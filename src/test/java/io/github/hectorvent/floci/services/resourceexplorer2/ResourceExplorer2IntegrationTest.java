@@ -298,6 +298,22 @@ class ResourceExplorer2IntegrationTest {
         .then()
             .statusCode(200);
 
+        // CloudWatch RUM app monitor (Resource Explorer 2 provider coverage)
+        given()
+            .header("Authorization", AUTH)
+            .contentType("application/json")
+            .body("""
+                {
+                    "Name": "re2-test-monitor",
+                    "Domain": "example.com",
+                    "Tags": {"env": "test"}
+                }
+                """)
+        .when()
+            .post("/appmonitor")
+        .then()
+            .statusCode(200);
+
         fixturesProvisioned = true;
     }
 
@@ -468,7 +484,7 @@ class ResourceExplorer2IntegrationTest {
                 .statusCode(200)
                 .body("ResourceTypes", notNullValue())
                 .body("ResourceTypes.size()", greaterThan(0))
-                .body("ResourceTypes.Service", hasItems("s3", "rds", "dynamodb", "elasticache", "es", "lambda", "sns", "kms", "sqs", "ecr", "states", "kafka", "pipes", "acm", "cognito-idp", "iam", "mq", "lightsail"));
+                .body("ResourceTypes.Service", hasItems("s3", "rds", "dynamodb", "elasticache", "es", "lambda", "sns", "kms", "sqs", "ecr", "states", "kafka", "pipes", "acm", "cognito-idp", "iam", "mq", "lightsail", "rum"));
         }
     }
 
@@ -489,7 +505,8 @@ class ResourceExplorer2IntegrationTest {
             "cognito-idp, cognito-idp:userpool",
             "mq,          mq:broker",
             "lightsail,   lightsail:Instance",
-            "lightsail,   lightsail:Disk"
+            "lightsail,   lightsail:Disk",
+            "rum,         rum:appmonitor"
         })
         void resourceSurfacesViaListResources(String service, String resourceType) {
             given()
