@@ -5,7 +5,10 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 @RegisterForReflection
 public class MskConfiguration {
@@ -28,16 +31,17 @@ public class MskConfiguration {
     @JsonProperty("creationTime")
     private Instant creationTime;
 
-    @JsonProperty("latestRevision")
-    private ConfigurationRevision latestRevision;
+    // Full revision history, oldest first. AWS's Configuration/CreateConfigurationResponse/
+    // DescribeConfigurationResponse shapes only ever expose the latest one (see
+    // getLatestRevision()); the full list backs ListConfigurationRevisions.
+    @JsonProperty("revisions")
+    private List<ConfigurationRevision> revisions = new ArrayList<>();
 
-    // Decoded server.properties content. Must round-trip through persistent/hybrid/wal
-    // storage (StorageBackend serializes this same model via Jackson), so it cannot be
-    // @JsonIgnore - the controller builds explicit response views instead to keep it out
-    // of Create/List/Describe responses, since AWS only returns it via
-    // DescribeConfigurationRevision (a separate follow-up issue, out of scope here).
-    @JsonProperty("serverProperties")
-    private String serverProperties;
+    // Decoded server.properties content, keyed by revision. AWS never returns this on the
+    // configuration/latestRevision shapes - only DescribeConfigurationRevision - so it's kept
+    // out of ConfigurationRevision itself, which those other shapes serialize directly.
+    @JsonProperty("serverPropertiesByRevision")
+    private Map<Long, String> serverPropertiesByRevision = new HashMap<>();
 
     @JsonIgnore
     private String accountId;
@@ -50,10 +54,10 @@ public class MskConfiguration {
         this.name = name;
         this.description = description;
         this.kafkaVersions = kafkaVersions;
-        this.serverProperties = serverProperties;
         this.state = ConfigurationState.ACTIVE;
         this.creationTime = Instant.now();
-        this.latestRevision = new ConfigurationRevision(1L, this.creationTime, description);
+        this.revisions.add(new ConfigurationRevision(1L, this.creationTime, description));
+        this.serverPropertiesByRevision.put(1L, serverProperties);
     }
 
     public String getArn() { return arn; }
@@ -74,11 +78,24 @@ public class MskConfiguration {
     public Instant getCreationTime() { return creationTime; }
     public void setCreationTime(Instant creationTime) { this.creationTime = creationTime; }
 
-    public ConfigurationRevision getLatestRevision() { return latestRevision; }
-    public void setLatestRevision(ConfigurationRevision latestRevision) { this.latestRevision = latestRevision; }
+    // Derived from revisions, not its own stored field, so it can never drift out of sync.
+    // Must stay @JsonIgnore: this class has no setter for it and isn't
+    // @JsonIgnoreProperties(ignoreUnknown = true), so serializing it would make a stored file
+    // fail to deserialize on load.
+    @JsonIgnore
+    public ConfigurationRevision getLatestRevision() {
+        return revisions.isEmpty() ? null : revisions.get(revisions.size() - 1);
+    }
 
-    public String getServerProperties() { return serverProperties; }
-    public void setServerProperties(String serverProperties) { this.serverProperties = serverProperties; }
+    public List<ConfigurationRevision> getRevisions() { return revisions; }
+    public void setRevisions(List<ConfigurationRevision> revisions) {
+        this.revisions = revisions != null ? revisions : new ArrayList<>();
+    }
+
+    public Map<Long, String> getServerPropertiesByRevision() { return serverPropertiesByRevision; }
+    public void setServerPropertiesByRevision(Map<Long, String> serverPropertiesByRevision) {
+        this.serverPropertiesByRevision = serverPropertiesByRevision != null ? serverPropertiesByRevision : new HashMap<>();
+    }
 
     public String getAccountId() { return accountId; }
     public void setAccountId(String accountId) { this.accountId = accountId; }

@@ -11,6 +11,7 @@ import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
+import static org.hamcrest.Matchers.hasKey;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.notNullValue;
@@ -295,5 +296,149 @@ class MskControllerIntegrationTest {
         given()
             .when().get("/v1/configurations?nextToken=not-a-valid-token!!")
             .then().statusCode(400);
+    }
+
+    @Test
+    void updateConfigurationAndRevisionRoundTrip() {
+        String propsV1 = Base64.getEncoder().encodeToString("auto.create.topics.enable=true".getBytes(StandardCharsets.UTF_8));
+        String propsV2 = Base64.getEncoder().encodeToString("auto.create.topics.enable=false".getBytes(StandardCharsets.UTF_8));
+
+        String arn = given()
+            .contentType("application/json")
+            .body("""
+                {"name": "revision-test", "description": "v1", "kafkaVersions": ["3.6.0"], "serverProperties": "%s"}
+                """.formatted(propsV1))
+        .when()
+            .post("/v1/configurations")
+        .then()
+            .statusCode(200)
+            .extract().path("arn");
+
+        given()
+            .contentType("application/json")
+            .body("""
+                {"description": "v2", "serverProperties": "%s"}
+                """.formatted(propsV2))
+        .when()
+            .put("/v1/configurations/{arn}", arn)
+        .then()
+            .statusCode(200)
+            .body("arn", equalTo(arn))
+            .body("latestRevision.revision", equalTo(2));
+
+        given()
+        .when()
+            .get("/v1/configurations/{arn}/revisions", arn)
+        .then()
+            .statusCode(200)
+            .body("revisions", hasSize(2))
+            .body("revisions[0].revision", equalTo(1))
+            .body("revisions[1].revision", equalTo(2))
+            // AWS's ConfigurationRevision shape never includes serverProperties.
+            .body("revisions[0]", not(hasKey("serverProperties")));
+
+        given()
+        .when()
+            .get("/v1/configurations/{arn}/revisions/1", arn)
+        .then()
+            .statusCode(200)
+            .body("arn", equalTo(arn))
+            .body("revision", equalTo(1))
+            .body("description", equalTo("v1"))
+            .body("serverProperties", equalTo(propsV1));
+
+        given()
+        .when()
+            .get("/v1/configurations/{arn}/revisions/2", arn)
+        .then()
+            .statusCode(200)
+            .body("revision", equalTo(2))
+            .body("description", equalTo("v2"))
+            .body("serverProperties", equalTo(propsV2));
+
+        // DescribeConfiguration/ListConfigurations still never leak serverProperties.
+        given()
+        .when()
+            .get("/v1/configurations/{arn}", arn)
+        .then()
+            .statusCode(200)
+            .body("latestRevision.revision", equalTo(2))
+            .body("$", not(hasKey("serverProperties")));
+    }
+
+    @Test
+    void updateConfigurationReturnsNotFoundForUnknownArn() {
+        given()
+            .contentType("application/json")
+            .body("{\"serverProperties\": \"cHJvcHM=\"}")
+        .when()
+            .put("/v1/configurations/{arn}", "arn:aws:kafka:us-east-1:000000000000:configuration/missing/id")
+        .then()
+            .statusCode(404);
+    }
+
+    @Test
+    void updateConfigurationRejectsMissingServerProperties() {
+        String propsV1 = Base64.getEncoder().encodeToString("props".getBytes(StandardCharsets.UTF_8));
+        String arn = given()
+            .contentType("application/json")
+            .body("""
+                {"name": "update-missing-props", "serverProperties": "%s"}
+                """.formatted(propsV1))
+        .when()
+            .post("/v1/configurations")
+        .then()
+            .statusCode(200)
+            .extract().path("arn");
+
+        given()
+            .contentType("application/json")
+            .body("{\"description\": \"v2\"}")
+        .when()
+            .put("/v1/configurations/{arn}", arn)
+        .then()
+            .statusCode(400);
+    }
+
+    @Test
+    void describeConfigurationRevisionReturnsNotFoundForUnknownRevision() {
+        String propsV1 = Base64.getEncoder().encodeToString("props".getBytes(StandardCharsets.UTF_8));
+        String arn = given()
+            .contentType("application/json")
+            .body("""
+                {"name": "revision-not-found-test", "serverProperties": "%s"}
+                """.formatted(propsV1))
+        .when()
+            .post("/v1/configurations")
+        .then()
+            .statusCode(200)
+            .extract().path("arn");
+
+        given()
+        .when()
+            .get("/v1/configurations/{arn}/revisions/99", arn)
+        .then()
+            .statusCode(404);
+    }
+
+    @Test
+    void describeConfigurationRevisionRejectsNonNumericRevision() {
+        String propsV1 = Base64.getEncoder().encodeToString("props".getBytes(StandardCharsets.UTF_8));
+        String arn = given()
+            .contentType("application/json")
+            .body("""
+                {"name": "revision-bad-path-test", "serverProperties": "%s"}
+                """.formatted(propsV1))
+        .when()
+            .post("/v1/configurations")
+        .then()
+            .statusCode(200)
+            .extract().path("arn");
+
+        given()
+        .when()
+            .get("/v1/configurations/{arn}/revisions/abc", arn)
+        .then()
+            .statusCode(400);
     }
 }

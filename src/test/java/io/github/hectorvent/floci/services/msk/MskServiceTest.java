@@ -8,6 +8,8 @@ import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.services.msk.model.ClusterState;
+import io.github.hectorvent.floci.services.msk.model.ConfigurationRevision;
+import io.github.hectorvent.floci.services.msk.model.ConfigurationRevisionDetail;
 import io.github.hectorvent.floci.services.msk.model.ConfigurationState;
 import io.github.hectorvent.floci.services.msk.model.MskCluster;
 import io.github.hectorvent.floci.services.msk.model.MskConfiguration;
@@ -107,7 +109,8 @@ class MskServiceTest {
         assertTrue(configuration.getArn().contains("test-config"));
         assertNotNull(configuration.getLatestRevision());
         assertEquals(1L, configuration.getLatestRevision().getRevision());
-        assertEquals("auto.create.topics.enable=true", configuration.getServerProperties());
+        assertEquals("auto.create.topics.enable=true",
+                configuration.getServerPropertiesByRevision().get(1L));
     }
 
     @Test
@@ -198,6 +201,92 @@ class MskServiceTest {
         assertTrue(mskService.listConfigurations(null, null).items().isEmpty());
     }
 
+    @Test
+    void updateConfiguration() {
+        MskConfiguration created = mskService.createConfiguration(
+                "test-config", "v1 desc", List.of("3.6.0"), "auto.create.topics.enable=true");
+
+        MskConfiguration updated = mskService.updateConfiguration(
+                created.getArn(), "v2 desc", "auto.create.topics.enable=false");
+
+        assertEquals(2L, updated.getLatestRevision().getRevision());
+        assertEquals("v2 desc", updated.getLatestRevision().getDescription());
+        // Revision 1 is untouched - update appends, it doesn't overwrite.
+        assertEquals("auto.create.topics.enable=true", updated.getServerPropertiesByRevision().get(1L));
+        assertEquals("auto.create.topics.enable=false", updated.getServerPropertiesByRevision().get(2L));
+        assertEquals(2, updated.getRevisions().size());
+    }
+
+    @Test
+    void updateConfigurationRejectsMissingServerProperties() {
+        MskConfiguration created = mskService.createConfiguration(
+                "test-config", "desc", List.of("3.6.0"), "props");
+        assertThrows(AwsException.class, () ->
+                mskService.updateConfiguration(created.getArn(), "desc", null));
+    }
+
+    @Test
+    void updateConfigurationNotFoundThrows() {
+        assertThrows(AwsException.class, () ->
+                mskService.updateConfiguration(
+                        "arn:aws:kafka:us-east-1:000000000000:configuration/missing/id", "desc", "props"));
+    }
+
+    @Test
+    void listConfigurationRevisions() {
+        MskConfiguration created = mskService.createConfiguration(
+                "test-config", "desc", List.of("3.6.0"), "props-v1");
+        mskService.updateConfiguration(created.getArn(), "desc v2", "props-v2");
+        mskService.updateConfiguration(created.getArn(), "desc v3", "props-v3");
+
+        List<ConfigurationRevision> revisions =
+                mskService.listConfigurationRevisions(created.getArn(), null, null).items();
+        assertEquals(3, revisions.size());
+        assertEquals(1L, revisions.get(0).getRevision());
+        assertEquals(3L, revisions.get(2).getRevision());
+    }
+
+    @Test
+    void listConfigurationRevisionsPaginates() {
+        MskConfiguration created = mskService.createConfiguration(
+                "test-config", "desc", List.of("3.6.0"), "props-v1");
+        mskService.updateConfiguration(created.getArn(), "desc v2", "props-v2");
+        mskService.updateConfiguration(created.getArn(), "desc v3", "props-v3");
+
+        PaginatedResult<ConfigurationRevision> firstPage =
+                mskService.listConfigurationRevisions(created.getArn(), 2, null);
+        assertEquals(2, firstPage.items().size());
+        assertNotNull(firstPage.nextToken());
+
+        PaginatedResult<ConfigurationRevision> secondPage =
+                mskService.listConfigurationRevisions(created.getArn(), 2, firstPage.nextToken());
+        assertEquals(1, secondPage.items().size());
+        assertEquals(3L, secondPage.items().getFirst().getRevision());
+    }
+
+    @Test
+    void describeConfigurationRevisionReturnsServerPropertiesForThatRevision() {
+        MskConfiguration created = mskService.createConfiguration(
+                "test-config", "desc", List.of("3.6.0"), "props-v1");
+        mskService.updateConfiguration(created.getArn(), "desc v2", "props-v2");
+
+        ConfigurationRevisionDetail rev1 = mskService.describeConfigurationRevision(created.getArn(), 1L);
+        assertEquals("props-v1", rev1.getServerProperties());
+        assertEquals("desc", rev1.getDescription());
+
+        ConfigurationRevisionDetail rev2 = mskService.describeConfigurationRevision(created.getArn(), 2L);
+        assertEquals("props-v2", rev2.getServerProperties());
+        assertEquals("desc v2", rev2.getDescription());
+    }
+
+    @Test
+    void describeConfigurationRevisionNotFoundThrows() {
+        MskConfiguration created = mskService.createConfiguration(
+                "test-config", "desc", List.of("3.6.0"), "props");
+        assertThrows(AwsException.class, () ->
+                mskService.describeConfigurationRevision(created.getArn(), 99L));
+    }
+
     // StorageBackend persists this model via plain Jackson serialization (PersistentStorage,
     // HybridStorage, WalStorage all call ObjectMapper#writeValue on it directly), so
     // serverProperties must round-trip through JSON or persistent/hybrid/wal storage modes
@@ -211,6 +300,7 @@ class MskServiceTest {
         String json = mapper.writeValueAsString(configuration);
         MskConfiguration restored = mapper.readValue(json, MskConfiguration.class);
 
-        assertEquals("auto.create.topics.enable=true", restored.getServerProperties());
+        assertEquals("auto.create.topics.enable=true",
+                restored.getServerPropertiesByRevision().get(1L));
     }
 }

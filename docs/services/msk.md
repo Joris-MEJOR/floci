@@ -21,6 +21,9 @@ Floci emulates Amazon MSK by orchestrating **Redpanda** containers. This provide
 | `ListConfigurations` | List all configurations |
 | `DescribeConfiguration` | Get configuration metadata and latest revision |
 | `DeleteConfiguration` | Delete a configuration |
+| `UpdateConfiguration` | Create a new revision of a configuration |
+| `ListConfigurationRevisions` | List all revisions of a configuration |
+| `DescribeConfigurationRevision` | Get a specific revision, including its `server.properties` |
 
 ## Configuration
 

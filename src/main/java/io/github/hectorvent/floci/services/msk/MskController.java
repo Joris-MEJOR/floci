@@ -3,6 +3,8 @@ package io.github.hectorvent.floci.services.msk;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.services.msk.model.ConfigurationRevision;
+import io.github.hectorvent.floci.services.msk.model.ConfigurationRevisionDetail;
 import io.github.hectorvent.floci.services.msk.model.MskCluster;
 import io.github.hectorvent.floci.services.msk.model.MskConfiguration;
 import jakarta.inject.Inject;
@@ -142,6 +144,51 @@ public class MskController {
         return Response.ok(Map.of("arn", arn, "state", "DELETING")).build();
     }
 
+    @PUT
+    @Path("/v1/configurations/{arn}")
+    public Response updateConfiguration(@PathParam("arn") String arn, Map<String, Object> request) {
+        String description = asString(request.get("description"), "description");
+        String serverProperties = decodeServerProperties(asString(request.get("serverProperties"), "serverProperties"));
+
+        MskConfiguration configuration = mskService.updateConfiguration(arn, description, serverProperties);
+        return Response.ok(Map.of(
+                "arn", configuration.getArn(),
+                "latestRevision", configuration.getLatestRevision())).build();
+    }
+
+    @GET
+    @Path("/v1/configurations/{arn}/revisions")
+    public Response listConfigurationRevisions(@PathParam("arn") String arn,
+                                                @QueryParam("maxResults") String maxResultsParam,
+                                                @QueryParam("nextToken") String nextToken) {
+        PaginatedResult<ConfigurationRevision> result = mskService.listConfigurationRevisions(arn,
+                Pagination.parseMaxResults(maxResultsParam, "BadRequestException"), nextToken);
+
+        Map<String, Object> response = new HashMap<>();
+        response.put("revisions", result.items());
+        if (result.nextToken() != null) {
+            response.put("nextToken", result.nextToken());
+        }
+        return Response.ok(response).build();
+    }
+
+    @GET
+    @Path("/v1/configurations/{arn}/revisions/{revision}")
+    public Response describeConfigurationRevision(@PathParam("arn") String arn,
+                                                    @PathParam("revision") String revisionParam) {
+        long revision = parseRevision(revisionParam);
+        ConfigurationRevisionDetail detail = mskService.describeConfigurationRevision(arn, revision);
+
+        Map<String, Object> response = new HashMap<>();
+        response.put("arn", detail.getArn());
+        response.put("creationTime", detail.getCreationTime());
+        response.put("description", detail.getDescription() != null ? detail.getDescription() : "");
+        response.put("revision", detail.getRevision());
+        response.put("serverProperties",
+                Base64.getEncoder().encodeToString(detail.getServerProperties().getBytes(StandardCharsets.UTF_8)));
+        return Response.ok(response).build();
+    }
+
     // AWS's Configuration/DescribeConfigurationResponse shape never includes
     // serverProperties (that's only returned via DescribeConfigurationRevision), so build
     // an explicit view instead of serializing the model directly.
@@ -155,6 +202,17 @@ public class MskController {
         view.put("creationTime", configuration.getCreationTime());
         view.put("latestRevision", configuration.getLatestRevision());
         return view;
+    }
+
+    // Bound as String rather than @PathParam long, matching the same reasoning as
+    // maxResults: a failed path-param conversion should return an AWS-shaped 400, not
+    // whatever the framework's own default handling produces.
+    private long parseRevision(String value) {
+        try {
+            return Long.parseLong(value);
+        } catch (NumberFormatException e) {
+            throw new AwsException("BadRequestException", "revision must be an integer.", 400);
+        }
     }
 
     private String decodeServerProperties(String serverPropertiesB64) {

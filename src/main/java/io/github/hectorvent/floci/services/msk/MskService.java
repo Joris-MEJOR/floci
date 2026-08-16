@@ -10,6 +10,8 @@ import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.msk.model.ClusterState;
+import io.github.hectorvent.floci.services.msk.model.ConfigurationRevision;
+import io.github.hectorvent.floci.services.msk.model.ConfigurationRevisionDetail;
 import io.github.hectorvent.floci.services.msk.model.ConfigurationState;
 import io.github.hectorvent.floci.services.msk.model.MskCluster;
 import io.github.hectorvent.floci.services.msk.model.MskConfiguration;
@@ -21,6 +23,7 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.security.SecureRandom;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -165,6 +168,44 @@ public class MskService {
         configurationStorage.delete(arn);
         LOG.infov("Deleted MSK configuration: {0}", configuration.getName());
         return configuration;
+    }
+
+    public MskConfiguration updateConfiguration(String arn, String description, String serverProperties) {
+        MskConfiguration configuration = describeConfiguration(arn);
+        if (configuration.getState() != ConfigurationState.ACTIVE) {
+            throw new AwsException("BadRequestException",
+                    "Configuration must be ACTIVE to update: " + arn, 400);
+        }
+        if (serverProperties == null || serverProperties.isBlank()) {
+            throw new AwsException("BadRequestException", "serverProperties is required.", 400);
+        }
+
+        long newRevisionNumber = configuration.getLatestRevision().getRevision() + 1;
+        configuration.getRevisions().add(new ConfigurationRevision(newRevisionNumber, Instant.now(), description));
+        configuration.getServerPropertiesByRevision().put(newRevisionNumber, serverProperties);
+
+        configurationStorage.put(arn, configuration);
+        LOG.infov("Updated MSK configuration {0} to revision {1}", configuration.getName(), newRevisionNumber);
+        return configuration;
+    }
+
+    public PaginatedResult<ConfigurationRevision> listConfigurationRevisions(String arn, Integer maxResults, String nextToken) {
+        MskConfiguration configuration = describeConfiguration(arn);
+        return Pagination.paginate(configuration.getRevisions(),
+                revision -> String.format("%019d", revision.getRevision()),
+                maxResults, nextToken, MAX_PAGE, "BadRequestException");
+    }
+
+    public ConfigurationRevisionDetail describeConfigurationRevision(String arn, long revision) {
+        MskConfiguration configuration = describeConfiguration(arn);
+        ConfigurationRevision found = configuration.getRevisions().stream()
+                .filter(r -> r.getRevision() == revision)
+                .findFirst()
+                .orElseThrow(() -> new AwsException("NotFoundException",
+                        "Revision not found: " + revision + " for configuration " + arn, 404));
+        String serverProperties = configuration.getServerPropertiesByRevision().get(revision);
+        return new ConfigurationRevisionDetail(arn, found.getCreationTime(), found.getDescription(),
+                revision, serverProperties);
     }
 
     private void startReadinessPoller() {
