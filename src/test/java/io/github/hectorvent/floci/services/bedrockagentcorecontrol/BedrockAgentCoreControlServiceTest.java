@@ -3,12 +3,12 @@ package io.github.hectorvent.floci.services.bedrockagentcorecontrol;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.AgentRuntime;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.AgentRuntimeEndpoint;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.AgentRuntimeVersion;
-import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.ListResult;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -109,7 +109,7 @@ class BedrockAgentCoreControlServiceTest {
     void listReturnsCreatedRuntimes() {
         create("agentA");
         create("agentB");
-        ListResult<AgentRuntime> result = service.listAgentRuntimes(0, null, REGION);
+        PaginatedResult<AgentRuntime> result = service.listAgentRuntimes(null, null, REGION);
         assertEquals(2, result.items().size());
         assertNull(result.nextToken());
     }
@@ -119,10 +119,10 @@ class BedrockAgentCoreControlServiceTest {
         create("agentA");
         create("agentB");
         create("agentC");
-        ListResult<AgentRuntime> page1 = service.listAgentRuntimes(2, null, REGION);
+        PaginatedResult<AgentRuntime> page1 = service.listAgentRuntimes(2, null, REGION);
         assertEquals(2, page1.items().size());
         assertTrue(page1.nextToken() != null);
-        ListResult<AgentRuntime> page2 = service.listAgentRuntimes(2, page1.nextToken(), REGION);
+        PaginatedResult<AgentRuntime> page2 = service.listAgentRuntimes(2, page1.nextToken(), REGION);
         assertEquals(1, page2.items().size());
         assertNull(page2.nextToken());
     }
@@ -141,7 +141,7 @@ class BedrockAgentCoreControlServiceTest {
         String token = null;
         int pages = 0;
         do {
-            ListResult<AgentRuntimeVersion> page = service.listAgentRuntimeVersions(id, 5, token, REGION);
+            PaginatedResult<AgentRuntimeVersion> page = service.listAgentRuntimeVersions(id, 5, token, REGION);
             page.items().forEach(v -> seen.add(v.getVersion()));
             token = page.nextToken();
             assertTrue(++pages <= 5, "pagination did not terminate (cycled)");
@@ -183,7 +183,15 @@ class BedrockAgentCoreControlServiceTest {
     @Test
     void listRejectsMalformedNextToken() {
         assertEquals(400, assertThrows(AwsException.class,
-                () -> service.listAgentRuntimes(0, "!!!not-base64!!!", REGION)).getHttpStatus());
+                () -> service.listAgentRuntimes(null, "!!!not-base64!!!", REGION)).getHttpStatus());
+    }
+
+    @Test
+    void listRejectsZeroMaxResults() {
+        // AWS declares MaxResults with a minimum of 1; 0 is a real out-of-range value, not a
+        // synonym for "omitted" (that's represented by null instead).
+        assertEquals(400, assertThrows(AwsException.class,
+                () -> service.listAgentRuntimes(0, null, REGION)).getHttpStatus());
     }
 
     @Test
@@ -194,7 +202,7 @@ class BedrockAgentCoreControlServiceTest {
         AgentRuntime b = service.createAgentRuntime("myAgent", artifact(), network(),
                 "arn:aws:iam::000000000000:role/agent", "d", null, null, null, "tok-1", REGION);
         assertEquals(a.getAgentRuntimeId(), b.getAgentRuntimeId());
-        assertEquals(1, service.listAgentRuntimes(0, null, REGION).items().size());
+        assertEquals(1, service.listAgentRuntimes(null, null, REGION).items().size());
     }
 
     @Test
@@ -223,7 +231,7 @@ class BedrockAgentCoreControlServiceTest {
         AgentRuntime rt = create("myAgent");
         String id = rt.getAgentRuntimeId();
         // Not visible or gettable from a different region.
-        assertTrue(service.listAgentRuntimes(0, null, "us-west-2").items().isEmpty());
+        assertTrue(service.listAgentRuntimes(null, null, "us-west-2").items().isEmpty());
         assertEquals(404, assertThrows(AwsException.class,
                 () -> service.getAgentRuntime(id, "us-west-2")).getHttpStatus());
         // Same id resolves in its own region.

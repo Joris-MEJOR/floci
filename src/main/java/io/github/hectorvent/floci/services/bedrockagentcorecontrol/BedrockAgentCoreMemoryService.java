@@ -2,25 +2,22 @@ package io.github.hectorvent.floci.services.bedrockagentcorecontrol;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Pagination;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
-import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.ListResult;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.Memory;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
-import java.nio.charset.StandardCharsets;
 import java.time.Instant;
-import java.util.Base64;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
-import java.util.stream.Collectors;
 
 /** CRUD for AgentCore memory resources. Metadata registry only. */
 @ApplicationScoped
@@ -118,33 +115,10 @@ public class BedrockAgentCoreMemoryService {
         return memory;
     }
 
-    public ListResult<Memory> list(int maxResults, String nextToken, String region) {
-        if (maxResults < 0 || maxResults > MAX_PAGE) {
-            throw new AwsException("ValidationException",
-                    "maxResults must be between 1 and " + MAX_PAGE, 400);
-        }
+    public PaginatedResult<Memory> list(Integer maxResults, String nextToken, String region) {
         String prefix = keyPrefix(region);
-        List<Memory> all = storage.scan(k -> k.startsWith(prefix)).stream()
-                .sorted(Comparator.comparing(Memory::getMemoryId))
-                .collect(Collectors.toList());
-        int limit = maxResults > 0 ? maxResults : MAX_PAGE;
-        String after = decode(nextToken);
-        int start = 0;
-        if (after != null) {
-            for (int i = 0; i < all.size(); i++) {
-                if (all.get(i).getMemoryId().compareTo(after) > 0) {
-                    start = i;
-                    break;
-                }
-                start = i + 1;
-            }
-        }
-        List<Memory> page = all.stream().skip(start).limit(limit).collect(Collectors.toList());
-        String token = null;
-        if (start + limit < all.size() && !page.isEmpty()) {
-            token = encode(page.get(page.size() - 1).getMemoryId());
-        }
-        return new ListResult<>(page, token);
+        List<Memory> all = storage.scan(k -> k.startsWith(prefix));
+        return Pagination.paginate(all, Memory::getMemoryId, maxResults, nextToken, MAX_PAGE, "ValidationException");
     }
 
     public String arn(Memory memory, String region) {
@@ -173,20 +147,5 @@ public class BedrockAgentCoreMemoryService {
 
     private static String keyPrefix(String region) {
         return "memory:" + region + ":";
-    }
-
-    private static String encode(String cursor) {
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(cursor.getBytes(StandardCharsets.UTF_8));
-    }
-
-    private static String decode(String token) {
-        if (token == null || token.isEmpty()) {
-            return null;
-        }
-        try {
-            return new String(Base64.getUrlDecoder().decode(token), StandardCharsets.UTF_8);
-        } catch (IllegalArgumentException e) {
-            throw new AwsException("ValidationException", "Invalid nextToken", 400);
-        }
     }
 }

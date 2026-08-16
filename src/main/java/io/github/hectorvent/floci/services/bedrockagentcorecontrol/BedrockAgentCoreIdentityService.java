@@ -2,22 +2,19 @@ package io.github.hectorvent.floci.services.bedrockagentcorecontrol;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Pagination;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
-import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.ListResult;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.WorkloadIdentity;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
-import java.nio.charset.StandardCharsets;
 import java.time.Instant;
-import java.util.Base64;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 
 /**
  * Workload identity registry for the AgentCore control plane. Exposed via the
@@ -94,51 +91,14 @@ public class BedrockAgentCoreIdentityService {
         storage.delete(key(region, name));
     }
 
-    public ListResult<WorkloadIdentity> list(int maxResults, String nextToken, String region) {
-        if (maxResults < 0 || maxResults > MAX_PAGE) {
-            throw new AwsException("ValidationException",
-                    "maxResults must be between 1 and " + MAX_PAGE, 400);
-        }
+    public PaginatedResult<WorkloadIdentity> list(Integer maxResults, String nextToken, String region) {
         String prefix = "identity:" + region + ":";
-        List<WorkloadIdentity> all = storage.scan(k -> k.startsWith(prefix)).stream()
-                .sorted(Comparator.comparing(WorkloadIdentity::getName))
-                .collect(Collectors.toList());
-        int limit = maxResults > 0 ? maxResults : MAX_PAGE;
-        String after = decode(nextToken);
-        int start = 0;
-        if (after != null) {
-            for (int i = 0; i < all.size(); i++) {
-                if (all.get(i).getName().compareTo(after) > 0) {
-                    start = i;
-                    break;
-                }
-                start = i + 1;
-            }
-        }
-        List<WorkloadIdentity> page = all.stream().skip(start).limit(limit).collect(Collectors.toList());
-        String token = null;
-        if (start + limit < all.size() && !page.isEmpty()) {
-            token = encode(page.get(page.size() - 1).getName());
-        }
-        return new ListResult<>(page, token);
+        List<WorkloadIdentity> all = storage.scan(k -> k.startsWith(prefix));
+        return Pagination.paginate(all, WorkloadIdentity::getName, maxResults, nextToken,
+                MAX_PAGE, "ValidationException");
     }
 
     private static String key(String region, String name) {
         return "identity:" + region + ":" + name;
-    }
-
-    private static String encode(String cursor) {
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(cursor.getBytes(StandardCharsets.UTF_8));
-    }
-
-    private static String decode(String token) {
-        if (token == null || token.isEmpty()) {
-            return null;
-        }
-        try {
-            return new String(Base64.getUrlDecoder().decode(token), StandardCharsets.UTF_8);
-        } catch (IllegalArgumentException e) {
-            throw new AwsException("ValidationException", "Invalid nextToken", 400);
-        }
     }
 }

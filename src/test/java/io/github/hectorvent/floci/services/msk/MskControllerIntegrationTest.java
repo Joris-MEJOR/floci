@@ -270,6 +270,15 @@ class MskControllerIntegrationTest {
             .then().statusCode(400);
     }
 
+    // AWS declares MaxResults with a minimum of 1; 0 is real out-of-range input, not a
+    // synonym for "omitted" (that's an absent query param instead).
+    @Test
+    void listConfigurationsRejectsZeroMaxResults() {
+        given()
+            .when().get("/v1/configurations?maxResults=0")
+            .then().statusCode(400);
+    }
+
     // maxResults is bound as a raw String and parsed by hand rather than @QueryParam
     // Integer specifically because a non-numeric value for an Integer-typed @QueryParam
     // fails RESTEasy Reactive's own conversion before the method body runs, and its

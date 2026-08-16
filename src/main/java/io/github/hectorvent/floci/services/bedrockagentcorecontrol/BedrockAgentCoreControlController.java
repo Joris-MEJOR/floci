@@ -6,11 +6,12 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Pagination;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.AgentRuntime;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.AgentRuntimeEndpoint;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.AgentRuntimeVersion;
-import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.ListResult;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.DELETE;
@@ -97,12 +98,12 @@ public class BedrockAgentCoreControlController {
     @POST
     @Path("/runtimes/")
     public Response listAgentRuntimes(@Context HttpHeaders headers,
-                                      @QueryParam("maxResults") Integer maxResults,
+                                      @QueryParam("maxResults") String maxResultsParam,
                                       @QueryParam("nextToken") String nextToken) {
         String region = regionResolver.resolveRegion(headers);
         try {
-            ListResult<AgentRuntime> result =
-                    service.listAgentRuntimes(maxResults != null ? maxResults : 0, nextToken, region);
+            Integer maxResults = Pagination.parseMaxResults(maxResultsParam, "ValidationException");
+            PaginatedResult<AgentRuntime> result = service.listAgentRuntimes(maxResults, nextToken, region);
             ObjectNode out = objectMapper.createObjectNode();
             ArrayNode arr = out.putArray("agentRuntimes");
             for (AgentRuntime runtime : result.items()) {
@@ -202,13 +203,14 @@ public class BedrockAgentCoreControlController {
     @Path("/runtimes/{agentRuntimeId}/versions/")
     public Response listAgentRuntimeVersions(@Context HttpHeaders headers,
                                              @PathParam("agentRuntimeId") String id,
-                                             @QueryParam("maxResults") Integer maxResults,
+                                             @QueryParam("maxResults") String maxResultsParam,
                                              @QueryParam("nextToken") String nextToken) {
         String region = regionResolver.resolveRegion(headers);
         try {
+            Integer maxResults = Pagination.parseMaxResults(maxResultsParam, "ValidationException");
             AgentRuntime runtime = service.getAgentRuntime(id, region);
-            ListResult<AgentRuntimeVersion> result =
-                    service.listAgentRuntimeVersions(id, maxResults != null ? maxResults : 0, nextToken, region);
+            PaginatedResult<AgentRuntimeVersion> result =
+                    service.listAgentRuntimeVersions(id, maxResults, nextToken, region);
             ObjectNode out = objectMapper.createObjectNode();
             ArrayNode arr = out.putArray("agentRuntimes");
             for (AgentRuntimeVersion snap : result.items()) {
@@ -315,13 +317,14 @@ public class BedrockAgentCoreControlController {
     @Path("/runtimes/{agentRuntimeId}/runtime-endpoints/")
     public Response listEndpoints(@Context HttpHeaders headers,
                                   @PathParam("agentRuntimeId") String id,
-                                  @QueryParam("maxResults") Integer maxResults,
+                                  @QueryParam("maxResults") String maxResultsParam,
                                   @QueryParam("nextToken") String nextToken) {
         String region = regionResolver.resolveRegion(headers);
         try {
+            Integer maxResults = Pagination.parseMaxResults(maxResultsParam, "ValidationException");
             AgentRuntime runtime = service.getAgentRuntime(id, region);
-            ListResult<AgentRuntimeEndpoint> result =
-                    service.listEndpoints(id, maxResults != null ? maxResults : 0, nextToken, region);
+            PaginatedResult<AgentRuntimeEndpoint> result =
+                    service.listEndpoints(id, maxResults, nextToken, region);
             ObjectNode out = objectMapper.createObjectNode();
             ArrayNode arr = out.putArray("runtimeEndpoints");
             for (AgentRuntimeEndpoint endpoint : result.items()) {

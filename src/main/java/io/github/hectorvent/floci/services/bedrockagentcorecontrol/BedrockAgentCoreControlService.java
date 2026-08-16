@@ -3,21 +3,19 @@ package io.github.hectorvent.floci.services.bedrockagentcorecontrol;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Pagination;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.AgentRuntime;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.AgentRuntimeEndpoint;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.AgentRuntimeVersion;
-import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.ListResult;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
-import java.nio.charset.StandardCharsets;
 import java.time.Instant;
-import java.util.Base64;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -26,9 +24,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
-import java.util.function.Function;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 
 /**
  * Business logic for the Amazon Bedrock AgentCore control plane (runtime registry).
@@ -48,7 +44,6 @@ public class BedrockAgentCoreControlService {
     private static final String ID_ALPHABET =
             "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     private static final int MAX_PAGE = 100;
-    private static final int DEFAULT_PAGE = 100;
 
     private final StorageBackend<String, AgentRuntime> storage;
     private final RegionResolver regionResolver;
@@ -220,20 +215,20 @@ public class BedrockAgentCoreControlService {
         return region + " " + clientToken;
     }
 
-    public ListResult<AgentRuntime> listAgentRuntimes(int maxResults, String nextToken, String region) {
+    public PaginatedResult<AgentRuntime> listAgentRuntimes(Integer maxResults, String nextToken, String region) {
         String prefix = keyPrefix(region);
-        List<AgentRuntime> all = storage.scan(k -> k.startsWith(prefix)).stream()
-                .sorted(Comparator.comparing(AgentRuntime::getAgentRuntimeId))
-                .collect(Collectors.toList());
-        return paginate(all, AgentRuntime::getAgentRuntimeId, maxResults, nextToken);
+        List<AgentRuntime> all = storage.scan(k -> k.startsWith(prefix));
+        return Pagination.paginate(all, AgentRuntime::getAgentRuntimeId, maxResults, nextToken,
+                MAX_PAGE, "ValidationException");
     }
 
-    public ListResult<AgentRuntimeVersion> listAgentRuntimeVersions(String id, int maxResults, String nextToken,
+    public PaginatedResult<AgentRuntimeVersion> listAgentRuntimeVersions(String id, Integer maxResults, String nextToken,
                                                                     String region) {
         AgentRuntime runtime = getAgentRuntime(id, region);
         // Cursor must be zero-padded so lexicographic order matches numeric version order;
-        // paginate() sorts by the cursor, keeping sort order and resume order consistent.
-        return paginate(runtime.getVersions(), v -> pad(v.getVersion()), maxResults, nextToken);
+        // Pagination.paginate() sorts by the cursor, keeping sort order and resume order consistent.
+        return Pagination.paginate(runtime.getVersions(), v -> pad(v.getVersion()), maxResults, nextToken,
+                MAX_PAGE, "ValidationException");
     }
 
     private static String pad(String version) {
@@ -393,13 +388,11 @@ public class BedrockAgentCoreControlService {
         return endpoint;
     }
 
-    public ListResult<AgentRuntimeEndpoint> listEndpoints(String runtimeId, int maxResults, String nextToken,
+    public PaginatedResult<AgentRuntimeEndpoint> listEndpoints(String runtimeId, Integer maxResults, String nextToken,
                                                           String region) {
         AgentRuntime runtime = getAgentRuntime(runtimeId, region);
-        List<AgentRuntimeEndpoint> all = runtime.getEndpoints().stream()
-                .sorted(Comparator.comparing(AgentRuntimeEndpoint::getName))
-                .collect(Collectors.toList());
-        return paginate(all, AgentRuntimeEndpoint::getName, maxResults, nextToken);
+        return Pagination.paginate(runtime.getEndpoints(), AgentRuntimeEndpoint::getName, maxResults, nextToken,
+                MAX_PAGE, "ValidationException");
     }
 
     private AgentRuntimeEndpoint findEndpoint(AgentRuntime runtime, String name) {
@@ -438,49 +431,6 @@ public class BedrockAgentCoreControlService {
         return snap;
     }
 
-    private <T> ListResult<T> paginate(List<T> all, Function<T, String> cursorOf,
-                                       int maxResults, String nextToken) {
-        if (maxResults < 0 || maxResults > MAX_PAGE) {
-            throw new AwsException("ValidationException",
-                    "maxResults must be between 1 and " + MAX_PAGE, 400);
-        }
-        int limit = maxResults > 0 ? maxResults : DEFAULT_PAGE;
-        // Sort by the same key used as the pagination cursor so resume order always matches.
-        List<T> sorted = all.stream().sorted(Comparator.comparing(cursorOf)).collect(Collectors.toList());
-        String after = decodeToken(nextToken);
-        int start = 0;
-        if (after != null) {
-            for (int i = 0; i < sorted.size(); i++) {
-                if (cursorOf.apply(sorted.get(i)).compareTo(after) > 0) {
-                    start = i;
-                    break;
-                }
-                start = i + 1;
-            }
-        }
-        List<T> page = sorted.stream().skip(start).limit(limit).collect(Collectors.toList());
-        String outToken = null;
-        if (start + limit < sorted.size() && !page.isEmpty()) {
-            outToken = encodeToken(cursorOf.apply(page.get(page.size() - 1)));
-        }
-        return new ListResult<>(page, outToken);
-    }
-
-    private static String encodeToken(String cursor) {
-        return Base64.getUrlEncoder().withoutPadding()
-                .encodeToString(cursor.getBytes(StandardCharsets.UTF_8));
-    }
-
-    private static String decodeToken(String token) {
-        if (token == null || token.isEmpty()) {
-            return null;
-        }
-        try {
-            return new String(Base64.getUrlDecoder().decode(token), StandardCharsets.UTF_8);
-        } catch (IllegalArgumentException e) {
-            throw new AwsException("ValidationException", "Invalid nextToken", 400);
-        }
-    }
 
     private static String key(String region, String id) {
         return keyPrefix(region) + id;

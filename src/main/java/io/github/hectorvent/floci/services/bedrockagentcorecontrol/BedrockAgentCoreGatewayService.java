@@ -3,25 +3,21 @@ package io.github.hectorvent.floci.services.bedrockagentcorecontrol;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Pagination;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.Gateway;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.GatewayTarget;
-import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.ListResult;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
-import java.nio.charset.StandardCharsets;
 import java.time.Instant;
-import java.util.Base64;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
-import java.util.function.Function;
-import java.util.stream.Collectors;
 
 /** CRUD for AgentCore gateways and their targets. Metadata registry only. */
 @ApplicationScoped
@@ -141,12 +137,10 @@ public class BedrockAgentCoreGatewayService {
         return gateway;
     }
 
-    public ListResult<Gateway> list(int maxResults, String nextToken, String region) {
+    public PaginatedResult<Gateway> list(Integer maxResults, String nextToken, String region) {
         String prefix = keyPrefix(region);
-        List<Gateway> all = storage.scan(k -> k.startsWith(prefix)).stream()
-                .sorted(Comparator.comparing(Gateway::getGatewayId))
-                .collect(Collectors.toList());
-        return paginate(all, Gateway::getGatewayId, maxResults, nextToken);
+        List<Gateway> all = storage.scan(k -> k.startsWith(prefix));
+        return Pagination.paginate(all, Gateway::getGatewayId, maxResults, nextToken, MAX_PAGE, "ValidationException");
     }
 
     public String gatewayArn(Gateway gateway, String region) {
@@ -203,12 +197,10 @@ public class BedrockAgentCoreGatewayService {
         return target;
     }
 
-    public ListResult<GatewayTarget> listTargets(String gatewayId, int maxResults, String nextToken, String region) {
+    public PaginatedResult<GatewayTarget> listTargets(String gatewayId, Integer maxResults, String nextToken, String region) {
         Gateway gateway = get(gatewayId, region);
-        List<GatewayTarget> all = gateway.getTargets().stream()
-                .sorted(Comparator.comparing(GatewayTarget::getTargetId))
-                .collect(Collectors.toList());
-        return paginate(all, GatewayTarget::getTargetId, maxResults, nextToken);
+        return Pagination.paginate(gateway.getTargets(), GatewayTarget::getTargetId, maxResults, nextToken,
+                MAX_PAGE, "ValidationException");
     }
 
     private GatewayTarget findTarget(Gateway gateway, String targetId) {
@@ -217,31 +209,6 @@ public class BedrockAgentCoreGatewayService {
                 .findFirst()
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                         "Gateway target not found: " + targetId, 404));
-    }
-
-    private <T> ListResult<T> paginate(List<T> all, Function<T, String> cursorOf, int maxResults, String nextToken) {
-        if (maxResults < 0 || maxResults > MAX_PAGE) {
-            throw new AwsException("ValidationException",
-                    "maxResults must be between 1 and " + MAX_PAGE, 400);
-        }
-        int limit = maxResults > 0 ? maxResults : MAX_PAGE;
-        String after = decode(nextToken);
-        int start = 0;
-        if (after != null) {
-            for (int i = 0; i < all.size(); i++) {
-                if (cursorOf.apply(all.get(i)).compareTo(after) > 0) {
-                    start = i;
-                    break;
-                }
-                start = i + 1;
-            }
-        }
-        List<T> page = all.stream().skip(start).limit(limit).collect(Collectors.toList());
-        String token = null;
-        if (start + limit < all.size() && !page.isEmpty()) {
-            token = encode(cursorOf.apply(page.get(page.size() - 1)));
-        }
-        return new ListResult<>(page, token);
     }
 
     private static String sanitize(String name) {
@@ -266,20 +233,5 @@ public class BedrockAgentCoreGatewayService {
 
     private static String keyPrefix(String region) {
         return "gateway:" + region + ":";
-    }
-
-    private static String encode(String cursor) {
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(cursor.getBytes(StandardCharsets.UTF_8));
-    }
-
-    private static String decode(String token) {
-        if (token == null || token.isEmpty()) {
-            return null;
-        }
-        try {
-            return new String(Base64.getUrlDecoder().decode(token), StandardCharsets.UTF_8);
-        } catch (IllegalArgumentException e) {
-            throw new AwsException("ValidationException", "Invalid nextToken", 400);
-        }
     }
 }

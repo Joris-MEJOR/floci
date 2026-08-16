@@ -6,8 +6,8 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
-import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.ListResult;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.WorkloadIdentity;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
@@ -109,9 +109,9 @@ public class BedrockAgentCoreIdentityController {
         String region = regionResolver.resolveRegion(headers);
         try {
             JsonNode req = objectMapper.readTree(body != null && !body.isBlank() ? body : "{}");
-            int maxResults = req.hasNonNull("maxResults") ? req.get("maxResults").asInt() : 0;
+            Integer maxResults = req.hasNonNull("maxResults") ? req.get("maxResults").asInt() : null;
             String nextToken = text(req, "nextToken");
-            ListResult<WorkloadIdentity> result = service.list(maxResults, nextToken, region);
+            PaginatedResult<WorkloadIdentity> result = service.list(maxResults, nextToken, region);
             ObjectNode out = objectMapper.createObjectNode();
             ArrayNode arr = out.putArray("workloadIdentities");
             for (WorkloadIdentity identity : result.items()) {

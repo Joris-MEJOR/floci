@@ -6,8 +6,9 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Pagination;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
-import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.ListResult;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.Memory;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
@@ -109,11 +110,12 @@ public class BedrockAgentCoreMemoryController {
     @POST
     @Path("/")
     public Response listMemories(@Context HttpHeaders headers,
-                                 @QueryParam("maxResults") Integer maxResults,
+                                 @QueryParam("maxResults") String maxResultsParam,
                                  @QueryParam("nextToken") String nextToken) {
         String region = regionResolver.resolveRegion(headers);
         try {
-            ListResult<Memory> result = service.list(maxResults != null ? maxResults : 0, nextToken, region);
+            Integer maxResults = Pagination.parseMaxResults(maxResultsParam, "ValidationException");
+            PaginatedResult<Memory> result = service.list(maxResults, nextToken, region);
             ObjectNode out = objectMapper.createObjectNode();
             ArrayNode arr = out.putArray("memories");
             for (Memory memory : result.items()) {

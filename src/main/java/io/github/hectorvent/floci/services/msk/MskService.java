@@ -3,13 +3,14 @@ package io.github.hectorvent.floci.services.msk;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Pagination;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.msk.model.ClusterState;
 import io.github.hectorvent.floci.services.msk.model.ConfigurationState;
-import io.github.hectorvent.floci.services.msk.model.ListResult;
 import io.github.hectorvent.floci.services.msk.model.MskCluster;
 import io.github.hectorvent.floci.services.msk.model.MskConfiguration;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -19,18 +20,13 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
-import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
-import java.util.Base64;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Function;
-import java.util.stream.Collectors;
 
 @ApplicationScoped
 public class MskService {
@@ -158,50 +154,9 @@ public class MskService {
                 .orElseThrow(() -> new AwsException("NotFoundException", "Configuration not found: " + arn, 404));
     }
 
-    public ListResult<MskConfiguration> listConfigurations(int maxResults, String nextToken) {
-        List<MskConfiguration> all = configurationStorage.scan(k -> true).stream()
-                .sorted(Comparator.comparing(MskConfiguration::getArn))
-                .collect(Collectors.toList());
-        return paginate(all, MskConfiguration::getArn, maxResults, nextToken);
-    }
-
-    private <T> ListResult<T> paginate(List<T> all, Function<T, String> cursorOf, int maxResults, String nextToken) {
-        if (maxResults < 0 || maxResults > MAX_PAGE) {
-            throw new AwsException("BadRequestException", "maxResults must be between 1 and " + MAX_PAGE, 400);
-        }
-        int limit = maxResults > 0 ? maxResults : MAX_PAGE;
-        String after = decodeToken(nextToken);
-        int start = 0;
-        if (after != null) {
-            for (int i = 0; i < all.size(); i++) {
-                if (cursorOf.apply(all.get(i)).compareTo(after) > 0) {
-                    start = i;
-                    break;
-                }
-                start = i + 1;
-            }
-        }
-        List<T> page = all.stream().skip(start).limit(limit).collect(Collectors.toList());
-        String token = null;
-        if (start + limit < all.size() && !page.isEmpty()) {
-            token = encodeToken(cursorOf.apply(page.get(page.size() - 1)));
-        }
-        return new ListResult<>(page, token);
-    }
-
-    private static String encodeToken(String cursor) {
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(cursor.getBytes(StandardCharsets.UTF_8));
-    }
-
-    private static String decodeToken(String token) {
-        if (token == null || token.isEmpty()) {
-            return null;
-        }
-        try {
-            return new String(Base64.getUrlDecoder().decode(token), StandardCharsets.UTF_8);
-        } catch (IllegalArgumentException e) {
-            throw new AwsException("BadRequestException", "Invalid nextToken.", 400);
-        }
+    public PaginatedResult<MskConfiguration> listConfigurations(Integer maxResults, String nextToken) {
+        List<MskConfiguration> all = configurationStorage.scan(k -> true);
+        return Pagination.paginate(all, MskConfiguration::getArn, maxResults, nextToken, MAX_PAGE, "BadRequestException");
     }
 
     public MskConfiguration deleteConfiguration(String arn) {

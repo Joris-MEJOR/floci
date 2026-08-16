@@ -6,10 +6,11 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Pagination;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.Gateway;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.GatewayTarget;
-import io.github.hectorvent.floci.services.bedrockagentcorecontrol.model.ListResult;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.DELETE;
@@ -115,11 +116,12 @@ public class BedrockAgentCoreGatewayController {
     @GET
     @Path("/")
     public Response listGateways(@Context HttpHeaders headers,
-                                 @QueryParam("maxResults") Integer maxResults,
+                                 @QueryParam("maxResults") String maxResultsParam,
                                  @QueryParam("nextToken") String nextToken) {
         String region = regionResolver.resolveRegion(headers);
         try {
-            ListResult<Gateway> result = service.list(maxResults != null ? maxResults : 0, nextToken, region);
+            Integer maxResults = Pagination.parseMaxResults(maxResultsParam, "ValidationException");
+            PaginatedResult<Gateway> result = service.list(maxResults, nextToken, region);
             ObjectNode out = objectMapper.createObjectNode();
             ArrayNode arr = out.putArray("items");
             for (Gateway gateway : result.items()) {
@@ -211,12 +213,12 @@ public class BedrockAgentCoreGatewayController {
     @GET
     @Path("/{gatewayIdentifier}/targets/")
     public Response listTargets(@Context HttpHeaders headers, @PathParam("gatewayIdentifier") String id,
-                                @QueryParam("maxResults") Integer maxResults,
+                                @QueryParam("maxResults") String maxResultsParam,
                                 @QueryParam("nextToken") String nextToken) {
         String region = regionResolver.resolveRegion(headers);
         try {
-            ListResult<GatewayTarget> result =
-                    service.listTargets(id, maxResults != null ? maxResults : 0, nextToken, region);
+            Integer maxResults = Pagination.parseMaxResults(maxResultsParam, "ValidationException");
+            PaginatedResult<GatewayTarget> result = service.listTargets(id, maxResults, nextToken, region);
             ObjectNode out = objectMapper.createObjectNode();
             ArrayNode arr = out.putArray("items");
             for (GatewayTarget target : result.items()) {

@@ -6,9 +6,9 @@ import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.services.msk.model.ClusterState;
 import io.github.hectorvent.floci.services.msk.model.ConfigurationState;
-import io.github.hectorvent.floci.services.msk.model.ListResult;
 import io.github.hectorvent.floci.services.msk.model.MskCluster;
 import io.github.hectorvent.floci.services.msk.model.MskConfiguration;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -153,7 +153,7 @@ class MskServiceTest {
     void listConfigurations() {
         mskService.createConfiguration("config-1", "desc", List.of("3.6.0"), "props");
         mskService.createConfiguration("config-2", "desc", List.of("3.6.0"), "props");
-        List<MskConfiguration> configurations = mskService.listConfigurations(0, null).items();
+        List<MskConfiguration> configurations = mskService.listConfigurations(null, null).items();
         assertEquals(2, configurations.size());
     }
 
@@ -163,11 +163,11 @@ class MskServiceTest {
         mskService.createConfiguration("config-2", "desc", List.of("3.6.0"), "props");
         mskService.createConfiguration("config-3", "desc", List.of("3.6.0"), "props");
 
-        ListResult<MskConfiguration> firstPage = mskService.listConfigurations(2, null);
+        PaginatedResult<MskConfiguration> firstPage = mskService.listConfigurations(2, null);
         assertEquals(2, firstPage.items().size());
         assertNotNull(firstPage.nextToken());
 
-        ListResult<MskConfiguration> secondPage = mskService.listConfigurations(2, firstPage.nextToken());
+        PaginatedResult<MskConfiguration> secondPage = mskService.listConfigurations(2, firstPage.nextToken());
         assertEquals(1, secondPage.items().size());
         assertNull(secondPage.nextToken());
     }
@@ -178,8 +178,16 @@ class MskServiceTest {
     }
 
     @Test
+    void listConfigurationsRejectsZeroMaxResults() {
+        // AWS declares MaxResults with a minimum of 1; 0 is a real out-of-range value, not a
+        // synonym for "omitted" (that's represented by null instead).
+        AwsException ex = assertThrows(AwsException.class, () -> mskService.listConfigurations(0, null));
+        assertEquals("BadRequestException", ex.getErrorCode());
+    }
+
+    @Test
     void listConfigurationsRejectsInvalidNextToken() {
-        assertThrows(AwsException.class, () -> mskService.listConfigurations(0, "not-a-valid-token!!"));
+        assertThrows(AwsException.class, () -> mskService.listConfigurations(null, "not-a-valid-token!!"));
     }
 
     @Test
@@ -187,7 +195,7 @@ class MskServiceTest {
         MskConfiguration configuration = mskService.createConfiguration(
                 "test-config", "desc", List.of("3.6.0"), "props");
         mskService.deleteConfiguration(configuration.getArn());
-        assertTrue(mskService.listConfigurations(0, null).items().isEmpty());
+        assertTrue(mskService.listConfigurations(null, null).items().isEmpty());
     }
 
     // StorageBackend persists this model via plain Jackson serialization (PersistentStorage,

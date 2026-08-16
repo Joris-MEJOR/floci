@@ -61,4 +61,13 @@ class BedrockAgentCorePaginationIntegrationTest {
         assertEquals(collected.size(), new HashSet<>(collected).size(), "duplicate items across pages");
         assertTrue(collected.containsAll(mine), "a created runtime was dropped by pagination");
     }
+
+    // AWS declares MaxResults with a minimum of 1; 0 is real out-of-range input, not a
+    // synonym for "omitted" (an absent query param instead).
+    @Test
+    void listRuntimesRejectsZeroMaxResults() {
+        given().contentType("application/json").queryParam("maxResults", 0)
+                .when().post("/runtimes/")
+                .then().statusCode(400);
+    }
 }
