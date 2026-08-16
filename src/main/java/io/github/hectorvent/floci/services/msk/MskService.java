@@ -43,6 +43,7 @@ public class MskService {
     private final RegionResolver regionResolver;
     private final RedpandaManager redpandaManager;
     private final ScheduledExecutorService poller = Executors.newSingleThreadScheduledExecutor();
+    private final Object configurationUpdateLock = new Object();
 
     @Inject
     public MskService(StorageFactory storageFactory, EmulatorConfig config,
@@ -171,22 +172,36 @@ public class MskService {
     }
 
     public MskConfiguration updateConfiguration(String arn, String description, String serverProperties) {
-        MskConfiguration configuration = describeConfiguration(arn);
-        if (configuration.getState() != ConfigurationState.ACTIVE) {
-            throw new AwsException("BadRequestException",
-                    "Configuration must be ACTIVE to update: " + arn, 400);
-        }
         if (serverProperties == null || serverProperties.isBlank()) {
             throw new AwsException("BadRequestException", "serverProperties is required.", 400);
         }
 
-        long newRevisionNumber = configuration.getLatestRevision().getRevision() + 1;
-        configuration.getRevisions().add(new ConfigurationRevision(newRevisionNumber, Instant.now(), description));
-        configuration.getServerPropertiesByRevision().put(newRevisionNumber, serverProperties);
+        // Read-modify-write on the shared configuration: two concurrent updates for the same
+        // ARN could otherwise derive the same "next revision" number before either persists,
+        // silently overwriting one request's serverProperties under the other's revision key.
+        synchronized (configurationUpdateLock) {
+            MskConfiguration configuration = describeConfiguration(arn);
+            if (configuration.getState() != ConfigurationState.ACTIVE) {
+                throw new AwsException("BadRequestException",
+                        "Configuration must be ACTIVE to update: " + arn, 400);
+            }
+            ConfigurationRevision latestRevision = configuration.getLatestRevision();
+            if (latestRevision == null) {
+                // Only reachable for a configuration persisted by the pre-revision-history
+                // schema (see MskConfiguration's ignoreUnknown note) - it has no revisions to
+                // build on.
+                throw new AwsException("BadRequestException",
+                        "Configuration has no revision history and cannot be updated: " + arn, 400);
+            }
 
-        configurationStorage.put(arn, configuration);
-        LOG.infov("Updated MSK configuration {0} to revision {1}", configuration.getName(), newRevisionNumber);
-        return configuration;
+            long newRevisionNumber = latestRevision.getRevision() + 1;
+            configuration.getRevisions().add(new ConfigurationRevision(newRevisionNumber, Instant.now(), description));
+            configuration.getServerPropertiesByRevision().put(newRevisionNumber, serverProperties);
+
+            configurationStorage.put(arn, configuration);
+            LOG.infov("Updated MSK configuration {0} to revision {1}", configuration.getName(), newRevisionNumber);
+            return configuration;
+        }
     }
 
     public PaginatedResult<ConfigurationRevision> listConfigurationRevisions(String arn, Integer maxResults, String nextToken) {

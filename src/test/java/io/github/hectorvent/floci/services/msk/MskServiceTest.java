@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
@@ -19,7 +20,11 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
+import java.util.HashSet;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.when;
@@ -30,14 +35,26 @@ class MskServiceTest {
     private StorageFactory storageFactory;
     private EmulatorConfig config;
     private RedpandaManager redpandaManager;
+    // MskService's constructor creates the cluster backend first and the configuration backend
+    // second; captured here so tests can seed raw entries directly into the configuration store
+    // (e.g. to simulate a pre-revision-history persisted entry) without exposing it from MskService.
+    private StorageBackend<String, MskConfiguration> configurationStorage;
 
     @BeforeEach
     void setUp() {
         storageFactory = Mockito.mock(StorageFactory.class);
         // A fresh backend per call - MskService now creates two (clusters, configurations),
         // and a shared instance would let configuration scans see cluster entries and vice versa.
+        // The configuration backend is also captured by filename so tests can seed raw entries
+        // into it directly (e.g. to simulate a pre-revision-history persisted entry).
         when(storageFactory.create(Mockito.anyString(), Mockito.anyString(), Mockito.any()))
-                .thenAnswer(invocation -> AccountAwareStorageBackend.inMemory("000000000000"));
+                .thenAnswer(invocation -> {
+                    AccountAwareStorageBackend<?> backend = AccountAwareStorageBackend.inMemory("000000000000");
+                    if ("msk-configurations.json".equals(invocation.getArgument(1))) {
+                        configurationStorage = (StorageBackend<String, MskConfiguration>) backend;
+                    }
+                    return backend;
+                });
 
         config = Mockito.mock(EmulatorConfig.class);
         var servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
@@ -302,5 +319,85 @@ class MskServiceTest {
 
         assertEquals("auto.create.topics.enable=true",
                 restored.getServerPropertiesByRevision().get(1L));
+    }
+
+    // A configuration persisted by the pre-revision-history schema has "latestRevision"/
+    // "serverProperties" keys this class no longer maps to a field. Without
+    // @JsonIgnoreProperties(ignoreUnknown = true), this throws and fails the whole
+    // msk-configurations.json load, not just this one entry.
+    @Test
+    void deserializingPreRevisionHistorySchemaDoesNotThrow() throws Exception {
+        String oldSchemaJson = """
+                {
+                  "arn": "arn:aws:kafka:us-east-1:000000000000:configuration/legacy/id",
+                  "name": "legacy",
+                  "description": "desc",
+                  "kafkaVersions": ["3.6.0"],
+                  "state": "ACTIVE",
+                  "creationTime": 1700000000,
+                  "latestRevision": {"revision": 1, "creationTime": 1700000000, "description": "desc"},
+                  "serverProperties": "auto.create.topics.enable=true"
+                }
+                """;
+
+        ObjectMapper mapper = new ObjectMapper().registerModule(new JavaTimeModule());
+        MskConfiguration restored = mapper.readValue(oldSchemaJson, MskConfiguration.class);
+
+        assertEquals("legacy", restored.getName());
+        assertNull(restored.getLatestRevision());
+        assertTrue(restored.getRevisions().isEmpty());
+    }
+
+    @Test
+    void updateConfigurationOnPreRevisionHistoryEntryThrowsInsteadOfNpe() throws Exception {
+        String oldSchemaJson = """
+                {
+                  "arn": "arn:aws:kafka:us-east-1:000000000000:configuration/legacy/id",
+                  "name": "legacy",
+                  "kafkaVersions": ["3.6.0"],
+                  "state": "ACTIVE",
+                  "creationTime": 1700000000,
+                  "latestRevision": {"revision": 1, "creationTime": 1700000000},
+                  "serverProperties": "props"
+                }
+                """;
+        ObjectMapper mapper = new ObjectMapper().registerModule(new JavaTimeModule());
+        MskConfiguration legacy = mapper.readValue(oldSchemaJson, MskConfiguration.class);
+        // Seed the service's own backing store directly - the point of this test is what
+        // happens when MskService reads back an already-persisted legacy entry, not what
+        // happens to an object that was merely deserialized in isolation.
+        configurationStorage.put(legacy.getArn(), legacy);
+
+        AwsException ex = assertThrows(AwsException.class, () -> {
+            mskService.updateConfiguration(legacy.getArn(), "new desc", "new-props");
+        });
+        assertEquals("BadRequestException", ex.getErrorCode());
+    }
+
+    @Test
+    void concurrentUpdatesProduceDistinctRevisionsWithoutOverwritingServerProperties() throws InterruptedException {
+        MskConfiguration created = mskService.createConfiguration(
+                "concurrent-config", "v0", List.of("3.6.0"), "props-v0");
+
+        int updates = 16;
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        for (int i = 0; i < updates; i++) {
+            int idx = i;
+            pool.submit(() -> mskService.updateConfiguration(created.getArn(), "v" + idx, "props-" + idx));
+        }
+        pool.shutdown();
+        assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS), "updates did not finish");
+
+        MskConfiguration finalState = mskService.describeConfiguration(created.getArn());
+        List<Long> revisionNumbers = finalState.getRevisions().stream()
+                .map(ConfigurationRevision::getRevision).toList();
+
+        assertEquals(1 + updates, revisionNumbers.size(), "revision count");
+        assertEquals(revisionNumbers.size(), new HashSet<>(revisionNumbers).size(),
+                "duplicate revision numbers were assigned");
+        for (long revision : revisionNumbers) {
+            assertNotNull(finalState.getServerPropertiesByRevision().get(revision),
+                    "revision " + revision + " lost its serverProperties");
+        }
     }
 }

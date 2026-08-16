@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.msk.model;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
@@ -10,6 +11,13 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+// A configuration persisted by the previous (pre-revision-history) schema has
+// "latestRevision"/"serverProperties" keys this class no longer maps - without
+// ignoreUnknown, loading it would throw and fail the whole msk-configurations.json load,
+// not just that one entry. Ignoring them leaves that entry with no revision history rather
+// than crashing storage; MskService#updateConfiguration guards the resulting
+// getLatestRevision() == null case explicitly.
+@JsonIgnoreProperties(ignoreUnknown = true)
 @RegisterForReflection
 public class MskConfiguration {
 
