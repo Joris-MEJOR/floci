@@ -204,20 +204,31 @@ public class MskService {
     }
 
     public PaginatedResult<ConfigurationRevision> listConfigurationRevisions(String arn, Integer maxResults, String nextToken) {
-        MskConfiguration configuration = describeConfiguration(arn);
-        return Pagination.paginate(configuration.getRevisions(),
+        // Snapshot revisions under the same lock updateConfiguration writes under - revisions and
+        // serverPropertiesByRevision are plain (non-concurrent) collections, so reading them
+        // outside the lock while a write is in flight risks more than stale data: a torn
+        // ArrayList/HashMap iteration or a ConcurrentModificationException.
+        List<ConfigurationRevision> revisions;
+        synchronized (configurationUpdateLock) {
+            revisions = describeConfiguration(arn).getRevisions();
+        }
+        return Pagination.paginate(revisions,
                 revision -> String.format("%019d", revision.getRevision()),
                 maxResults, nextToken, MAX_PAGE, "BadRequestException");
     }
 
     public ConfigurationRevisionDetail describeConfigurationRevision(String arn, long revision) {
-        MskConfiguration configuration = describeConfiguration(arn);
-        ConfigurationRevision found = configuration.getRevisions().stream()
-                .filter(r -> r.getRevision() == revision)
-                .findFirst()
-                .orElseThrow(() -> new AwsException("NotFoundException",
-                        "Revision not found: " + revision + " for configuration " + arn, 404));
-        String serverProperties = configuration.getServerPropertiesByRevision().get(revision);
+        ConfigurationRevision found;
+        String serverProperties;
+        synchronized (configurationUpdateLock) {
+            MskConfiguration configuration = describeConfiguration(arn);
+            found = configuration.getRevisions().stream()
+                    .filter(r -> r.getRevision() == revision)
+                    .findFirst()
+                    .orElseThrow(() -> new AwsException("NotFoundException",
+                            "Revision not found: " + revision + " for configuration " + arn, 404));
+            serverProperties = configuration.getServerPropertiesByRevision().get(revision);
+        }
         return new ConfigurationRevisionDetail(arn, found.getCreationTime(), found.getDescription(),
                 revision, serverProperties);
     }
