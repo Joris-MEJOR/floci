@@ -64,8 +64,7 @@ public class MskConfiguration {
         this.kafkaVersions = kafkaVersions;
         this.state = ConfigurationState.ACTIVE;
         this.creationTime = Instant.now();
-        this.revisions.add(new ConfigurationRevision(1L, this.creationTime, description));
-        this.serverPropertiesByRevision.put(1L, serverProperties);
+        addRevision(new ConfigurationRevision(1L, this.creationTime, description), serverProperties);
     }
 
     public String getArn() { return arn; }
@@ -95,14 +94,26 @@ public class MskConfiguration {
         return revisions.isEmpty() ? null : revisions.get(revisions.size() - 1);
     }
 
-    public List<ConfigurationRevision> getRevisions() { return revisions; }
+    // Read-only views: callers must go through addRevision() to mutate, so this class controls
+    // publish order (server properties land before the revision that references them becomes
+    // visible) rather than letting a caller append to a live list a reader can observe mid-update.
+    public List<ConfigurationRevision> getRevisions() { return List.copyOf(revisions); }
     public void setRevisions(List<ConfigurationRevision> revisions) {
-        this.revisions = revisions != null ? revisions : new ArrayList<>();
+        this.revisions = revisions != null ? new ArrayList<>(revisions) : new ArrayList<>();
     }
 
-    public Map<Long, String> getServerPropertiesByRevision() { return serverPropertiesByRevision; }
+    public Map<Long, String> getServerPropertiesByRevision() { return Map.copyOf(serverPropertiesByRevision); }
     public void setServerPropertiesByRevision(Map<Long, String> serverPropertiesByRevision) {
-        this.serverPropertiesByRevision = serverPropertiesByRevision != null ? serverPropertiesByRevision : new HashMap<>();
+        this.serverPropertiesByRevision = serverPropertiesByRevision != null
+                ? new HashMap<>(serverPropertiesByRevision) : new HashMap<>();
+    }
+
+    // Server properties are stored before the revision that references them is appended, so a
+    // reader who isn't holding the caller's update lock can never observe a revision whose
+    // properties aren't there yet (see MskService#updateConfiguration).
+    public void addRevision(ConfigurationRevision revision, String serverProperties) {
+        this.serverPropertiesByRevision.put(revision.getRevision(), serverProperties);
+        this.revisions.add(revision);
     }
 
     public String getAccountId() { return accountId; }

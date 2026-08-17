@@ -195,8 +195,7 @@ public class MskService {
             }
 
             long newRevisionNumber = latestRevision.getRevision() + 1;
-            configuration.getRevisions().add(new ConfigurationRevision(newRevisionNumber, Instant.now(), description));
-            configuration.getServerPropertiesByRevision().put(newRevisionNumber, serverProperties);
+            configuration.addRevision(new ConfigurationRevision(newRevisionNumber, Instant.now(), description), serverProperties);
 
             configurationStorage.put(arn, configuration);
             LOG.infov("Updated MSK configuration {0} to revision {1}", configuration.getName(), newRevisionNumber);
