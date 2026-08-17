@@ -164,11 +164,17 @@ public class MskService {
     }
 
     public MskConfiguration deleteConfiguration(String arn) {
-        MskConfiguration configuration = describeConfiguration(arn);
-        configuration.setState(ConfigurationState.DELETING);
-        configurationStorage.delete(arn);
-        LOG.infov("Deleted MSK configuration: {0}", configuration.getName());
-        return configuration;
+        // Shares updateConfiguration's lock so the two can't interleave: without it, a delete
+        // could remove the entry while an in-flight update still holds its pre-delete read,
+        // then that update's own put(arn, ...) at the end of its critical section would put the
+        // "deleted" configuration right back, resurrecting it.
+        synchronized (configurationUpdateLock) {
+            MskConfiguration configuration = describeConfiguration(arn);
+            configuration.setState(ConfigurationState.DELETING);
+            configurationStorage.delete(arn);
+            LOG.infov("Deleted MSK configuration: {0}", configuration.getName());
+            return configuration;
+        }
     }
 
     public MskConfiguration updateConfiguration(String arn, String description, String serverProperties) {

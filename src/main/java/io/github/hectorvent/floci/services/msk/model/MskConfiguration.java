@@ -6,10 +6,10 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 // A configuration persisted by the previous (pre-revision-history) schema has
 // "latestRevision"/"serverProperties" keys this class no longer maps - without
@@ -42,14 +42,19 @@ public class MskConfiguration {
     // Full revision history, oldest first. AWS's Configuration/CreateConfigurationResponse/
     // DescribeConfigurationResponse shapes only ever expose the latest one (see
     // getLatestRevision()); the full list backs ListConfigurationRevisions.
+    //
+    // Concurrent-safe by construction (CopyOnWriteArrayList/ConcurrentHashMap), not just by
+    // convention: getLatestRevision() and the getters below are read from MskController with no
+    // access to MskService#configurationUpdateLock, so a plain ArrayList/HashMap here would let
+    // an in-flight updateConfiguration() on another thread corrupt or crash an unrelated read.
     @JsonProperty("revisions")
-    private List<ConfigurationRevision> revisions = new ArrayList<>();
+    private List<ConfigurationRevision> revisions = new CopyOnWriteArrayList<>();
 
     // Decoded server.properties content, keyed by revision. AWS never returns this on the
     // configuration/latestRevision shapes - only DescribeConfigurationRevision - so it's kept
     // out of ConfigurationRevision itself, which those other shapes serialize directly.
     @JsonProperty("serverPropertiesByRevision")
-    private Map<Long, String> serverPropertiesByRevision = new HashMap<>();
+    private Map<Long, String> serverPropertiesByRevision = new ConcurrentHashMap<>();
 
     @JsonIgnore
     private String accountId;
@@ -99,13 +104,13 @@ public class MskConfiguration {
     // visible) rather than letting a caller append to a live list a reader can observe mid-update.
     public List<ConfigurationRevision> getRevisions() { return List.copyOf(revisions); }
     public void setRevisions(List<ConfigurationRevision> revisions) {
-        this.revisions = revisions != null ? new ArrayList<>(revisions) : new ArrayList<>();
+        this.revisions = revisions != null ? new CopyOnWriteArrayList<>(revisions) : new CopyOnWriteArrayList<>();
     }
 
     public Map<Long, String> getServerPropertiesByRevision() { return Map.copyOf(serverPropertiesByRevision); }
     public void setServerPropertiesByRevision(Map<Long, String> serverPropertiesByRevision) {
         this.serverPropertiesByRevision = serverPropertiesByRevision != null
-                ? new HashMap<>(serverPropertiesByRevision) : new HashMap<>();
+                ? new ConcurrentHashMap<>(serverPropertiesByRevision) : new ConcurrentHashMap<>();
     }
 
     // Server properties are stored before the revision that references them is appended, so a
