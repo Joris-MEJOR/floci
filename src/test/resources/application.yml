@@ -65,6 +65,8 @@ floci:
         flush-interval-ms: 60000
       rum:
         flush-interval-ms: 60000
+      guardduty:
+        flush-interval-ms: 60000
 
   auth:
     validate-signatures: false
@@ -177,6 +179,8 @@ floci:
       enabled: true
     firehose:
       enabled: true
+      tick-interval-seconds: 10
+      flush-record-count: 0
     kms:
       enabled: true
     cognito:
@@ -302,5 +306,8 @@ floci:
         port: 1883
     iotdata:
       enabled: true
+    cloudhsmv2:
     rum:
+      enabled: true
+    guardduty:
       enabled: true

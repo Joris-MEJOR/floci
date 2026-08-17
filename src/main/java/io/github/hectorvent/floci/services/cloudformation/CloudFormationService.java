@@ -33,6 +33,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -727,19 +728,19 @@ public class CloudFormationService {
 
             if (!isCreate) {
                 updateCommitted = true;
-                if (hasReplacementUpdates(stack)) {
+                if (hasReplacementUpdates(stack) || hasRemovedOrConditionFalseResources(stack, resources, conditions)) {
                     stack.setStatus("UPDATE_COMPLETE_CLEANUP_IN_PROGRESS");
                     stack.setLastUpdatedTime(now());
                     addEvent(stack, stack.getStackName(), stack.getStackId(),
                             "AWS::CloudFormation::Stack",
                             "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS", null);
                     // The committed template and new physical IDs must be durable before old
-                    // resources are deleted during replacement cleanup.
+                    // resources are deleted during post-update cleanup.
                     persistStack(stack);
                 }
                 // Both cleanup paths feed the single final status/reason writer.
                 List<UpdateCleanupFailure> cleanupFailures =
-                        new ArrayList<>(deleteInactiveConditionResources(
+                        new ArrayList<>(deleteRemovedOrConditionFalseResources(
                                 stack, resources, conditions, region));
                 cleanupFailures.addAll(finishCommittedResourceCleanup(stack));
                 finishCommittedStackUpdate(stack, cleanupFailures);
@@ -912,6 +913,52 @@ public class CloudFormationService {
                 .anyMatch(provisioner::hasReplacementUpdate);
     }
 
+    private boolean hasRemovedOrConditionFalseResources(Stack stack, JsonNode resources, Map<String, Boolean> conditions) {
+        if (!resources.isObject()) {
+            return false;
+        }
+        for (StackResource resource : stack.getResources().values()) {
+            JsonNode resDef = resources.get(resource.getLogicalId());
+            if (resDef == null) {
+                return true;
+            }
+            String condition = resDef.path("Condition").asText(null);
+            if (condition != null && !conditions.getOrDefault(condition, false)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void deleteResourcePhysically(StackResource resource, String region) throws Exception {
+        if ("AWS::CloudFormation::Stack".equals(resource.getResourceType())) {
+            Future<?> future = deleteStack(resource.getPhysicalId(), region, regionResolver.getAccountId());
+            if (future != null) {
+                try {
+                    future.get();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                } catch (ExecutionException e) {
+                    Throwable cause = e.getCause();
+                    if (cause instanceof Exception ex) {
+                        throw ex;
+                    }
+                    throw e;
+                }
+            }
+            Stack child = resolveStack(resource.getPhysicalId(), region);
+            if (child != null && "DELETE_FAILED".equals(child.getStatus())) {
+                String reason = child.getStatusReason() != null
+                        ? child.getStatusReason()
+                        : "Nested stack deletion failed";
+                throw new IllegalStateException(reason);
+            }
+        } else {
+            provisioner.delete(resource, region);
+        }
+    }
+
     private void rollbackFailedUpdate(
             Stack stack,
             String region,
@@ -977,7 +1024,7 @@ public class CloudFormationService {
                         addEvent(stack, resource.getLogicalId(), resource.getPhysicalId(),
                                 resource.getResourceType(), "DELETE_IN_PROGRESS",
                                 "Resource creation cancelled during update rollback");
-                        provisioner.delete(resource, region);
+                        deleteResourcePhysically(resource, region);
                     }
                     addEvent(stack, resource.getLogicalId(), resource.getPhysicalId(),
                             resource.getResourceType(), "DELETE_COMPLETE",
@@ -1120,7 +1167,7 @@ public class CloudFormationService {
             addEvent(stack, resource.getLogicalId(), resource.getPhysicalId(),
                     resource.getResourceType(), "DELETE_IN_PROGRESS", null);
             try {
-                provisioner.delete(resource, region);
+                deleteResourcePhysically(resource, region);
                 resource.setStatus("DELETE_COMPLETE");
                 addEvent(stack, resource.getLogicalId(), resource.getPhysicalId(),
                         resource.getResourceType(), "DELETE_COMPLETE", null);
@@ -1140,15 +1187,15 @@ public class CloudFormationService {
 
     /**
      * Removes resources that were provisioned by an earlier execution but whose resource-level
-     * {@code Condition} is false in the current template. Physical deletion honors the resource's
-     * deletion policy. A failed physical deletion leaves the resource in the underlying service and
-     * keeps it under stack management as {@code DELETE_FAILED}, so a later {@code DeleteStack} or
-     * {@code UpdateStack} can retry the cleanup instead of orphaning the backing resource.
-     * Resources removed from the template entirely are outside this condition-specific cleanup.
+     * {@code Condition} is false in the current template, or that were removed from the template entirely.
+     * Physical deletion honors the resource's retention policy ({@code Retain}, {@code RetainExceptOnCreate}).
+     * A failed physical deletion leaves the resource in the underlying service and keeps it under stack management
+     * as {@code DELETE_FAILED}, so a later {@code DeleteStack} or {@code UpdateStack} can retry the cleanup
+     * instead of orphaning the backing resource.
      *
      * @return one {@link UpdateCleanupFailure} per resource whose physical deletion failed
      */
-    private List<UpdateCleanupFailure> deleteInactiveConditionResources(Stack stack, JsonNode resources,
+    private List<UpdateCleanupFailure> deleteRemovedOrConditionFalseResources(Stack stack, JsonNode resources,
                                                            Map<String, Boolean> conditions, String region) {
         if (!resources.isObject()) {
             return List.of();
@@ -1159,12 +1206,11 @@ public class CloudFormationService {
         Collections.reverse(ordered);
         for (StackResource resource : ordered) {
             JsonNode resDef = resources.get(resource.getLogicalId());
-            if (resDef == null) {
-                continue;
-            }
-            String condition = resDef.path("Condition").asText(null);
-            if (condition == null || conditions.getOrDefault(condition, false)) {
-                continue;
+            if (resDef != null) {
+                String condition = resDef.path("Condition").asText(null);
+                if (condition == null || conditions.getOrDefault(condition, false)) {
+                    continue;
+                }
             }
 
             if (resource.getPhysicalId() == null || skipRetainedResource(stack, resource, false)) {
@@ -1175,7 +1221,7 @@ public class CloudFormationService {
             addEvent(stack, resource.getLogicalId(), resource.getPhysicalId(),
                     resource.getResourceType(), "DELETE_IN_PROGRESS", null);
             try {
-                provisioner.delete(resource, region);
+                deleteResourcePhysically(resource, region);
                 addEvent(stack, resource.getLogicalId(), resource.getPhysicalId(),
                         resource.getResourceType(), "DELETE_COMPLETE", null);
                 stack.getResources().remove(resource.getLogicalId());
@@ -1192,7 +1238,7 @@ public class CloudFormationService {
                 resource.setStatusReason(reason);
                 addEvent(stack, resource.getLogicalId(), resource.getPhysicalId(),
                         resource.getResourceType(), "DELETE_FAILED", reason);
-                LOG.warnv("Failed to delete condition-disabled {0} ({1}) in stack {2}: {3}",
+                LOG.warnv("Failed to delete removed or condition-disabled {0} ({1}) in stack {2}: {3}",
                         resource.getResourceType(), resource.getPhysicalId(),
                         stack.getStackName(), reason);
             }
@@ -1223,7 +1269,7 @@ public class CloudFormationService {
                 addEvent(stack, resource.getLogicalId(), resource.getPhysicalId(),
                         resource.getResourceType(), "DELETE_IN_PROGRESS", null);
                 try {
-                    provisioner.delete(resource, region);
+                    deleteResourcePhysically(resource, region);
                     resource.setStatus("DELETE_COMPLETE");
                     addEvent(stack, resource.getLogicalId(), resource.getPhysicalId(),
                             resource.getResourceType(), "DELETE_COMPLETE", null);
@@ -1250,8 +1296,9 @@ public class CloudFormationService {
                 stack.setStatusReason(reason);
                 addEvent(stack, stack.getStackName(), stack.getStackId(),
                         "AWS::CloudFormation::Stack", "DELETE_FAILED", reason);
+                persistStack(stack);
                 LOG.errorv("Stack {0} delete failed: {1}", stack.getStackName(), reason);
-                return;
+                throw new IllegalStateException(reason);
             }
 
             stack.setStatus("DELETE_COMPLETE");
@@ -1269,6 +1316,8 @@ public class CloudFormationService {
             LOG.errorv("Stack {0} delete failed: {1}", stack.getStackName(), e.getMessage());
             stack.setStatus("DELETE_FAILED");
             stack.setStatusReason(e.getMessage());
+            persistStack(stack);
+            throw (e instanceof RuntimeException re ? re : new RuntimeException(e));
         }
     }
 

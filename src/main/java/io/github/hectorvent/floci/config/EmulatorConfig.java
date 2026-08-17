@@ -282,6 +282,7 @@ public interface EmulatorConfig {
         ElasticBeanstalkStorageConfig elasticbeanstalk();
         CloudTrailStorageConfig cloudtrail();
         RumStorageConfig rum();
+        GuardDutyStorageConfig guardduty();
     }
 
     interface SsmStorageConfig {
@@ -504,6 +505,13 @@ public interface EmulatorConfig {
         long flushIntervalMs();
     }
 
+    interface GuardDutyStorageConfig {
+        Optional<String> mode();
+
+        @WithDefault("5000")
+        long flushIntervalMs();
+    }
+
     interface CodeDeployStorageConfig {
         Optional<String> mode();
 
@@ -608,7 +616,9 @@ public interface EmulatorConfig {
         S3TablesServiceConfig s3tables();
         IotServiceConfig iot();
         IotDataServiceConfig iotdata();
+        CloudHsmV2ServiceConfig cloudhsmv2();
         RumServiceConfig rum();
+        GuardDutyServiceConfig guardduty();
     }
 
     interface IotServiceConfig {
@@ -638,6 +648,11 @@ public interface EmulatorConfig {
     }
 
     interface RumServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface GuardDutyServiceConfig {
         @WithDefault("true")
         boolean enabled();
     }
@@ -1083,6 +1098,22 @@ public interface EmulatorConfig {
     interface FirehoseServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        /**
+         * How often the buffer flusher checks for streams whose buffering
+         * interval (BufferingHints.IntervalInSeconds) has elapsed.
+         */
+        @WithDefault("10")
+        long tickIntervalSeconds();
+
+        /**
+         * Emulator-only volume trigger: number of buffered records that forces
+         * an immediate flush, complementing the stream's BufferingHints.
+         * Disabled by default (0) so out-of-the-box delivery matches real AWS;
+         * set to 1 for LocalStack-style record-at-a-time delivery in local dev.
+         */
+        @WithDefault("0")
+        int flushRecordCount();
     }
 
     interface KmsServiceConfig {
@@ -1139,6 +1170,11 @@ public interface EmulatorConfig {
         /** Seconds to wait before transitioning from PENDING_VALIDATION to ISSUED (0 = immediate) */
         @WithDefault("0")
         int validationWaitSeconds();
+    }
+
+    interface CloudHsmV2ServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
     }
 
     interface AthenaServiceConfig {
@@ -1507,8 +1543,9 @@ public interface EmulatorConfig {
          * When set, no AWS credential env vars are injected; instead
          * AWS_SHARED_CREDENTIALS_FILE and AWS_CONFIG_FILE are set to point at
          * the mounted files, ensuring SDK discovery works regardless of container HOME.
-         * When absent, Floci injects credentials from its own environment
-         * (AWS_ACCESS_KEY_ID, etc.) or falls back to test/test/test.
+         * When absent, a function whose execution role exists in Floci receives temporary
+         * credentials for that role. Functions with an unknown role retain the compatibility
+         * fallback to Floci's own AWS credential environment or test/test/test.
          * Blank values are treated as absent.
          *
          * Env var: FLOCI_SERVICES_LAMBDA_AWS_CONFIG_PATH

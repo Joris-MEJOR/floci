@@ -59,6 +59,7 @@ quarkus:
       - --initialize-at-run-time=io.github.hectorvent.floci.services.emr.EmrService
       - --initialize-at-run-time=io.github.hectorvent.floci.services.elasticbeanstalk.ElasticBeanstalkService
       - --initialize-at-run-time=graphql.util.IdGenerator
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.lambda.launcher.LambdaExecutionRoleCredentials
 
 
 floci:
@@ -142,6 +143,8 @@ floci:
       appsync:
         flush-interval-ms: 5000
       rum:
+        flush-interval-ms: 5000
+      guardduty:
         flush-interval-ms: 5000
 
   dns:
@@ -311,6 +314,8 @@ floci:
       enabled: true
     firehose:
       enabled: true
+      tick-interval-seconds: 10
+      flush-record-count: 0
     kms:
       enabled: true
     cognito:
@@ -489,5 +494,8 @@ floci:
         port: 1883
     iotdata:
       enabled: true
+    cloudhsmv2:
     rum:
+      enabled: true
+    guardduty:
       enabled: true

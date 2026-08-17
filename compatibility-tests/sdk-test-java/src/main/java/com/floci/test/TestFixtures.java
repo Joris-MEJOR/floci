@@ -4,6 +4,7 @@ import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.cloudformation.CloudFormationClient;
+import software.amazon.awssdk.services.cloudhsmv2.CloudHsmV2Client;
 import software.amazon.awssdk.services.cloudfront.CloudFrontClient;
 import software.amazon.awssdk.services.cloudtrail.CloudTrailClient;
 import software.amazon.awssdk.services.cloudwatch.CloudWatchClient;
@@ -25,6 +26,7 @@ import software.amazon.awssdk.services.lambda.LambdaClient;
 import software.amazon.awssdk.services.opensearch.OpenSearchClient;
 import software.amazon.awssdk.services.neptune.NeptuneClient;
 import software.amazon.awssdk.services.rds.RdsClient;
+import software.amazon.awssdk.services.guardduty.GuardDutyClient;
 import software.amazon.awssdk.services.rum.RumClient;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.endpoints.Endpoint;
@@ -247,6 +249,14 @@ public final class TestFixtures {
     // ============================================
     // AWS Client Factories
     // ============================================
+
+        public static CloudHsmV2Client cloudHsmV2Client() {
+        return CloudHsmV2Client.builder()
+                .endpointOverride(ENDPOINT)
+                .region(REGION)
+                .credentialsProvider(CREDENTIALS)
+                .build();
+    }
 
     public static SsmClient ssmClient() {
         return SsmClient.builder()
@@ -704,6 +714,14 @@ public final class TestFixtures {
 
     public static RumClient rumClient() {
         return RumClient.builder()
+                .endpointOverride(ENDPOINT)
+                .region(REGION)
+                .credentialsProvider(CREDENTIALS)
+                .build();
+    }
+
+    public static GuardDutyClient guardDutyClient() {
+        return GuardDutyClient.builder()
                 .endpointOverride(ENDPOINT)
                 .region(REGION)
                 .credentialsProvider(CREDENTIALS)

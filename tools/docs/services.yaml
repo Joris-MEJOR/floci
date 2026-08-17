@@ -26,6 +26,10 @@ services:
     doc: docs/services/cloudformation.md
     sources:
       - { path: src/main/java/io/github/hectorvent/floci/services/cloudformation/CloudFormationQueryHandler.java, mode: switch }
+  - service: cloudhsmv2
+    doc: docs/services/cloudhsmv2.md
+    sources:
+      - { path: src/main/java/io/github/hectorvent/floci/services/cloudhsmv2/CloudHsmV2JsonHandler.java, mode: switch }
   - service: cloudtrail
     doc: docs/services/cloudtrail.md
     sources:
