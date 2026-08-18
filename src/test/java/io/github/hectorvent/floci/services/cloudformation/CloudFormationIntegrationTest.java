@@ -19,6 +19,11 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Base64;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 import static io.restassured.RestAssured.given;
@@ -9533,6 +9538,62 @@ class CloudFormationIntegrationTest {
         .then()
             .body(containsString("AlreadyExistsException"))
             .body(containsString("already exists"));
+    }
+
+    @Test
+    void createStack_concurrentRequestsForUnusedName_exactlyOneSucceeds() throws InterruptedException {
+        // The existence check and the stack-map insert used to be two separate operations, so two
+        // requests racing for the same never-before-used name could both observe "absent" and then
+        // share whichever Stack computeIfAbsent settled on, each independently executing the
+        // template - duplicate provisioning instead of one AlreadyExistsException. Verifies the
+        // check-and-insert is now atomic.
+        String template = """
+            {
+              "Resources": {
+                "MyBus": { "Type": "AWS::Events::EventBus", "Properties": { "Name": "cfn-2207-concurrent-bus" } }
+              }
+            }
+            """;
+        String stackName = "cfn-2207-concurrent-stack";
+        int attempts = 16;
+
+        CountDownLatch ready = new CountDownLatch(attempts);
+        CountDownLatch go = new CountDownLatch(1);
+        AtomicInteger succeeded = new AtomicInteger();
+        AtomicInteger conflicted = new AtomicInteger();
+        ExecutorService pool = Executors.newFixedThreadPool(attempts);
+        try {
+            for (int i = 0; i < attempts; i++) {
+                pool.submit(() -> {
+                    ready.countDown();
+                    try {
+                        go.await();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    String body = given()
+                        .contentType("application/x-www-form-urlencoded")
+                        .formParam("Action", "CreateStack")
+                        .formParam("StackName", stackName)
+                        .formParam("TemplateBody", template)
+                    .when().post("/").then().extract().asString();
+                    if (body.contains("AlreadyExistsException")) {
+                        conflicted.incrementAndGet();
+                    } else if (body.contains("<StackId>")) {
+                        succeeded.incrementAndGet();
+                    }
+                });
+            }
+            assertTrue(ready.await(10, TimeUnit.SECONDS), "workers failed to line up in time");
+            go.countDown();
+        } finally {
+            pool.shutdown();
+            assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS), "requests did not finish in time");
+        }
+
+        assertEquals(1, succeeded.get(), "exactly one CreateStack should have won the race");
+        assertEquals(attempts - 1, conflicted.get(), "every other request should see AlreadyExistsException");
     }
 
     @Test

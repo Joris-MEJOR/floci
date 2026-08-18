@@ -179,22 +179,26 @@ public class CloudFormationService {
         // (deleting the failed attempt at execute time, not here - see the ROLLBACK_COMPLETE
         // handling in executeChangeSet) rather than throwing. Every other existing status is a
         // real conflict.
+        //
+        // The existence check and the insert must be one atomic operation: compute() holds the
+        // map's per-key lock for the whole call, so two CreateStack requests racing for the same
+        // unused name can no longer both see "absent" and then share whichever Stack
+        // computeIfAbsent settled on - the second one now finds the first's (non-ROLLBACK_COMPLETE)
+        // stack already there and throws, instead of both executing the template concurrently.
         boolean isCreateType = changeSetType == null || "CREATE".equalsIgnoreCase(changeSetType);
-        Stack existing = stacks.get(key(stackName, region));
-        if (isCreateType && existing != null && !"ROLLBACK_COMPLETE".equals(existing.getStatus())) {
-            throw new AwsException("AlreadyExistsException",
-                    "Stack [" + stackName + "] already exists", 400);
-        }
-
-        // Detect first creation atomically: the mapping function runs at most once per key, so the
-        // flag is only set for the thread that actually creates the stack (no double-recording under
-        // concurrent CreateChangeSet calls).
         boolean[] stackCreated = {false};
-        Stack stack = stacks.computeIfAbsent(key(stackName, region), k -> {
-            stackCreated[0] = true;
-            Stack s = newStack(stackName, region);
-            if (tags != null) s.getTags().putAll(tags);
-            return s;
+        Stack stack = stacks.compute(key(stackName, region), (k, existing) -> {
+            if (existing == null) {
+                stackCreated[0] = true;
+                Stack s = newStack(stackName, region);
+                if (tags != null) s.getTags().putAll(tags);
+                return s;
+            }
+            if (isCreateType && !"ROLLBACK_COMPLETE".equals(existing.getStatus())) {
+                throw new AwsException("AlreadyExistsException",
+                        "Stack [" + stackName + "] already exists", 400);
+            }
+            return existing;
         });
 
         // A CREATE change set puts a brand-new stack into REVIEW_IN_PROGRESS. Record the matching
