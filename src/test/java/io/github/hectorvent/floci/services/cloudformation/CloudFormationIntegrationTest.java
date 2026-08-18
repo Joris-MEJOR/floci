@@ -9506,6 +9506,122 @@ class CloudFormationIntegrationTest {
     }
 
     @Test
+    void createStack_onExistingActiveStack_throwsAlreadyExistsException() {
+        String template = """
+            {
+              "Resources": {
+                "MyBus": { "Type": "AWS::Events::EventBus", "Properties": { "Name": "cfn-2207-active-bus" } }
+              }
+            }
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", "cfn-2207-active-stack")
+            .formParam("TemplateBody", template)
+        .when().post("/").then().statusCode(200);
+
+        // A second CreateStack for the same name, while the first is still ACTIVE, is a real
+        // conflict - it must not silently re-run the template against the live stack.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", "cfn-2207-active-stack")
+            .formParam("TemplateBody", template)
+        .when().post("/")
+        .then()
+            .body(containsString("AlreadyExistsException"))
+            .body(containsString("already exists"));
+    }
+
+    @Test
+    void createStack_redeployOverRollbackComplete_succeedsWithFreshStack() {
+        // #2207: floci used to give callers no way to redeploy over ROLLBACK_COMPLETE except an
+        // explicit DeleteStack first - which destroyed the failed attempt's DescribeStackEvents
+        // before an operator had a chance to read them. AWS instead lets CreateStack proceed
+        // directly over ROLLBACK_COMPLETE, deleting the failed attempt at that point.
+        String failingTemplate = """
+            {
+              "Resources": {
+                "BadSecret": {
+                  "Type": "AWS::SecretsManager::Secret",
+                  "Properties": {
+                    "Name": "cfn-2207-redeploy-secret",
+                    "SecretString": "explicit",
+                    "GenerateSecretString": { "PasswordLength": 32 }
+                  }
+                }
+              }
+            }
+            """;
+        String stackName = "cfn-2207-redeploy-stack";
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", failingTemplate)
+        .when().post("/").then().statusCode(200);
+
+        String failedDescribe = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when().post("/").then().extract().asString();
+        assertThat(failedDescribe, containsString("<StackStatus>ROLLBACK_COMPLETE</StackStatus>"));
+        String firstStackId = failedDescribe.substring(
+                failedDescribe.indexOf("<StackId>") + 9, failedDescribe.indexOf("</StackId>"));
+
+        // The failed attempt's diagnostic is still readable right up until the redeploy.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackEvents")
+            .formParam("StackName", stackName)
+        .when().post("/")
+        .then().statusCode(200).body(containsString("CREATE_FAILED"));
+
+        String workingTemplate = """
+            {
+              "Resources": {
+                "MyBus": { "Type": "AWS::Events::EventBus", "Properties": { "Name": "cfn-2207-redeploy-bus" } }
+              }
+            }
+            """;
+
+        String createXml = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", workingTemplate)
+        .when().post("/")
+        .then().statusCode(200).extract().asString();
+
+        // The redeploy is a fresh stack, not a resumed one - new StackId, no leftover BadSecret.
+        assertThat(createXml, not(containsString(firstStackId)));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when().post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"))
+            .body(not(containsString(firstStackId)));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackResources")
+            .formParam("StackName", stackName)
+        .when().post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("MyBus"))
+            .body(not(containsString("BadSecret")));
+    }
+
+    @Test
     void createStack_apiGatewayRestApi_withEndpointConfiguration() {
         String template = """
             {
