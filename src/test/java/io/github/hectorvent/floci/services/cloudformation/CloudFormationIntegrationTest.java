@@ -9597,11 +9597,13 @@ class CloudFormationIntegrationTest {
     }
 
     @Test
-    void createStack_redeployOverRollbackComplete_succeedsWithFreshStack() {
-        // #2207: floci used to give callers no way to redeploy over ROLLBACK_COMPLETE except an
-        // explicit DeleteStack first - which destroyed the failed attempt's DescribeStackEvents
-        // before an operator had a chance to read them. AWS instead lets CreateStack proceed
-        // directly over ROLLBACK_COMPLETE, deleting the failed attempt at that point.
+    void createStack_onRollbackCompleteStack_alsoThrowsAlreadyExistsException() {
+        // #2207: a stack whose first CREATE fails ends in ROLLBACK_COMPLETE and stays fully
+        // describable - it is not deleted eagerly at rollback time. Matching real AWS,
+        // ROLLBACK_COMPLETE is still a real conflict for CreateStack: an explicit DeleteStack is
+        // required before the name can be reused (verified against AWS's own CreateStack API
+        // reference and troubleshooting docs, which list AlreadyExists unconditionally - there is
+        // no ROLLBACK_COMPLETE carve-out).
         String failingTemplate = """
             {
               "Resources": {
@@ -9625,22 +9627,38 @@ class CloudFormationIntegrationTest {
             .formParam("TemplateBody", failingTemplate)
         .when().post("/").then().statusCode(200);
 
-        String failedDescribe = given()
+        given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "DescribeStacks")
             .formParam("StackName", stackName)
-        .when().post("/").then().extract().asString();
-        assertThat(failedDescribe, containsString("<StackStatus>ROLLBACK_COMPLETE</StackStatus>"));
-        String firstStackId = failedDescribe.substring(
-                failedDescribe.indexOf("<StackId>") + 9, failedDescribe.indexOf("</StackId>"));
+        .when().post("/")
+        .then().statusCode(200).body(containsString("<StackStatus>ROLLBACK_COMPLETE</StackStatus>"));
 
-        // The failed attempt's diagnostic is still readable right up until the redeploy.
+        // A second CreateStack still conflicts - the diagnostic is preserved, not silently
+        // superseded.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", failingTemplate)
+        .when().post("/")
+        .then().body(containsString("AlreadyExistsException"));
+
+        // The failed attempt's diagnostic is still readable after that rejected retry.
         given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "DescribeStackEvents")
             .formParam("StackName", stackName)
         .when().post("/")
         .then().statusCode(200).body(containsString("CREATE_FAILED"));
+
+        // An explicit DeleteStack, though, clears the way for a fresh CreateStack - matching the
+        // issue's suggested fix: "let DeleteStack remove it."
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DeleteStack")
+            .formParam("StackName", stackName)
+        .when().post("/").then().statusCode(200);
 
         String workingTemplate = """
             {
@@ -9650,36 +9668,19 @@ class CloudFormationIntegrationTest {
             }
             """;
 
-        String createXml = given()
+        given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "CreateStack")
             .formParam("StackName", stackName)
             .formParam("TemplateBody", workingTemplate)
-        .when().post("/")
-        .then().statusCode(200).extract().asString();
-
-        // The redeploy is a fresh stack, not a resumed one - new StackId, no leftover BadSecret.
-        assertThat(createXml, not(containsString(firstStackId)));
+        .when().post("/").then().statusCode(200).body(containsString("<StackId>"));
 
         given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "DescribeStacks")
             .formParam("StackName", stackName)
         .when().post("/")
-        .then()
-            .statusCode(200)
-            .body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"))
-            .body(not(containsString(firstStackId)));
-
-        given()
-            .contentType("application/x-www-form-urlencoded")
-            .formParam("Action", "DescribeStackResources")
-            .formParam("StackName", stackName)
-        .when().post("/")
-        .then()
-            .statusCode(200)
-            .body(containsString("MyBus"))
-            .body(not(containsString("BadSecret")));
+        .then().statusCode(200).body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"));
     }
 
     @Test

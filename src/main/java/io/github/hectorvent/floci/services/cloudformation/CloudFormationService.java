@@ -174,17 +174,15 @@ public class CloudFormationService {
         // created, so CreateStack/UpdateStack fail synchronously the way real CloudFormation does.
         validateConditionDependencies(resolvedTemplate, parameters, region, accountId);
 
-        // A CREATE change set against a name that already has a stack is only valid when that
-        // stack is ROLLBACK_COMPLETE - AWS lets a redeploy proceed directly over that state
-        // (deleting the failed attempt at execute time, not here - see the ROLLBACK_COMPLETE
-        // handling in executeChangeSet) rather than throwing. Every other existing status is a
-        // real conflict.
+        // A CREATE change set against a name that already has a stack of any status - including
+        // ROLLBACK_COMPLETE - is a real conflict: AWS requires an explicit DeleteStack before a
+        // name can be reused, even when the existing stack already failed to create (see #2207).
         //
         // The existence check and the insert must be one atomic operation: compute() holds the
         // map's per-key lock for the whole call, so two CreateStack requests racing for the same
         // unused name can no longer both see "absent" and then share whichever Stack
-        // computeIfAbsent settled on - the second one now finds the first's (non-ROLLBACK_COMPLETE)
-        // stack already there and throws, instead of both executing the template concurrently.
+        // computeIfAbsent settled on - the second one now finds the first's stack already there
+        // and throws, instead of both executing the template concurrently.
         boolean isCreateType = changeSetType == null || "CREATE".equalsIgnoreCase(changeSetType);
         boolean[] stackCreated = {false};
         Stack stack = stacks.compute(key(stackName, region), (k, existing) -> {
@@ -194,7 +192,7 @@ public class CloudFormationService {
                 if (tags != null) s.getTags().putAll(tags);
                 return s;
             }
-            if (isCreateType && !"ROLLBACK_COMPLETE".equals(existing.getStatus())) {
+            if (isCreateType) {
                 throw new AwsException("AlreadyExistsException",
                         "Stack [" + stackName + "] already exists", 400);
             }
@@ -264,21 +262,6 @@ public class CloudFormationService {
         boolean isCreate = "CREATE".equalsIgnoreCase(cs.getChangeSetType()) ||
                 "CREATE_IN_PROGRESS".equals(stack.getStatus());
 
-        if (isCreate && "ROLLBACK_COMPLETE".equals(stack.getStatus())) {
-            // A redeploy over a ROLLBACK_COMPLETE stack: rollback already tore down every
-            // resource it created, so there's nothing left to physically clean up - just replace
-            // the stale shell with a fresh stack (new StackId, empty resources/events) now, at the
-            // moment the operator actually retries, rather than eagerly when the rollback itself
-            // completed. That's what keeps the failed attempt's DescribeStackEvents readable for
-            // as long as the operator hasn't asked to redeploy - see #2207.
-            Stack fresh = newStack(stackName, region);
-            fresh.setTags(stack.getTags());
-            cs.setStackId(fresh.getStackId());
-            fresh.getChangeSets().put(changeSetName, cs);
-            stacks.put(key(stackName, region), fresh);
-            stack = fresh;
-        }
-
         stack.setStatus(isCreate ? "CREATE_IN_PROGRESS" : "UPDATE_IN_PROGRESS");
         stack.setLastUpdatedTime(now());
         addEvent(stack, stack.getStackName(), stack.getStackId(),
@@ -288,9 +271,8 @@ public class CloudFormationService {
         String templateBody = cs.getTemplateBody();
         Map<String, String> params = cs.getParameters() != null ? cs.getParameters() : Map.of();
 
-        Stack executingStack = stack;
         return executor.submit(() -> runUnderAccount(accountId,
-                () -> executeTemplate(executingStack, templateBody, params, isCreate, region, accountId)));
+                () -> executeTemplate(stack, templateBody, params, isCreate, region, accountId)));
     }
 
     /**
