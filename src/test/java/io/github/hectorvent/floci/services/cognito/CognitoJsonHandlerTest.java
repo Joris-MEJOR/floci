@@ -126,9 +126,11 @@ class CognitoJsonHandlerTest {
         JsonNode describedPool = described.get("UserPool");
 
         for (JsonNode pool : java.util.List.of(createdPool, describedPool)) {
-            // AWS: "A null value indicates that you have deactivated device remembering."
-            assertTrue(pool.get("DeviceConfiguration").isNull());
-            assertTrue(pool.get("UserPoolAddOns").isNull());
+            // AWS's JSON protocol serializes only members with a value provided - an
+            // unconfigured pool omits these keys entirely, it doesn't write a JSON null
+            // (confirmed against moto's DescribeUserPool, which never emits either key unset).
+            assertFalse(pool.has("DeviceConfiguration"));
+            assertFalse(pool.has("UserPoolAddOns"));
             assertEquals("COGNITO_DEFAULT", pool.get("EmailConfiguration").get("EmailSendingAccount").asText());
         }
     }
