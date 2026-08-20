@@ -109,6 +109,31 @@ class CognitoJsonHandlerTest {
     }
 
     @Test
+    void createAndDescribeUserPoolAgreeOnUnconfiguredOptionalBlocks() {
+        // #2200: CreateUserPool and a later DescribeUserPool disagreed on DeviceConfiguration,
+        // EmailConfiguration, and UserPoolAddOns when the request never configured them - an
+        // empty object one moment, filled in or absent the next - so a Terraform apply looked
+        // clean and the very next plan reported perpetual drift.
+        ObjectNode request = mapper.createObjectNode();
+        request.put("PoolName", "minimal-pool");
+
+        JsonNode created = (JsonNode) handler.handle("CreateUserPool", request, "us-east-1").getEntity();
+        JsonNode createdPool = created.get("UserPool");
+
+        ObjectNode describeReq = mapper.createObjectNode();
+        describeReq.put("UserPoolId", createdPool.get("Id").asText());
+        JsonNode described = (JsonNode) handler.handle("DescribeUserPool", describeReq, "us-east-1").getEntity();
+        JsonNode describedPool = described.get("UserPool");
+
+        for (JsonNode pool : java.util.List.of(createdPool, describedPool)) {
+            // AWS: "A null value indicates that you have deactivated device remembering."
+            assertTrue(pool.get("DeviceConfiguration").isNull());
+            assertTrue(pool.get("UserPoolAddOns").isNull());
+            assertEquals("COGNITO_DEFAULT", pool.get("EmailConfiguration").get("EmailSendingAccount").asText());
+        }
+    }
+
+    @Test
     void createUserPoolResponseDoesNotLeakReservedTag() {
         ObjectNode request = mapper.createObjectNode();
         request.put("PoolName", "pinned-pool");

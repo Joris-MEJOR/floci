@@ -122,7 +122,10 @@ class FirehoseExtendedS3IntegrationTest {
             .body("DeliveryStreamDescription.Destinations[0].ExtendedS3DestinationDescription.CompressionFormat", equalTo("UNCOMPRESSED"))
             .body("DeliveryStreamDescription.Destinations[0].ExtendedS3DestinationDescription.BufferingHints.SizeInMBs", equalTo(5))
             .body("DeliveryStreamDescription.Destinations[0].ExtendedS3DestinationDescription.BufferingHints.IntervalInSeconds", equalTo(300))
-            .body("DeliveryStreamDescription.Destinations[0].ExtendedS3DestinationDescription.EncryptionConfiguration.NoEncryptionConfig", equalTo("NoEncryption"));
+            .body("DeliveryStreamDescription.Destinations[0].ExtendedS3DestinationDescription.EncryptionConfiguration.NoEncryptionConfig", equalTo("NoEncryption"))
+            // #2200: a create response that omits S3BackupMode, followed by a later describe
+            // that fills it in, applied cleanly and then re-planned dirty forever in Terraform.
+            .body("DeliveryStreamDescription.Destinations[0].ExtendedS3DestinationDescription.S3BackupMode", equalTo("Disabled"));
     }
 
     @Test

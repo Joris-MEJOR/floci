@@ -192,6 +192,8 @@ public class DeliveryStreamDescription {
         private BufferingHints bufferingHints;
         @JsonProperty("EncryptionConfiguration")
         private EncryptionConfiguration encryptionConfiguration;
+        @JsonProperty("S3BackupMode")
+        private String s3BackupMode;
 
         public S3Destination() {}
         public String getRoleArn() { return roleArn; }
@@ -212,6 +214,8 @@ public class DeliveryStreamDescription {
         public void setBufferingHints(BufferingHints bufferingHints) { this.bufferingHints = bufferingHints; }
         public EncryptionConfiguration getEncryptionConfiguration() { return encryptionConfiguration; }
         public void setEncryptionConfiguration(EncryptionConfiguration encryptionConfiguration) { this.encryptionConfiguration = encryptionConfiguration; }
+        public String getS3BackupMode() { return s3BackupMode; }
+        public void setS3BackupMode(String s3BackupMode) { this.s3BackupMode = s3BackupMode; }
 
         /**
          * Fills the members the wire contract marks required with the AWS defaults.
@@ -221,6 +225,9 @@ public class DeliveryStreamDescription {
         public void applyDefaults() {
             if (compressionFormat == null) {
                 compressionFormat = "UNCOMPRESSED";
+            }
+            if (s3BackupMode == null) {
+                s3BackupMode = "Disabled";
             }
             if (encryptionConfiguration == null) {
                 encryptionConfiguration = EncryptionConfiguration.noEncryption();

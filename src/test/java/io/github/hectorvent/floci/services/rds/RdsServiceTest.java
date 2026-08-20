@@ -4335,7 +4335,7 @@ class RdsServiceTest {
             String id, String engine, String engineVersion, String optionGroupName) {
         return rdsService.createDbInstance(id, engine, engineVersion, "admin", "password",
                 "dbname", "db.t3.micro", 20, false, null, null, null, null, false, false,
-                null, Map.of(), List.of(), optionGroupName, null);
+                null, Map.of(), List.of(), optionGroupName, null, true);
     }
 
     private RdsService newService(RdsContainerManager containerManager,

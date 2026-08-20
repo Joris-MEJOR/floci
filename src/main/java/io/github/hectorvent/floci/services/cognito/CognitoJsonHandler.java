@@ -701,13 +701,31 @@ public class CognitoJsonHandler {
         if (p.getSmsAuthenticationMessage() != null) node.put("SmsAuthenticationMessage", p.getSmsAuthenticationMessage());
 
         node.put("MfaConfiguration", p.getMfaConfiguration() != null ? p.getMfaConfiguration() : "OFF");
-        node.set("DeviceConfiguration", objectMapper.valueToTree(p.getDeviceConfiguration() != null ? p.getDeviceConfiguration() : new HashMap<>()));
+        // AWS: "A null value indicates that you have deactivated device remembering" - an empty
+        // object (rather than a JSON null) here made a re-planning Terraform see one block with
+        // false/false the first time and no block at all the next, reporting perpetual drift.
+        if (p.getDeviceConfiguration() != null && !p.getDeviceConfiguration().isEmpty()) {
+            node.set("DeviceConfiguration", objectMapper.valueToTree(p.getDeviceConfiguration()));
+        } else {
+            node.putNull("DeviceConfiguration");
+        }
         node.put("EstimatedNumberOfUsers", p.getEstimatedNumberOfUsers());
-        node.set("EmailConfiguration", objectMapper.valueToTree(p.getEmailConfiguration() != null ? p.getEmailConfiguration() : new HashMap<>()));
+        Map<String, Object> emailConfig = p.getEmailConfiguration() != null
+                ? new HashMap<>(p.getEmailConfiguration()) : new HashMap<>();
+        emailConfig.putIfAbsent("EmailSendingAccount", "COGNITO_DEFAULT");
+        node.set("EmailConfiguration", objectMapper.valueToTree(emailConfig));
         node.set("SmsConfiguration", objectMapper.valueToTree(p.getSmsConfiguration() != null ? p.getSmsConfiguration() : new HashMap<>()));
         node.set("UserPoolTags", objectMapper.valueToTree(p.getUserPoolTags() != null ? p.getUserPoolTags() : new HashMap<>()));
         node.set("AdminCreateUserConfig", objectMapper.valueToTree(p.getAdminCreateUserConfig() != null ? p.getAdminCreateUserConfig() : new HashMap<>()));
-        node.set("UserPoolAddOns", objectMapper.valueToTree(p.getUserPoolAddOns() != null ? p.getUserPoolAddOns() : new HashMap<>()));
+        // Same empty-object-vs-null distinction as DeviceConfiguration above: an unconfigured
+        // pool reports no UserPoolAddOns block at all, not one with AdvancedSecurityMode filled
+        // in - confirmed by re-planning Terraform, which otherwise saw the block appear at apply
+        // (captured into state) and disappear on the next refresh.
+        if (p.getUserPoolAddOns() != null && !p.getUserPoolAddOns().isEmpty()) {
+            node.set("UserPoolAddOns", objectMapper.valueToTree(p.getUserPoolAddOns()));
+        } else {
+            node.putNull("UserPoolAddOns");
+        }
         node.set("UsernameConfiguration", objectMapper.valueToTree(p.getUsernameConfiguration() != null ? p.getUsernameConfiguration() : new HashMap<>()));
         node.set("AccountRecoverySetting", objectMapper.valueToTree(p.getAccountRecoverySetting() != null ? p.getAccountRecoverySetting() : new HashMap<>()));
         node.put("UserPoolTier", p.getUserPoolTier() != null ? p.getUserPoolTier() : "ESSENTIALS");
