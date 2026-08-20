@@ -291,6 +291,7 @@ floci:
     cloudtrail:
       enabled: true
     lightsail:
+      enabled: true
     cloudcontrol:
       enabled: true
     cloudfront:
@@ -314,9 +315,24 @@ floci:
     iotdata:
       enabled: true
     cloudhsmv2:
+      enabled: true
     rum:
       enabled: true
     guardduty:
       enabled: true
     emrserverless:
+      enabled: true
+    tagging:
+      enabled: true
+    configservice:
+      enabled: true
+    transcribe:
+      enabled: true
+    docdb:
+      enabled: true
+      mock: false
+      default-image: "mongo:7.0"
+    bedrock-agent-core:
+      enabled: true
+    bedrock-agent-core-control:
       enabled: true

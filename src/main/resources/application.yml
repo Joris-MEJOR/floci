@@ -484,6 +484,7 @@ floci:
     cloudtrail:
       enabled: true
     lightsail:
+      enabled: true
     cloudcontrol:
       enabled: true
     cloudfront:
@@ -507,9 +508,26 @@ floci:
     iotdata:
       enabled: true
     cloudhsmv2:
+      enabled: true
     rum:
       enabled: true
     guardduty:
       enabled: true
     emrserverless:
+      enabled: true
+    tagging:
+      enabled: true
+    pipes:
+      enabled: true
+    configservice:
+      enabled: true
+    docdb:
+      enabled: true
+      mock: false
+      default-image: "mongo:7.0"
+    bedrock-agent-core:
+      enabled: true
+      # invoke-response: '{"output":"yes"}'   # Body returned by InvokeAgentRuntime
+      # validate-runtime-exists: false        # true = reject unknown runtime ARNs
+    bedrock-agent-core-control:
       enabled: true
