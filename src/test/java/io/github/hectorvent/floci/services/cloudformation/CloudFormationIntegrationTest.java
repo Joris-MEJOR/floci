@@ -9684,6 +9684,150 @@ class CloudFormationIntegrationTest {
     }
 
     @Test
+    void createChangeSet_secondCreateTypeBeforeExecution_attachesToReviewInProgressStack() {
+        // `aws cloudformation deploy` (and SAM, which shares the code) treats a REVIEW_IN_PROGRESS
+        // stack as nonexistent - see has_stack in the AWS CLI's deployer.py - and sends another
+        // CREATE change set against it, which real CloudFormation accepts: a CREATE change set
+        // leaves the stack in REVIEW_IN_PROGRESS until somebody executes it, so it is a placeholder
+        // rather than a deployment to conflict with. Retrying a failed `deploy` before any execute
+        // must therefore not hit AlreadyExistsException.
+        String template = """
+            {
+              "Resources": {
+                "MyBus": { "Type": "AWS::Events::EventBus", "Properties": { "Name": "cfn-2365-review-bus" } }
+              }
+            }
+            """;
+        String stackName = "cfn-2365-review-stack";
+
+        String firstStackId = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateChangeSet")
+            .formParam("StackName", stackName)
+            .formParam("ChangeSetName", "deploy-attempt-1")
+            .formParam("ChangeSetType", "CREATE")
+            .formParam("TemplateBody", template)
+        .when().post("/")
+        .then().statusCode(200).extract().path("CreateChangeSetResponse.CreateChangeSetResult.StackId");
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when().post("/")
+        .then().statusCode(200).body(containsString("<StackStatus>REVIEW_IN_PROGRESS</StackStatus>"));
+
+        // The retry: same name, still nothing executed. It attaches to the placeholder rather than
+        // conflicting with it, and lands on the same stack rather than creating a second one.
+        String secondStackId = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateChangeSet")
+            .formParam("StackName", stackName)
+            .formParam("ChangeSetName", "deploy-attempt-2")
+            .formParam("ChangeSetType", "CREATE")
+            .formParam("TemplateBody", template)
+        .when().post("/")
+        .then()
+            .statusCode(200)
+            .body(not(containsString("AlreadyExistsException")))
+            .extract().path("CreateChangeSetResponse.CreateChangeSetResult.StackId");
+
+        assertEquals(firstStackId, secondStackId, "the retry should attach to the same placeholder stack");
+
+        // Executing the retry's change set still deploys normally.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "ExecuteChangeSet")
+            .formParam("StackName", stackName)
+            .formParam("ChangeSetName", "deploy-attempt-2")
+        .when().post("/").then().statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when().post("/")
+        .then().statusCode(200).body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"));
+    }
+
+    @Test
+    void createChangeSet_createTypeAfterExecution_stillThrowsAlreadyExistsException() {
+        // The exemption is narrow: it covers a stack that never left REVIEW_IN_PROGRESS. Once the
+        // change set has been executed the stack is a real deployment, and a further CREATE change
+        // set is the ordinary name conflict again.
+        String template = """
+            {
+              "Resources": {
+                "MyBus": { "Type": "AWS::Events::EventBus", "Properties": { "Name": "cfn-2365-executed-bus" } }
+              }
+            }
+            """;
+        String stackName = "cfn-2365-executed-stack";
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateChangeSet")
+            .formParam("StackName", stackName)
+            .formParam("ChangeSetName", "deploy-attempt-1")
+            .formParam("ChangeSetType", "CREATE")
+            .formParam("TemplateBody", template)
+        .when().post("/").then().statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "ExecuteChangeSet")
+            .formParam("StackName", stackName)
+            .formParam("ChangeSetName", "deploy-attempt-1")
+        .when().post("/").then().statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateChangeSet")
+            .formParam("StackName", stackName)
+            .formParam("ChangeSetName", "deploy-attempt-2")
+            .formParam("ChangeSetType", "CREATE")
+            .formParam("TemplateBody", template)
+        .when().post("/")
+        .then().body(containsString("AlreadyExistsException"));
+    }
+
+    @Test
+    void createStack_onReviewInProgressStack_throwsAlreadyExistsException() {
+        // CreateStack does not get the REVIEW_IN_PROGRESS exemption, and must not: every stack it
+        // creates is REVIEW_IN_PROGRESS for the window between newStack() and the execute that
+        // immediately follows, so exempting the status on this path would let two racing
+        // CreateStack requests share one stack and both provision the template - the very race
+        // createStack_concurrentRequestsForUnusedName_exactlyOneSucceeds covers. LocalStack draws
+        // the same line: its create_stack conflicts on any status but DELETE_COMPLETE, while only
+        // its create_change_set exempts REVIEW_IN_PROGRESS.
+        String template = """
+            {
+              "Resources": {
+                "MyBus": { "Type": "AWS::Events::EventBus", "Properties": { "Name": "cfn-2365-implicit-bus" } }
+              }
+            }
+            """;
+        String stackName = "cfn-2365-implicit-stack";
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateChangeSet")
+            .formParam("StackName", stackName)
+            .formParam("ChangeSetName", "pending")
+            .formParam("ChangeSetType", "CREATE")
+            .formParam("TemplateBody", template)
+        .when().post("/").then().statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when().post("/")
+        .then().body(containsString("AlreadyExistsException"));
+    }
+
+    @Test
     void createStack_apiGatewayRestApi_withEndpointConfiguration() {
         String template = """
             {

@@ -151,7 +151,31 @@ public class CloudFormationService {
                                      Map<String, String> parameters, List<String> capabilities,
                                      Map<String, String> tags, String region) {
         return createChangeSet(stackName, changeSetName, changeSetType, templateBody, templateUrl,
-                parameters, capabilities, tags, region, regionResolver.getAccountId());
+                parameters, capabilities, tags, region, regionResolver.getAccountId(), false);
+    }
+
+    /**
+     * Entry point for the {@code CreateChangeSet} operation itself, as opposed to the change sets
+     * {@code CreateStack}/{@code UpdateStack}/StackSet deployment create internally and execute
+     * immediately.
+     *
+     * <p>The difference matters for exactly one case: a CREATE change set is allowed to attach to a
+     * stack already sitting in {@code REVIEW_IN_PROGRESS}, because that status means "a CREATE
+     * change set was created here and nobody has executed it yet" - the stack is a placeholder, not
+     * a deployment. {@code aws cloudformation deploy} and SAM rely on this: {@code has_stack} in the
+     * AWS CLI's deployer treats a {@code REVIEW_IN_PROGRESS} stack as nonexistent and sends a second
+     * CREATE change set against it, which real CloudFormation accepts. Routing that exemption
+     * through a separate entry point rather than the shared one keeps it off the implicit callers,
+     * where a stack is only ever momentarily {@code REVIEW_IN_PROGRESS} - between {@link #newStack}
+     * and the execute that immediately follows - and treating that window as reusable would let two
+     * racing {@code CreateStack} requests both provision the same template.
+     */
+    public ChangeSet createChangeSetForRequest(String stackName, String changeSetName, String changeSetType,
+                                               String templateBody, String templateUrl,
+                                               Map<String, String> parameters, List<String> capabilities,
+                                               Map<String, String> tags, String region) {
+        return createChangeSet(stackName, changeSetName, changeSetType, templateBody, templateUrl,
+                parameters, capabilities, tags, region, regionResolver.getAccountId(), true);
     }
 
     /**
@@ -168,6 +192,15 @@ public class CloudFormationService {
                                      String templateBody, String templateUrl,
                                      Map<String, String> parameters, List<String> capabilities,
                                      Map<String, String> tags, String region, String accountId) {
+        return createChangeSet(stackName, changeSetName, changeSetType, templateBody, templateUrl,
+                parameters, capabilities, tags, region, accountId, false);
+    }
+
+    private ChangeSet createChangeSet(String stackName, String changeSetName, String changeSetType,
+                                      String templateBody, String templateUrl,
+                                      Map<String, String> parameters, List<String> capabilities,
+                                      Map<String, String> tags, String region, String accountId,
+                                      boolean attachToReviewInProgressStack) {
         String resolvedTemplate = resolveTemplate(templateBody, templateUrl);
 
         // Reject an unresolvable condition dependency graph up front, before any stack state is
@@ -178,11 +211,22 @@ public class CloudFormationService {
         // ROLLBACK_COMPLETE - is a real conflict: AWS requires an explicit DeleteStack before a
         // name can be reused, even when the existing stack already failed to create (see #2207).
         //
+        // The one exception is a stack in REVIEW_IN_PROGRESS, and only for the CreateChangeSet
+        // operation itself (see createChangeSetForRequest): that status means a CREATE change set
+        // exists but has never been executed, so the stack is a placeholder the next CREATE change
+        // set attaches to rather than a deployment to conflict with. The AWS CLI's `deploy` and SAM
+        // both depend on it - their has_stack treats REVIEW_IN_PROGRESS as nonexistent and sends a
+        // second CREATE change set, which real CloudFormation accepts.
+        //
         // The existence check and the insert must be one atomic operation: compute() holds the
         // map's per-key lock for the whole call, so two CreateStack requests racing for the same
         // unused name can no longer both see "absent" and then share whichever Stack
         // computeIfAbsent settled on - the second one now finds the first's stack already there
-        // and throws, instead of both executing the template concurrently.
+        // and throws, instead of both executing the template concurrently. That race is also why
+        // the exemption above is scoped to the explicit operation: on the CreateStack path every
+        // brand-new stack is REVIEW_IN_PROGRESS for the moment between newStack() and the execute
+        // that follows it, so exempting the status outright would hand the racing request the same
+        // stack and reopen exactly this hole.
         boolean isCreateType = changeSetType == null || "CREATE".equalsIgnoreCase(changeSetType);
         boolean[] stackCreated = {false};
         Stack stack = stacks.compute(key(stackName, region), (k, existing) -> {
@@ -192,7 +236,9 @@ public class CloudFormationService {
                 if (tags != null) s.getTags().putAll(tags);
                 return s;
             }
-            if (isCreateType) {
+            boolean reusableReviewPlaceholder =
+                    attachToReviewInProgressStack && "REVIEW_IN_PROGRESS".equals(existing.getStatus());
+            if (isCreateType && !reusableReviewPlaceholder) {
                 throw new AwsException("AlreadyExistsException",
                         "Stack [" + stackName + "] already exists", 400);
             }
