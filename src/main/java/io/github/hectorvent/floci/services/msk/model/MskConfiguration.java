@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.msk.model;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.JsonSetter;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
@@ -11,12 +12,13 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 
-// A configuration persisted by the previous (pre-revision-history) schema has
-// "latestRevision"/"serverProperties" keys this class no longer maps - without
-// ignoreUnknown, loading it would throw and fail the whole msk-configurations.json load,
-// not just that one entry. Ignoring them leaves that entry with no revision history rather
-// than crashing storage; MskService#updateConfiguration guards the resulting
-// getLatestRevision() == null case explicitly.
+// A configuration persisted by the previous (pre-revision-history) schema stored one
+// "latestRevision" object plus a flat "serverProperties" string instead of a revision list.
+// Both keys are mapped back onto revision 1 at load time (see the legacy setters at the bottom
+// of this class), so an entry written before this schema still reports a latestRevision and can
+// still be updated, rather than loading as a configuration with no revision history at all.
+// ignoreUnknown stays for anything else an older writer may have left behind: without it a
+// single stale key would fail the whole msk-configurations.json load, not just that entry.
 @JsonIgnoreProperties(ignoreUnknown = true)
 @RegisterForReflection
 public class MskConfiguration {
@@ -91,9 +93,10 @@ public class MskConfiguration {
     public void setCreationTime(Instant creationTime) { this.creationTime = creationTime; }
 
     // Derived from revisions, not its own stored field, so it can never drift out of sync.
-    // Must stay @JsonIgnore: this class has no setter for it and isn't
-    // @JsonIgnoreProperties(ignoreUnknown = true), so serializing it would make a stored file
-    // fail to deserialize on load.
+    // Must stay @JsonIgnore: writing it back out would re-create the pre-revision-history shape
+    // this class now migrates away from, so a file saved today would load as a legacy entry
+    // tomorrow. Only the serialization half is off - @JsonSetter("latestRevision") on
+    // setLegacyLatestRevision below keeps reading the old key working.
     @JsonIgnore
     public ConfigurationRevision getLatestRevision() {
         return revisions.isEmpty() ? null : revisions.get(revisions.size() - 1);
@@ -119,6 +122,45 @@ public class MskConfiguration {
     public void addRevision(ConfigurationRevision revision, String serverProperties) {
         this.serverPropertiesByRevision.put(revision.getRevision(), serverProperties);
         this.revisions.add(revision);
+    }
+
+    // ── Pre-revision-history schema migration ────────────────────────────────────────────
+
+    // The old schema's two halves arrive as separate setter calls, in whatever order the keys
+    // happen to sit in the file, so neither can assemble the revision alone. These buffer what
+    // has been seen so far. Deliberately un-annotated and private: Jackson's default field
+    // visibility is PUBLIC_ONLY, so they stay invisible to serialization on their own, and an
+    // explicit @JsonIgnore here would risk splitting the logical property the renamed setters
+    // below belong to.
+    private String legacyServerProperties;
+    private Long legacyRevisionNumber;
+
+    // Deserialize-only - getLatestRevision() is @JsonIgnore, so this key is never written back.
+    // Ignored when revisions is already populated: a current-schema file sets "revisions"
+    // directly and never writes "latestRevision", but this way the two can't fight if one ever
+    // did carry both, whichever order they load in.
+    @JsonSetter("latestRevision")
+    public void setLegacyLatestRevision(ConfigurationRevision latestRevision) {
+        if (latestRevision == null || !revisions.isEmpty()) {
+            return;
+        }
+        // Empty string rather than null when the old entry carried no serverProperties:
+        // serverPropertiesByRevision is a ConcurrentHashMap and would reject a null value, and
+        // DescribeConfigurationRevision base64-encodes whatever it finds without a null check.
+        addRevision(latestRevision, legacyServerProperties != null ? legacyServerProperties : "");
+        this.legacyRevisionNumber = latestRevision.getRevision();
+    }
+
+    // Same deserialize-only treatment. Back-fills rather than assuming it runs first, since it
+    // may arrive after setLegacyLatestRevision has already seeded the revision with the empty
+    // placeholder above. Keyed off legacyRevisionNumber so a current-schema entry that somehow
+    // carried a stray top-level "serverProperties" is left alone.
+    @JsonSetter("serverProperties")
+    public void setLegacyServerProperties(String serverProperties) {
+        this.legacyServerProperties = serverProperties;
+        if (serverProperties != null && legacyRevisionNumber != null) {
+            this.serverPropertiesByRevision.put(legacyRevisionNumber, serverProperties);
+        }
     }
 
     public String getAccountId() { return accountId; }

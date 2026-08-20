@@ -321,12 +321,13 @@ class MskServiceTest {
                 restored.getServerPropertiesByRevision().get(1L));
     }
 
-    // A configuration persisted by the pre-revision-history schema has "latestRevision"/
-    // "serverProperties" keys this class no longer maps to a field. Without
-    // @JsonIgnoreProperties(ignoreUnknown = true), this throws and fails the whole
-    // msk-configurations.json load, not just this one entry.
+    // A configuration persisted by the pre-revision-history schema stored "latestRevision" and
+    // a flat "serverProperties" instead of a revision list. Both are mapped back onto revision 1
+    // as it loads - otherwise the entry would come back with getLatestRevision() == null, and
+    // AWS marks Configuration's LatestRevision required, so DescribeConfiguration and
+    // ListConfigurations would emit a required member as an explicit null for it.
     @Test
-    void deserializingPreRevisionHistorySchemaDoesNotThrow() throws Exception {
+    void preRevisionHistorySchemaMigratesOntoRevisionOne() throws Exception {
         String oldSchemaJson = """
                 {
                   "arn": "arn:aws:kafka:us-east-1:000000000000:configuration/legacy/id",
@@ -344,12 +345,83 @@ class MskServiceTest {
         MskConfiguration restored = mapper.readValue(oldSchemaJson, MskConfiguration.class);
 
         assertEquals("legacy", restored.getName());
-        assertNull(restored.getLatestRevision());
-        assertTrue(restored.getRevisions().isEmpty());
+        assertNotNull(restored.getLatestRevision());
+        assertEquals(1L, restored.getLatestRevision().getRevision());
+        assertEquals("desc", restored.getLatestRevision().getDescription());
+        assertEquals(1, restored.getRevisions().size());
+        assertEquals("auto.create.topics.enable=true",
+                restored.getServerPropertiesByRevision().get(1L));
     }
 
+    // Jackson calls the two legacy setters in whatever order the keys sit in the file, so the
+    // migration cannot assume "serverProperties" is read before "latestRevision". Same fixture
+    // as above with the two keys swapped.
     @Test
-    void updateConfigurationOnPreRevisionHistoryEntryThrowsInsteadOfNpe() throws Exception {
+    void preRevisionHistorySchemaMigratesRegardlessOfKeyOrder() throws Exception {
+        String oldSchemaJson = """
+                {
+                  "serverProperties": "auto.create.topics.enable=true",
+                  "latestRevision": {"revision": 1, "creationTime": 1700000000, "description": "desc"},
+                  "arn": "arn:aws:kafka:us-east-1:000000000000:configuration/legacy/id",
+                  "name": "legacy",
+                  "kafkaVersions": ["3.6.0"],
+                  "state": "ACTIVE",
+                  "creationTime": 1700000000
+                }
+                """;
+
+        ObjectMapper mapper = new ObjectMapper().registerModule(new JavaTimeModule());
+        MskConfiguration restored = mapper.readValue(oldSchemaJson, MskConfiguration.class);
+
+        assertEquals(1, restored.getRevisions().size());
+        assertEquals("auto.create.topics.enable=true",
+                restored.getServerPropertiesByRevision().get(1L));
+    }
+
+    // serverPropertiesByRevision is a ConcurrentHashMap, which rejects null values, and
+    // DescribeConfigurationRevision base64-encodes what it finds without a null check - so a
+    // legacy entry missing serverProperties has to migrate to an empty string, not a null.
+    @Test
+    void preRevisionHistorySchemaWithoutServerPropertiesMigratesToEmptyProperties() throws Exception {
+        String oldSchemaJson = """
+                {
+                  "arn": "arn:aws:kafka:us-east-1:000000000000:configuration/legacy/id",
+                  "name": "legacy",
+                  "kafkaVersions": ["3.6.0"],
+                  "state": "ACTIVE",
+                  "creationTime": 1700000000,
+                  "latestRevision": {"revision": 1, "creationTime": 1700000000}
+                }
+                """;
+
+        ObjectMapper mapper = new ObjectMapper().registerModule(new JavaTimeModule());
+        MskConfiguration restored = mapper.readValue(oldSchemaJson, MskConfiguration.class);
+
+        assertEquals(1L, restored.getLatestRevision().getRevision());
+        assertEquals("", restored.getServerPropertiesByRevision().get(1L));
+    }
+
+    // The migration adds setters for the two old key names; it must not also start writing them
+    // back out, or a file saved today would load as a legacy entry tomorrow.
+    @Test
+    void migrationDoesNotReintroduceLegacyKeysOnSerialization() throws Exception {
+        MskConfiguration created = mskService.createConfiguration(
+                "round-trip", "v1", List.of("3.6.0"), "props-v1");
+
+        ObjectMapper mapper = new ObjectMapper().registerModule(new JavaTimeModule());
+        String json = mapper.writeValueAsString(created);
+
+        assertFalse(json.contains("latestRevision"));
+        assertFalse(json.contains("legacyServerProperties"));
+        assertFalse(json.contains("legacyRevisionNumber"));
+        // The per-revision map keeps its own name; only the flat legacy key must be gone.
+        assertTrue(json.contains("serverPropertiesByRevision"));
+    }
+
+    // The whole point of the migration: a pre-revision-history entry is updatable again rather
+    // than being rejected for the rest of its life.
+    @Test
+    void updateConfigurationOnMigratedPreRevisionHistoryEntryAppendsRevisionTwo() throws Exception {
         String oldSchemaJson = """
                 {
                   "arn": "arn:aws:kafka:us-east-1:000000000000:configuration/legacy/id",
@@ -368,8 +440,37 @@ class MskServiceTest {
         // happens to an object that was merely deserialized in isolation.
         configurationStorage.put(legacy.getArn(), legacy);
 
+        MskConfiguration updated = mskService.updateConfiguration(legacy.getArn(), "new desc", "new-props");
+
+        assertEquals(2L, updated.getLatestRevision().getRevision());
+        assertEquals(2, updated.getRevisions().size());
+        // Revision 1's migrated properties survive the update rather than being overwritten.
+        assertEquals("props", updated.getServerPropertiesByRevision().get(1L));
+        assertEquals("new-props", updated.getServerPropertiesByRevision().get(2L));
+    }
+
+    // Nothing the emulator has ever written looks like this, but the guard in
+    // updateConfiguration still has to hold for a store that carries no revision data at all -
+    // hand-edited, or an entry whose latestRevision was explicitly null.
+    @Test
+    void updateConfigurationWithNoRevisionDataAtAllStillThrowsInsteadOfNpe() throws Exception {
+        String noRevisionJson = """
+                {
+                  "arn": "arn:aws:kafka:us-east-1:000000000000:configuration/legacy/id",
+                  "name": "legacy",
+                  "kafkaVersions": ["3.6.0"],
+                  "state": "ACTIVE",
+                  "creationTime": 1700000000,
+                  "latestRevision": null
+                }
+                """;
+        ObjectMapper mapper = new ObjectMapper().registerModule(new JavaTimeModule());
+        MskConfiguration broken = mapper.readValue(noRevisionJson, MskConfiguration.class);
+        assertNull(broken.getLatestRevision());
+        configurationStorage.put(broken.getArn(), broken);
+
         AwsException ex = assertThrows(AwsException.class, () -> {
-            mskService.updateConfiguration(legacy.getArn(), "new desc", "new-props");
+            mskService.updateConfiguration(broken.getArn(), "new desc", "new-props");
         });
         assertEquals("BadRequestException", ex.getErrorCode());
     }

@@ -193,9 +193,10 @@ public class MskService {
             }
             ConfigurationRevision latestRevision = configuration.getLatestRevision();
             if (latestRevision == null) {
-                // Only reachable for a configuration persisted by the pre-revision-history
-                // schema (see MskConfiguration's ignoreUnknown note) - it has no revisions to
-                // build on.
+                // MskConfiguration now maps a pre-revision-history entry onto revision 1 as
+                // it loads, so this no longer catches every configuration written before the
+                // schema changed - only one with no revision data at all to build on (a
+                // hand-edited store, or an entry whose latestRevision was explicitly null).
                 throw new AwsException("BadRequestException",
                         "Configuration has no revision history and cannot be updated: " + arn, 400);
             }
@@ -210,10 +211,12 @@ public class MskService {
     }
 
     public PaginatedResult<ConfigurationRevision> listConfigurationRevisions(String arn, Integer maxResults, String nextToken) {
-        // Snapshot revisions under the same lock updateConfiguration writes under - revisions and
-        // serverPropertiesByRevision are plain (non-concurrent) collections, so reading them
-        // outside the lock while a write is in flight risks more than stale data: a torn
-        // ArrayList/HashMap iteration or a ConcurrentModificationException.
+        // Snapshot revisions under the same lock updateConfiguration writes under. Now that
+        // MskConfiguration's collections are concurrent-safe this is no longer what prevents a
+        // torn read - getRevisions() copies a CopyOnWriteArrayList, which cannot tear on its
+        // own. It is kept so every reader of revision state serializes against an in-flight
+        // update the same way, rather than leaving describeConfigurationRevision - which reads
+        // both collections and does need them to agree - as the only one holding the lock.
         List<ConfigurationRevision> revisions;
         synchronized (configurationUpdateLock) {
             revisions = describeConfiguration(arn).getRevisions();
