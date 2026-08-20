@@ -1,4 +1,8 @@
 quarkus:
+  jackson:
+    # Quarkus 3.37 stopped tolerating empty response beans; AWS StartApplication/
+    # StopApplication legitimately return {}, so keep the pre-3.37 behaviour.
+    fail-on-empty-beans: false
   log:
     console:
       format: "%d{yyyy-MM-dd HH:mm:ss,SSS} %-5p [%c{3.}] %s%e%n"
