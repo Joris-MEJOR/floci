@@ -900,13 +900,21 @@ public class RdsService implements Resettable {
             String id, String newPassword, Boolean iamEnabled,
             String dbSubnetGroupName, List<String> vpcSecurityGroupIds, String region) {
         return modifyDbInstance(id, newPassword, iamEnabled, dbSubnetGroupName,
-                vpcSecurityGroupIds, null, region);
+                vpcSecurityGroupIds, null, region, null);
     }
 
     public DbInstance modifyDbInstance(
             String id, String newPassword, Boolean iamEnabled,
             String dbSubnetGroupName, List<String> vpcSecurityGroupIds,
             String optionGroupName, String region) {
+        return modifyDbInstance(id, newPassword, iamEnabled, dbSubnetGroupName,
+                vpcSecurityGroupIds, optionGroupName, region, null);
+    }
+
+    public DbInstance modifyDbInstance(
+            String id, String newPassword, Boolean iamEnabled,
+            String dbSubnetGroupName, List<String> vpcSecurityGroupIds,
+            String optionGroupName, String region, Boolean autoMinorVersionUpgrade) {
         String effectiveRegion = effectiveRegion(region);
         DbInstance instance = getDbInstance(id, effectiveRegion);
         instance.setStatus(DbInstanceStatus.AVAILABLE);
@@ -928,6 +936,9 @@ public class RdsService implements Resettable {
         }
         if (vpcSecurityGroupIds != null && !vpcSecurityGroupIds.isEmpty()) {
             instance.setVpcSecurityGroupIds(vpcSecurityGroupIds);
+        }
+        if (autoMinorVersionUpgrade != null) {
+            instance.setAutoMinorVersionUpgrade(autoMinorVersionUpgrade);
         }
         putInstanceForScope(currentAccountId(), effectiveRegion, id, instance);
         LOG.infov("DB instance {0} modified", id);

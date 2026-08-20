@@ -527,6 +527,23 @@ class RdsServiceTest {
     }
 
     @Test
+    void modifyDbInstanceAppliesAutoMinorVersionUpgrade() {
+        // #2420 review: ModifyDBInstance silently dropped this - created true (the AWS
+        // default), an explicit modify to false must actually take effect and stick on a
+        // later read, not just get echoed back unchanged.
+        rdsService.createDbInstance("mydb", "postgres", "13",
+                "admin", "original-password", "dbname", "db.t3.micro",
+                20, false, null, null, null, null, false);
+
+        DbInstance modified = rdsService.modifyDbInstance(
+                "mydb", null, null, null, List.of(), null, null, false);
+        assertFalse(modified.isAutoMinorVersionUpgrade());
+
+        DbInstance described = rdsService.getDbInstance("mydb");
+        assertFalse(described.isAutoMinorVersionUpgrade());
+    }
+
+    @Test
     void modifyDbInstanceRejectsMissingDbSubnetGroup() {
         rdsService.createDbInstance("mydb", "postgres", "13",
                 "admin", "original-password", "dbname", "db.t3.micro",

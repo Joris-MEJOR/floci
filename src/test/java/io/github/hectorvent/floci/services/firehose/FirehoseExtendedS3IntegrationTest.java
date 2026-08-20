@@ -196,7 +196,8 @@ class FirehoseExtendedS3IntegrationTest {
                       "DestinationId": "destinationId-000000000001",
                       "ExtendedS3DestinationUpdate": {
                         "CompressionFormat": "Snappy",
-                        "BufferingHints": { "SizeInMBs": 128, "IntervalInSeconds": 60 }
+                        "BufferingHints": { "SizeInMBs": 128, "IntervalInSeconds": 60 },
+                        "S3BackupMode": "Enabled"
                       }
                     }
                     """.formatted(STREAM_NAME))
@@ -218,7 +219,10 @@ class FirehoseExtendedS3IntegrationTest {
             .body("DeliveryStreamDescription.Destinations[0].ExtendedS3DestinationDescription.CompressionFormat", equalTo("Snappy"))
             .body("DeliveryStreamDescription.Destinations[0].ExtendedS3DestinationDescription.BufferingHints.SizeInMBs", equalTo(128))
             .body("DeliveryStreamDescription.Destinations[0].ExtendedS3DestinationDescription.RoleARN", equalTo(ROLE_ARN))
-            .body("DeliveryStreamDescription.Destinations[0].ExtendedS3DestinationDescription.Prefix", equalTo("events/data/"));
+            .body("DeliveryStreamDescription.Destinations[0].ExtendedS3DestinationDescription.Prefix", equalTo("events/data/"))
+            // #2420 review: mergeDestination silently dropped S3BackupMode updates, so a real
+            // change here would apply cleanly but describe would keep reporting the old value.
+            .body("DeliveryStreamDescription.Destinations[0].ExtendedS3DestinationDescription.S3BackupMode", equalTo("Enabled"));
     }
 
     @Test

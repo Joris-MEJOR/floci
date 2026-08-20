@@ -224,11 +224,14 @@ public class RdsQueryHandler {
         Boolean iamEnabled = iamStr != null ? Boolean.parseBoolean(iamStr) : null;
         String dbSubnetGroupName = params.getFirst("DBSubnetGroupName");
         String optionGroupName = params.getFirst("OptionGroupName");
+        String autoMinorVersionUpgradeStr = params.getFirst("AutoMinorVersionUpgrade");
+        Boolean autoMinorVersionUpgrade = autoMinorVersionUpgradeStr != null
+                ? Boolean.parseBoolean(autoMinorVersionUpgradeStr) : null;
         try {
             List<String> vpcSecurityGroupIds = vpcSecurityGroupIds(params);
             DbInstance instance = service.modifyDbInstance(
                     id, newPassword, iamEnabled, dbSubnetGroupName,
-                    vpcSecurityGroupIds, optionGroupName, region);
+                    vpcSecurityGroupIds, optionGroupName, region, autoMinorVersionUpgrade);
             String result = dbInstanceXml(instance);
             return Response.ok(AwsQueryResponse.envelope("ModifyDBInstance", AwsNamespaces.RDS, result)).build();
         } catch (AwsException e) {
