@@ -9792,6 +9792,84 @@ class CloudFormationIntegrationTest {
     }
 
     @Test
+    void createChangeSet_concurrentRequestsOnSamePlaceholder_keepEveryChangeSet() throws InterruptedException {
+        // Two requests are allowed to share one stack - two CREATE change sets attaching to the
+        // same REVIEW_IN_PROGRESS placeholder, or two UPDATE change sets on a live stack. Stack's
+        // changeSets is a plain LinkedHashMap, so recording the change set has to happen inside the
+        // same per-key lock that resolves the stack; done afterwards, concurrent writers lose an
+        // accepted change set or corrupt the map.
+        String template = """
+            {
+              "Resources": {
+                "MyBus": { "Type": "AWS::Events::EventBus", "Properties": { "Name": "cfn-2365-parallel-bus" } }
+              }
+            }
+            """;
+        String stackName = "cfn-2365-parallel-stack";
+        int attempts = 16;
+
+        // Establish the placeholder first, so every racing request takes the "attach" path.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateChangeSet")
+            .formParam("StackName", stackName)
+            .formParam("ChangeSetName", "seed")
+            .formParam("ChangeSetType", "CREATE")
+            .formParam("TemplateBody", template)
+        .when().post("/").then().statusCode(200);
+
+        CountDownLatch ready = new CountDownLatch(attempts);
+        CountDownLatch go = new CountDownLatch(1);
+        AtomicInteger accepted = new AtomicInteger();
+        ExecutorService pool = Executors.newFixedThreadPool(attempts);
+        try {
+            for (int i = 0; i < attempts; i++) {
+                String changeSetName = "parallel-" + i;
+                pool.submit(() -> {
+                    ready.countDown();
+                    try {
+                        go.await();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    String body = given()
+                        .contentType("application/x-www-form-urlencoded")
+                        .formParam("Action", "CreateChangeSet")
+                        .formParam("StackName", stackName)
+                        .formParam("ChangeSetName", changeSetName)
+                        .formParam("ChangeSetType", "CREATE")
+                        .formParam("TemplateBody", template)
+                    .when().post("/").then().extract().asString();
+                    if (body.contains("<StackId>")) {
+                        accepted.incrementAndGet();
+                    }
+                });
+            }
+            assertTrue(ready.await(10, TimeUnit.SECONDS), "workers failed to line up in time");
+            go.countDown();
+        } finally {
+            pool.shutdown();
+            assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS), "requests did not finish in time");
+        }
+
+        assertEquals(attempts, accepted.get(), "every CREATE change set on the placeholder should be accepted");
+
+        // Every accepted change set must still be readable - an acknowledged write that vanished
+        // from the map is exactly the failure this guards.
+        String listed = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "ListChangeSets")
+            .formParam("StackName", stackName)
+        .when().post("/").then().statusCode(200).extract().asString();
+
+        for (int i = 0; i < attempts; i++) {
+            assertTrue(listed.contains("parallel-" + i), "change set parallel-" + i + " was lost");
+        }
+        assertTrue(listed.contains("seed"), "the seed change set was lost");
+    }
+
+    @Test
     void createStack_onReviewInProgressStack_throwsAlreadyExistsException() {
         // CreateStack does not get the REVIEW_IN_PROGRESS exemption, and must not: every stack it
         // creates is REVIEW_IN_PROGRESS for the window between newStack() and the execute that

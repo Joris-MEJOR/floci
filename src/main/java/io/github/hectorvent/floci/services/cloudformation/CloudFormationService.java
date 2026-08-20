@@ -227,48 +227,58 @@ public class CloudFormationService {
         // brand-new stack is REVIEW_IN_PROGRESS for the moment between newStack() and the execute
         // that follows it, so exempting the status outright would hand the racing request the same
         // stack and reopen exactly this hole.
+        //
+        // Recording the change set happens inside the same remapping function, for the same reason.
+        // Stack#changeSets is a plain LinkedHashMap, so two requests that legitimately share one
+        // stack - two UPDATE change sets on a live stack, or two CREATE change sets attaching to the
+        // same REVIEW_IN_PROGRESS placeholder - would otherwise both write it after the per-key lock
+        // was already released, losing an accepted change set or corrupting the map's links. Only
+        // persistStack() stays outside: it is storage I/O, and compute()'s contract is that the
+        // remapping function does short, non-blocking work.
         boolean isCreateType = changeSetType == null || "CREATE".equalsIgnoreCase(changeSetType);
-        boolean[] stackCreated = {false};
+        ChangeSet[] created = new ChangeSet[1];
         Stack stack = stacks.compute(key(stackName, region), (k, existing) -> {
+            Stack target;
             if (existing == null) {
-                stackCreated[0] = true;
-                Stack s = newStack(stackName, region);
-                if (tags != null) s.getTags().putAll(tags);
-                return s;
+                target = newStack(stackName, region);
+                if (tags != null) target.getTags().putAll(tags);
+                // A CREATE change set puts a brand-new stack into REVIEW_IN_PROGRESS. Record the
+                // matching stack-level event (as AWS and LocalStack do) so DescribeStackEvents is
+                // non-empty straight after change-set creation — tooling such as the AWS SAM CLI
+                // reads StackEvents[0] there and otherwise fails with an IndexError.
+                // (CreateChangeSet defaults a null type to CREATE.)
+                if (isCreateType) {
+                    addEvent(target, target.getStackName(), target.getStackId(),
+                            "AWS::CloudFormation::Stack", "REVIEW_IN_PROGRESS", "User Initiated");
+                }
+            } else {
+                boolean reusableReviewPlaceholder =
+                        attachToReviewInProgressStack && "REVIEW_IN_PROGRESS".equals(existing.getStatus());
+                if (isCreateType && !reusableReviewPlaceholder) {
+                    throw new AwsException("AlreadyExistsException",
+                            "Stack [" + stackName + "] already exists", 400);
+                }
+                target = existing;
             }
-            boolean reusableReviewPlaceholder =
-                    attachToReviewInProgressStack && "REVIEW_IN_PROGRESS".equals(existing.getStatus());
-            if (isCreateType && !reusableReviewPlaceholder) {
-                throw new AwsException("AlreadyExistsException",
-                        "Stack [" + stackName + "] already exists", 400);
-            }
-            return existing;
+
+            ChangeSet cs = new ChangeSet();
+            cs.setChangeSetId(AwsArnUtils.Arn.of("cloudformation", region, regionResolver.getAccountId(), "changeSet/" + changeSetName + "/" + UUID.randomUUID()).toString());
+            cs.setChangeSetName(changeSetName);
+            cs.setStackName(stackName);
+            cs.setStackId(target.getStackId());
+            cs.setChangeSetType(changeSetType != null ? changeSetType : "CREATE");
+            cs.setTemplateBody(resolvedTemplate);
+            cs.setParameters(parameters);
+            cs.setCapabilities(capabilities);
+            cs.setStatus("CREATE_COMPLETE");
+            cs.setExecutionStatus("AVAILABLE");
+            target.getChangeSets().put(changeSetName, cs);
+            created[0] = cs;
+            return target;
         });
 
-        // A CREATE change set puts a brand-new stack into REVIEW_IN_PROGRESS. Record the matching
-        // stack-level event (as AWS and LocalStack do) so DescribeStackEvents is non-empty straight
-        // after change-set creation — tooling such as the AWS SAM CLI reads StackEvents[0] there and
-        // otherwise fails with an IndexError. (CreateChangeSet defaults a null type to CREATE.)
-        if (stackCreated[0] && isCreateType) {
-            addEvent(stack, stack.getStackName(), stack.getStackId(),
-                    "AWS::CloudFormation::Stack", "REVIEW_IN_PROGRESS", "User Initiated");
-        }
-
-        ChangeSet cs = new ChangeSet();
-        cs.setChangeSetId(AwsArnUtils.Arn.of("cloudformation", region, regionResolver.getAccountId(), "changeSet/" + changeSetName + "/" + UUID.randomUUID()).toString());
-        cs.setChangeSetName(changeSetName);
-        cs.setStackName(stackName);
-        cs.setStackId(stack.getStackId());
-        cs.setChangeSetType(changeSetType != null ? changeSetType : "CREATE");
-        cs.setTemplateBody(resolvedTemplate);
-        cs.setParameters(parameters);
-        cs.setCapabilities(capabilities);
-        cs.setStatus("CREATE_COMPLETE");
-        cs.setExecutionStatus("AVAILABLE");
-
-        stack.getChangeSets().put(changeSetName, cs);
         persistStack(stack);
-        return cs;
+        return created[0];
     }
 
     // ── DescribeChangeSet ─────────────────────────────────────────────────────
