@@ -12,6 +12,7 @@ import io.github.hectorvent.floci.services.dynamodb.model.ExportSummary;
 import io.github.hectorvent.floci.services.dynamodb.model.GlobalSecondaryIndex;
 import io.github.hectorvent.floci.services.dynamodb.model.LocalSecondaryIndex;
 import io.github.hectorvent.floci.services.dynamodb.model.KeySchemaElement;
+import io.github.hectorvent.floci.services.dynamodb.model.StreamDescription;
 import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
 import io.github.hectorvent.floci.services.dynamodb.model.ConditionalCheckFailedException;
 import io.github.hectorvent.floci.services.s3.S3Service;
@@ -55,7 +56,22 @@ import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 @ApplicationScoped
 public class DynamoDbService implements ResourceProvider {
 
+    private static final String LOCAL_REPLICA_UPDATE_ERROR =
+            "Cannot add, delete, or update the local region through ReplicaUpdates. "
+                    + "Use CreateTable, DeleteTable, or UpdateTable as required.";
+
     private static final Logger LOG = Logger.getLogger(DynamoDbService.class);
+
+    /**
+     * View type applied when a stream is requested without an explicit StreamViewType.
+     *
+     * <p>Not an AWS default: the CloudFormation schema marks StreamViewType required inside
+     * StreamSpecification, and the DynamoDB API documents no default either. This mirrors the
+     * lenient handling {@code DynamoDbJsonHandler} already applies on CreateTable/UpdateTable
+     * ({@code path("StreamViewType").asText("NEW_AND_OLD_IMAGES")}), so an under-specified
+     * template gets a working stream instead of a rejection, and every entry point agrees.
+     */
+    private static final String DEFAULT_STREAM_VIEW_TYPE = "NEW_AND_OLD_IMAGES";
 
     private final StorageBackend<String, TableDefinition> tableStore;
     private final StorageBackend<String, Map<String, JsonNode>> itemStore;
@@ -141,15 +157,23 @@ public class DynamoDbService implements ResourceProvider {
 
     private void loadPersistedItems() {
         if (itemStore == null) return;
+        // No request scope at startup, so itemStore.keys() would only see the default account.
+        // scanAllAccountsRaw() returns every account's items already in the "accountId/
+        // region::tableName" key format itemsByTable expects.
+        if (itemStore instanceof AccountAwareStorageBackend<Map<String, JsonNode>> aware) {
+            aware.scanAllAccountsRaw().forEach((rawKey, items) ->
+                itemsByTable.put(rawKey, new ConcurrentSkipListMap<>(items)));
+            return;
+        }
         for (String key : itemStore.keys()) {
             itemStore.get(key).ifPresent(items ->
-                itemsByTable.put(key, new ConcurrentSkipListMap<>(items)));
+                itemsByTable.put(scopedItemsKey(key), new ConcurrentSkipListMap<>(items)));
         }
     }
 
     private void persistItems(String storageKey) {
         if (itemStore == null) return;
-        var items = itemsByTable.get(storageKey);
+        var items = itemsByTable.get(scopedItemsKey(storageKey));
         if (items != null) {
             itemStore.put(storageKey, new HashMap<>(items));
         } else {
@@ -312,7 +336,7 @@ public class DynamoDbService implements ResourceProvider {
         }
 
         tableStore.put(storageKey, table);
-        itemsByTable.put(storageKey, new ConcurrentSkipListMap<>());
+        itemsByTable.put(scopedItemsKey(storageKey), new ConcurrentSkipListMap<>());
         LOG.infov("Created table: {0} in region {1}", tableName, region);
         return table;
     }
@@ -324,7 +348,7 @@ public class DynamoDbService implements ResourceProvider {
                 .orElseThrow(() -> resourceNotFoundException(canonicalTableName));
 
         // Update dynamic counts
-        var items = itemsByTable.get(storageKey);
+        var items = itemsByTable.get(scopedItemsKey(storageKey));
         if (items != null) {
             table.setItemCount(items.size());
         }
@@ -336,6 +360,56 @@ public class DynamoDbService implements ResourceProvider {
         tableStore.put(regionKey(region, canonicalTableName), table);
     }
 
+    /**
+     * Turns on the table's stream and persists the result, so DescribeTable reports
+     * StreamSpecification / LatestStreamArn and event source mappings can find the stream.
+     *
+     * <p>Callers that reach DynamoDB through the service rather than the JSON handler — notably
+     * CloudFormation provisioning — need this: the handler enables the stream inline on
+     * CreateTable/UpdateTable, and without an equivalent entry point a table created by any other
+     * path is left streamless. A null {@code viewType} falls back to
+     * {@link #DEFAULT_STREAM_VIEW_TYPE}, matching the leniency the JSON handler already applies
+     * rather than any documented AWS default.
+     *
+     * @return the updated table, or the unchanged table when no stream service is wired.
+     */
+    public TableDefinition enableStream(String tableName, String viewType, String region) {
+        TableDefinition table = describeTable(tableName, region);
+        if (streamService == null) {
+            return table;
+        }
+        String effectiveViewType = (viewType == null || viewType.isBlank())
+                ? DEFAULT_STREAM_VIEW_TYPE
+                : viewType;
+        StreamDescription sd = streamService.enableStream(
+                table.getTableName(), table.getTableArn(), effectiveViewType, region);
+        table.setStreamEnabled(true);
+        table.setStreamArn(sd.getStreamArn());
+        table.setStreamViewType(effectiveViewType);
+        persistTable(tableName, table, region);
+        return table;
+    }
+
+    /**
+     * Turns the table's stream off and persists the result, so it stops producing records.
+     *
+     * <p>The counterpart to {@link #enableStream}, for the same service-layer callers. The stream
+     * ARN is retained on the table, matching what UpdateTable does through the JSON handler: AWS
+     * keeps reporting {@code LatestStreamArn} for a disabled stream.
+     *
+     * @return the updated table, or the unchanged table when no stream service is wired.
+     */
+    public TableDefinition disableStream(String tableName, String region) {
+        TableDefinition table = describeTable(tableName, region);
+        if (streamService == null) {
+            return table;
+        }
+        streamService.disableStream(table.getTableName(), region);
+        table.setStreamEnabled(false);
+        persistTable(tableName, table, region);
+        return table;
+    }
+
     public void deleteTable(String tableName, String region) {
         String canonicalTableName = canonicalTableName(region, tableName);
         String storageKey = regionKey(region, canonicalTableName);
@@ -343,8 +417,8 @@ public class DynamoDbService implements ResourceProvider {
             throw resourceNotFoundException(canonicalTableName);
         }
         tableStore.delete(storageKey);
-        itemsByTable.remove(storageKey);
-        itemLocks.remove(storageKey);
+        itemsByTable.remove(scopedItemsKey(storageKey));
+        itemLocks.remove(scopedItemsKey(storageKey));
         if (itemStore != null) {
             itemStore.delete(storageKey);
         }
@@ -405,7 +479,7 @@ public class DynamoDbService implements ResourceProvider {
         String itemKey = buildItemKey(table, normalizedItem);
 
         withItemLock(storageKey, itemKey, () -> {
-            var tableItems = itemsByTable.computeIfAbsent(storageKey, k -> new ConcurrentSkipListMap<>());
+            var tableItems = itemsByTable.computeIfAbsent(scopedItemsKey(storageKey), k -> new ConcurrentSkipListMap<>());
 
             JsonNode existing = tableItems.get(itemKey);
 
@@ -435,7 +509,7 @@ public class DynamoDbService implements ResourceProvider {
                 .orElseThrow(() -> resourceNotFoundException(canonicalTableName));
 
         String itemKey = buildItemKey(table, key, true);
-        var items = itemsByTable.get(storageKey);
+        var items = itemsByTable.get(scopedItemsKey(storageKey));
         if (items == null) {
             LOG.tracev("Got item from {0}: key={1} item=<not found>", canonicalTableName, itemKey);
             return null;
@@ -465,7 +539,7 @@ public class DynamoDbService implements ResourceProvider {
         String itemKey = buildItemKey(table, key, true);
 
         return withItemLock(storageKey, itemKey, () -> {
-            var items = itemsByTable.get(storageKey);
+            var items = itemsByTable.get(scopedItemsKey(storageKey));
             if (items == null) return null;
 
             if (conditionExpression != null) {
@@ -512,7 +586,7 @@ public class DynamoDbService implements ResourceProvider {
         String itemKey = buildItemKey(table, key, true);
 
         return withItemLock(storageKey, itemKey, () -> {
-            var items = itemsByTable.computeIfAbsent(storageKey, k -> new ConcurrentSkipListMap<>());
+            var items = itemsByTable.computeIfAbsent(scopedItemsKey(storageKey), k -> new ConcurrentSkipListMap<>());
 
             // Get existing item or create new one from key
             JsonNode existing = items.get(itemKey);
@@ -656,27 +730,31 @@ public class DynamoDbService implements ResourceProvider {
         TableDefinition table = tableStore.get(storageKey)
                 .orElseThrow(() -> resourceNotFoundException(canonicalTableName));
 
-        var items = itemsByTable.get(storageKey);
+        var items = itemsByTable.get(scopedItemsKey(storageKey));
         if (items == null) return new QueryResult(List.of(), 0, null);
 
         // Resolve key names: use GSI or table keys
         String pkName;
         String skName;
+        List<String> sortKeyNames;
         if (indexName != null) {
             var gsi = table.findGsi(indexName);
             if (gsi.isPresent()) {
                 pkName = gsi.get().getPartitionKeyName();
                 skName = gsi.get().getSortKeyName();
+                sortKeyNames = gsi.get().getSortKeyNames();
             } else {
                 var lsi = table.findLsi(indexName)
                         .orElseThrow(() -> new AwsException("ValidationException",
                                 "The table does not have the specified index: " + indexName, 400));
                 pkName = lsi.getPartitionKeyName();
                 skName = lsi.getSortKeyName();
+                sortKeyNames = lsi.getSortKeyNames();
             }
         } else {
             pkName = table.getPartitionKeyName();
             skName = table.getSortKeyName();
+            sortKeyNames = table.getSortKeyNames();
         }
 
         List<JsonNode> results = new ArrayList<>();
@@ -719,17 +797,25 @@ public class DynamoDbService implements ResourceProvider {
         // Filter out TTL-expired items
         results = results.stream().filter(item -> !isExpired(item, table)).toList();
 
-        // Sort by sort key if present
-        if (skName != null) {
-            String finalSkName = skName;
+        // Sort by the full (possibly composite) sort key, comparing each attribute in key-schema
+        // order. Using only the first sort-key attribute would ignore the remaining components
+        // (e.g. a "requestStateQuery RANGE, createdAt RANGE" index would never order by createdAt),
+        // which in turn breaks ScanIndexForward=false. See floci-io/floci#1675.
+        if (!sortKeyNames.isEmpty()) {
+            List<String> finalSortKeyNames = sortKeyNames;
             results = new ArrayList<>(results);
             results.sort((a, b) -> {
-                JsonNode aAttr = a.get(finalSkName);
-                JsonNode bAttr = b.get(finalSkName);
-                if (aAttr == null && bAttr == null) return 0;
-                if (aAttr == null) return -1;
-                if (bAttr == null) return 1;
-                return ExpressionEvaluator.compareAttributeValues(aAttr, bAttr);
+                for (String name : finalSortKeyNames) {
+                    JsonNode aAttr = a.get(name);
+                    JsonNode bAttr = b.get(name);
+                    int cmp;
+                    if (aAttr == null && bAttr == null) cmp = 0;
+                    else if (aAttr == null) cmp = -1;
+                    else if (bAttr == null) cmp = 1;
+                    else cmp = ExpressionEvaluator.compareAttributeValues(aAttr, bAttr);
+                    if (cmp != 0) return cmp;
+                }
+                return 0;
             });
             if (Boolean.FALSE.equals(scanIndexForward)) {
                 Collections.reverse(results);
@@ -744,13 +830,13 @@ public class DynamoDbService implements ResourceProvider {
 
             String startItemKey = hasTableKeys
                     ? buildItemKeyFromNode(exclusiveStartKey, tablePkName, tableSkName)
-                    : buildItemKeyFromNode(exclusiveStartKey, pkName, skName);
+                    : buildItemKeyFromNode(exclusiveStartKey, pkName, sortKeyNames);
 
             int startIdx = -1;
             for (int i = 0; i < results.size(); i++) {
                 String thisKey = hasTableKeys
                         ? buildItemKeyFromNode(results.get(i), tablePkName, tableSkName)
-                        : buildItemKeyFromNode(results.get(i), pkName, skName);
+                        : buildItemKeyFromNode(results.get(i), pkName, sortKeyNames);
                 if (thisKey.equals(startItemKey)) {
                     startIdx = i;
                     break;
@@ -764,26 +850,33 @@ public class DynamoDbService implements ResourceProvider {
         List<JsonNode> evaluatedItems = results;
         JsonNode lastEvaluatedKey = null;
 
-        // Apply Limit (stops at N items)
-        if (limit != null && limit > 0 && evaluatedItems.size() > limit) {
-            JsonNode lastItem = evaluatedItems.get(limit - 1);
-            lastEvaluatedKey = buildKeyNode(table, lastItem, pkName, skName, indexName != null);
-            evaluatedItems = new ArrayList<>(evaluatedItems.subList(0, limit));
-        }
-
-        // Apply 1MB response size limit (DynamoDB stops reading when scanned data exceeds 1MB)
-        if (lastEvaluatedKey == null) {
-            final int MAX_RESPONSE_BYTES = 1024 * 1024;
-            int accSize = 0;
-            for (int i = 0; i < evaluatedItems.size(); i++) {
-                int sz = DynamoDbItemSize.calculateItemSize(evaluatedItems.get(i));
-                if (accSize > 0 && accSize + sz > MAX_RESPONSE_BYTES) {
-                    lastEvaluatedKey = buildKeyNode(table, evaluatedItems.get(i - 1), pkName, skName, indexName != null);
-                    evaluatedItems = new ArrayList<>(evaluatedItems.subList(0, i));
-                    break;
-                }
-                accSize += sz;
+        // Stop at whichever boundary the read reaches first: the 1 MB cap or Limit.
+        // The size check comes first for each item — per the Query API reference,
+        // "if the processed dataset size exceeds 1 MB before DynamoDB reaches this
+        // limit, it stops the operation", so an item that would cross the 1 MB cap
+        // is not read and does not count toward Limit. DynamoDB does not look ahead
+        // either way: a read that stops at a boundary always returns a
+        // LastEvaluatedKey, even when the boundary happens to be the last item of
+        // the result set ("the absence of LastEvaluatedKey is the only way to know
+        // that you have reached the end of the result set").
+        final int MAX_RESPONSE_BYTES = 1024 * 1024;
+        int accSize = 0;
+        int included = -1; // index one past the last included item; -1 = no boundary hit
+        for (int i = 0; i < evaluatedItems.size(); i++) {
+            int sz = DynamoDbItemSize.calculateItemSize(evaluatedItems.get(i));
+            if (accSize > 0 && accSize + sz > MAX_RESPONSE_BYTES) {
+                included = i; // the 1 MB cap stops the read BEFORE this item
+                break;
             }
+            accSize += sz;
+            if (limit != null && limit > 0 && i + 1 >= limit) {
+                included = i + 1; // the Limit cap stops the read AFTER this item
+                break;
+            }
+        }
+        if (included > 0) {
+            lastEvaluatedKey = buildKeyNode(table, evaluatedItems.get(included - 1), pkName, sortKeyNames, indexName != null);
+            evaluatedItems = new ArrayList<>(evaluatedItems.subList(0, included));
         }
 
         int scannedCount = evaluatedItems.size();
@@ -817,7 +910,7 @@ public class DynamoDbService implements ResourceProvider {
         TableDefinition table = tableStore.get(storageKey)
                 .orElseThrow(() -> resourceNotFoundException(canonicalTableName));
 
-        var items = itemsByTable.get(storageKey);
+        var items = itemsByTable.get(scopedItemsKey(storageKey));
         if (items == null) return new ScanResult(List.of(), 0, null);
 
         // ConcurrentSkipListMap keeps items sorted by base item key — no sort needed.
@@ -847,41 +940,50 @@ public class DynamoDbService implements ResourceProvider {
                 ? items.tailMap(buildItemKeyFromNode(exclusiveStartKey, pkName, skName), false).values()
                 : items.values();
 
+        final int MAX_RESPONSE_BYTES = 1024 * 1024;
         int totalScanned = 0;
+        int accSize = 0;
         List<JsonNode> results = new ArrayList<>();
         JsonNode lastEvaluatedKey = null;
-        Iterator<JsonNode> it = source.iterator();
-        while (it.hasNext()) {
-            JsonNode item = it.next();
+        JsonNode lastScanned = null;
+        for (JsonNode item : source) {
+            // Sparse index behavior: a scan of a secondary index reads the index
+            // itself, and base-table items missing any index key attribute do not
+            // exist in the index — they are never read, never counted, and can
+            // never anchor a cursor.
+            if (indexScan && !(hasNonNullAttribute(item, lekPkName)
+                    && (lekSkName == null || hasNonNullAttribute(item, lekSkName)))) {
+                continue;
+            }
+            // Stop at whichever boundary the read reaches first: the 1 MB cap or
+            // Limit. The size check comes first — per the API reference, "if the
+            // processed dataset size exceeds 1 MB before DynamoDB reaches this
+            // limit, it stops the operation" — so an item that would cross the cap
+            // is not read, does not count toward ScannedCount, and the cursor
+            // anchors to the previous scanned item (which, with a filter, may well
+            // be an item that was not returned).
+            int sz = DynamoDbItemSize.calculateItemSize(item);
+            if (accSize > 0 && accSize + sz > MAX_RESPONSE_BYTES) {
+                lastEvaluatedKey = buildKeyNode(table, lastScanned, lekPkName, lekSkName, indexScan);
+                break;
+            }
+            accSize += sz;
             totalScanned++;
+            lastScanned = item;
             if (!isExpired(item, table)) {
                 boolean matched = (filterExpression == null
                         || matchesFilterExpression(item, filterExpression, expressionAttrNames, expressionAttrValues))
                         && (scanFilter == null || matchesScanFilter(item, scanFilter));
                 if (matched) results.add(item);
             }
-            // Limit caps SCANNED items (those read), not matched items. Stop at the
-            // limit and surface a cursor when more items remain to be examined.
+            // Limit caps SCANNED items (those read), not matched items. DynamoDB does
+            // not look ahead when it stops at the Limit boundary: it always surfaces a
+            // cursor, even when the boundary happens to be the last item of the result
+            // set. The client only learns it reached the end when a follow-up request
+            // comes back without a LastEvaluatedKey.
             if (limit != null && limit > 0 && totalScanned >= limit) {
-                if (it.hasNext()) {
-                    lastEvaluatedKey = buildKeyNode(table, item, lekPkName, lekSkName, indexScan);
-                }
+                lastEvaluatedKey = buildKeyNode(table, item, lekPkName, lekSkName, indexScan);
                 break;
-            }
-        }
-
-        // Apply 1MB response size limit (only when not already truncated by Limit)
-        if (lastEvaluatedKey == null) {
-            final int MAX_RESPONSE_BYTES = 1024 * 1024;
-            int accSize = 0;
-            for (int i = 0; i < results.size(); i++) {
-                int sz = DynamoDbItemSize.calculateItemSize(results.get(i));
-                if (accSize > 0 && accSize + sz > MAX_RESPONSE_BYTES) {
-                    lastEvaluatedKey = buildKeyNode(table, results.get(i - 1), lekPkName, lekSkName, indexScan);
-                    results = new ArrayList<>(results.subList(0, i));
-                    break;
-                }
-                accSize += sz;
             }
         }
 
@@ -973,7 +1075,7 @@ public class DynamoDbService implements ResourceProvider {
         //   * Same token + different request body  → IdempotentParameterMismatchException.
         //   * No token, or expired token           → proceed normally.
         if (clientRequestToken != null && !clientRequestToken.isEmpty() && rawRequest != null) {
-            String cacheKey = region + "::" + clientRequestToken;
+            String cacheKey = regionResolver.getAccountId() + "::" + region + "::" + clientRequestToken;
             String requestHash = sha256(rawRequest.toString());
             long nowNanos = System.nanoTime();
 
@@ -1152,7 +1254,7 @@ public class DynamoDbService implements ResourceProvider {
                 .orElseThrow(() -> resourceNotFoundException(canonicalTableName));
 
         String itemKey = buildItemKey(table, key);
-        var tableItems = itemsByTable.get(storageKey);
+        var tableItems = itemsByTable.get(scopedItemsKey(storageKey));
         JsonNode existing = tableItems != null ? tableItems.get(itemKey) : null;
 
         try {
@@ -1290,6 +1392,84 @@ public class DynamoDbService implements ResourceProvider {
         return table;
     }
 
+    // --- Global-table replicas ---
+
+    /**
+     * Applies global-table replica changes (the {@code ReplicaUpdates} of UpdateTable, and the
+     * legacy {@code dynamodb.Table.replicationRegions} replica custom resource). This single-process
+     * emulator serves every region from the same table, so a replica is tracked as metadata and
+     * surfaced by DescribeTable as an ACTIVE Replica; no cross-region copy is performed. Regions are
+     * de-duplicated and adding an existing / removing an absent one is a no-op, keeping
+     * CloudFormation re-applies and cleanup idempotent. Update remains strict because it represents
+     * a settings change and has no target when the replica is absent.
+     */
+    public TableDefinition applyReplicaUpdates(String tableName, List<String> addRegions,
+                                               List<String> removeRegions, String region) {
+        return applyReplicaUpdates(tableName, addRegions, removeRegions, Collections.emptyList(), region);
+    }
+
+    public TableDefinition applyReplicaUpdates(String tableName, List<String> addRegions,
+                                               List<String> removeRegions, List<String> updateRegions, String region) {
+        TableDefinition table = validateReplicaUpdatesAndGetTable(
+                tableName, addRegions, removeRegions, updateRegions, region);
+        List<String> replicas = new ArrayList<>(table.getReplicaRegions());
+        if (removeRegions != null) {
+            replicas.removeAll(removeRegions);
+        }
+        if (addRegions != null) {
+            for (String r : addRegions) {
+                if (r != null && !r.isBlank() && !replicas.contains(r)) {
+                    replicas.add(r);
+                }
+            }
+        }
+        table.setReplicaRegions(replicas);
+        String canonicalTableName = canonicalTableName(region, tableName);
+        tableStore.put(regionKey(region, canonicalTableName), table);
+        LOG.infov("Updated replicas for table {0} in region {1}: {2}", canonicalTableName, region, replicas);
+        return table;
+    }
+
+    public void validateReplicaUpdates(String tableName, List<String> addRegions,
+                                       List<String> removeRegions, List<String> updateRegions, String region) {
+        validateReplicaUpdatesAndGetTable(tableName, addRegions, removeRegions, updateRegions, region);
+    }
+
+    private TableDefinition validateReplicaUpdatesAndGetTable(
+            String tableName, List<String> addRegions, List<String> removeRegions,
+            List<String> updateRegions, String region) {
+        validateReplicaRegions(addRegions, region);
+        validateReplicaRegions(removeRegions, region);
+        validateReplicaRegions(updateRegions, region);
+        String canonicalTableName = canonicalTableName(region, tableName);
+        String storageKey = regionKey(region, canonicalTableName);
+        TableDefinition table = tableStore.get(storageKey)
+                .orElseThrow(() -> resourceNotFoundException(canonicalTableName));
+        if (updateRegions != null) {
+            for (String replicaRegion : updateRegions) {
+                if (!table.getReplicaRegions().contains(replicaRegion)) {
+                    throw new AwsException("ValidationException",
+                            "Replica " + replicaRegion + " does not exist", 400);
+                }
+            }
+        }
+        return table;
+    }
+
+    private static void validateReplicaRegions(List<String> replicaRegions, String localRegion) {
+        if (replicaRegions == null) {
+            return;
+        }
+        for (String replicaRegion : replicaRegions) {
+            if (replicaRegion == null || replicaRegion.isBlank()) {
+                throw new AwsException("ValidationException", "Replica RegionName must not be empty", 400);
+            }
+            if (replicaRegion.equals(localRegion)) {
+                throw new AwsException("ValidationException", LOCAL_REPLICA_UPDATE_ERROR, 400);
+            }
+        }
+    }
+
     // --- TTL ---
 
     public void updateTimeToLive(String tableName, String ttlAttributeName, boolean enabled, String region) {
@@ -1331,20 +1511,22 @@ public class DynamoDbService implements ResourceProvider {
 
     void deleteExpiredItems() {
         int totalDeleted = 0;
+        // Runs with no request scope and must sweep every account's tables, not just the
+        // default one — scanAllAccountsRaw()'s key matches itemsByTable's directly.
         Map<String, TableDefinition> allTables;
         if (tableStore instanceof AccountAwareStorageBackend<TableDefinition> aware) {
-            allTables = aware.scanAllAccountsAsMap();
+            allTables = aware.scanAllAccountsRaw();
         } else {
             allTables = new HashMap<>();
-            tableStore.keys().forEach(k -> tableStore.get(k).ifPresent(v -> allTables.put(k, v)));
+            tableStore.keys().forEach(k -> tableStore.get(k).ifPresent(v -> allTables.put(scopedItemsKey(k), v)));
         }
         for (Map.Entry<String, TableDefinition> entry : allTables.entrySet()) {
-            String storageKey = entry.getKey();
+            String rawKey = entry.getKey();
             TableDefinition table = entry.getValue();
             if (!table.isTtlEnabled() || table.getTtlAttributeName() == null) {
                 continue;
             }
-            var items = itemsByTable.get(storageKey);
+            var items = itemsByTable.get(rawKey);
             if (items == null) continue;
 
             List<String> expiredKeys = items.entrySet().stream()
@@ -1354,6 +1536,9 @@ public class DynamoDbService implements ResourceProvider {
 
             if (expiredKeys.isEmpty()) continue;
 
+            int slash = rawKey.indexOf('/');
+            String accountId = slash >= 0 ? rawKey.substring(0, slash) : null;
+            String storageKey = slash >= 0 ? rawKey.substring(slash + 1) : rawKey;
             String region = storageKey.split("::", 2)[0];
             for (String itemKey : expiredKeys) {
                 JsonNode removed = items.remove(itemKey);
@@ -1366,11 +1551,21 @@ public class DynamoDbService implements ResourceProvider {
                     }
                 }
             }
-            persistItems(storageKey);
+            persistItemsForAccount(accountId, storageKey, items);
             totalDeleted += expiredKeys.size();
         }
         if (totalDeleted > 0) {
             LOG.infov("TTL sweeper removed {0} expired items", totalDeleted);
+        }
+    }
+
+    /** Like {@link #persistItems}, but for callers with no ambient request account to rely on. */
+    private void persistItemsForAccount(String accountId, String storageKey, Map<String, JsonNode> items) {
+        if (itemStore == null) return;
+        if (accountId != null && itemStore instanceof AccountAwareStorageBackend<Map<String, JsonNode>> aware) {
+            aware.putForAccount(accountId, storageKey, new HashMap<>(items));
+        } else {
+            itemStore.put(storageKey, new HashMap<>(items));
         }
     }
 
@@ -2282,9 +2477,17 @@ public class DynamoDbService implements ResourceProvider {
         return region + "::" + tableName;
     }
 
+    // itemsByTable/itemLocks are plain fields, unlike tableStore/itemStore, so they get no
+    // automatic account prefixing — without this, two accounts with a same-named table would
+    // share one item map. Matches scanAllAccountsRaw()'s key format, so a raw key from there
+    // can be used directly as an itemsByTable/itemLocks key.
+    private String scopedItemsKey(String storageKey) {
+        return regionResolver.getAccountId() + "/" + storageKey;
+    }
+
     private ReentrantLock lockFor(String storageKey, String itemKey) {
         return itemLocks
-                .computeIfAbsent(storageKey, k -> new ConcurrentHashMap<>())
+                .computeIfAbsent(scopedItemsKey(storageKey), k -> new ConcurrentHashMap<>())
                 .computeIfAbsent(itemKey, k -> new ReentrantLock());
     }
 
@@ -2352,16 +2555,25 @@ public class DynamoDbService implements ResourceProvider {
     }
 
     private String buildItemKeyFromNode(JsonNode item, String pkName, String skName) {
+        return buildItemKeyFromNode(item, pkName, skName == null ? List.of() : List.of(skName));
+    }
+
+    // Builds a cursor-matching string from the partition key plus every sort-key component in
+    // key-schema order. A composite (multi-RANGE) index cursor must incorporate all components,
+    // otherwise rows sharing the first RANGE value collapse to the same key and pagination can
+    // skip or duplicate items. See floci-io/floci#1675.
+    private String buildItemKeyFromNode(JsonNode item, String pkName, List<String> skNames) {
         JsonNode pkAttr = item.get(pkName);
         if (pkAttr == null) return "";
         String pk = extractScalarValue(pkAttr);
-        if (skName != null) {
+        StringBuilder key = new StringBuilder(pk != null ? pk : "");
+        for (String skName : skNames) {
             JsonNode skAttr = item.get(skName);
             if (skAttr != null) {
-                return pk + "#" + extractScalarValue(skAttr);
+                key.append("#").append(extractScalarValue(skAttr));
             }
         }
-        return pk != null ? pk : "";
+        return key.toString();
     }
 
     JsonNode buildKeyNode(TableDefinition table, JsonNode item, String pkName, String skName) {
@@ -2370,13 +2582,23 @@ public class DynamoDbService implements ResourceProvider {
 
     JsonNode buildKeyNode(TableDefinition table, JsonNode item,
                           String pkName, String skName, boolean isIndexQuery) {
+        return buildKeyNode(table, item, pkName,
+                skName == null ? List.of() : List.of(skName), isIndexQuery);
+    }
+
+    // Emits a LastEvaluatedKey carrying the partition key plus every sort-key component in
+    // key-schema order (a composite index has more than one), and, for index queries, the base
+    // table key so the cursor uniquely identifies a row. Emitting only the first RANGE attribute
+    // loses composite key identity. See floci-io/floci#1675.
+    JsonNode buildKeyNode(TableDefinition table, JsonNode item,
+                          String pkName, List<String> skNames, boolean isIndexQuery) {
         com.fasterxml.jackson.databind.node.ObjectNode keyNode =
                 com.fasterxml.jackson.databind.node.JsonNodeFactory.instance.objectNode();
         JsonNode pkAttr = item.get(pkName);
         if (pkAttr != null) {
             keyNode.set(pkName, pkAttr);
         }
-        if (skName != null) {
+        for (String skName : skNames) {
             JsonNode skAttr = item.get(skName);
             if (skAttr != null) {
                 keyNode.set(skName, skAttr);
@@ -2388,7 +2610,7 @@ public class DynamoDbService implements ResourceProvider {
             if (!tablePk.equals(pkName) && item.get(tablePk) != null) {
                 keyNode.set(tablePk, item.get(tablePk));
             }
-            if (tableSk != null && !tableSk.equals(skName) && item.get(tableSk) != null) {
+            if (tableSk != null && !skNames.contains(tableSk) && item.get(tableSk) != null) {
                 keyNode.set(tableSk, item.get(tableSk));
             }
         }
@@ -2433,14 +2655,18 @@ public class DynamoDbService implements ResourceProvider {
 
         return switch (op) {
             case "EQ" -> {
-                if (attrValue == null) yield false;
-                yield ExpressionEvaluator.compareAttributeValues(attrValue, compareAttr != null ? compareAttr : attrValue) == 0
-                        && actual != null && actual.equals(compareValue);
+                if (attrValue == null || compareAttr == null) {
+                    yield false;
+                }
+                // Deep equality, so set/list/map values compare by content rather than
+                // collapsing to an empty scalar and matching everything.
+                yield attributeValuesEqual(attrValue, compareAttr);
             }
             case "NE" -> {
-                if (attrValue == null) yield true;
-                if (actual == null || compareValue == null) yield true;
-                yield !actual.equals(compareValue);
+                if (attrValue == null || compareAttr == null) {
+                    yield true;
+                }
+                yield !attributeValuesEqual(attrValue, compareAttr);
             }
             case "NULL" -> attrValue == null;
             case "NOT_NULL" -> attrValue != null;
@@ -2615,7 +2841,7 @@ public class DynamoDbService implements ResourceProvider {
         }
 
         ExportDescription finalDesc = desc;
-        ConcurrentSkipListMap<String, JsonNode> tableItems = itemsByTable.get(storageKey);
+        ConcurrentSkipListMap<String, JsonNode> tableItems = itemsByTable.get(scopedItemsKey(storageKey));
         List<JsonNode> snapshot = tableItems != null
                 ? List.copyOf(tableItems.values())
                 : List.of();

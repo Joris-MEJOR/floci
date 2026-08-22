@@ -1,9 +1,11 @@
 package io.github.hectorvent.floci.services.elasticache;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
-import io.github.hectorvent.floci.core.common.RegionResolver;
-import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.elasticache.container.ElastiCacheContainerHandle;
 import io.github.hectorvent.floci.services.elasticache.container.ElastiCacheContainerManager;
 import io.github.hectorvent.floci.services.elasticache.model.AuthMode;
@@ -13,6 +15,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -41,7 +45,6 @@ class ElastiCacheServiceTest {
         proxyManager = mock(ElastiCacheProxyManager.class);
         StorageFactory storageFactory = mock(StorageFactory.class);
         EmulatorConfig config = mock(EmulatorConfig.class);
-        RegionResolver regionResolver = mock(RegionResolver.class);
 
         EmulatorConfig.ServicesConfig servicesConfig = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.ElastiCacheServiceConfig ecConfig = mock(EmulatorConfig.ElastiCacheServiceConfig.class);
@@ -52,14 +55,47 @@ class ElastiCacheServiceTest {
         when(ecConfig.defaultImage()).thenReturn("valkey/valkey:8");
         when(config.hostname()).thenReturn(java.util.Optional.of("localhost"));
 
-        when(storageFactory.create(anyString(), anyString(), any())).thenAnswer(inv -> new InMemoryStorage<>());
+        when(storageFactory.create(anyString(), anyString(), any())).thenAnswer(inv -> AccountAwareStorageBackend.inMemory("000000000000"));
         when(containerManager.start(anyString(), anyString()))
                 .thenReturn(new ElastiCacheContainerHandle("cid", "grp", "localhost", 6379));
         doNothing().when(proxyManager).startProxy(anyString(), any(), anyInt(), anyString(), anyInt(), any());
-        when(regionResolver.buildArn(anyString(), anyString(), anyString()))
-                .thenAnswer(inv -> "arn:aws:" + inv.getArgument(0) + ":us-east-1:123456789012:" + inv.getArgument(2));
+        Ec2Service ec2Service = org.mockito.Mockito.mock(Ec2Service.class);
+        service = new ElastiCacheService(containerManager, proxyManager, storageFactory, config,
+                ec2Service, new RegionResolver("us-east-1", "000000000000"));
+    }
 
-        service = new ElastiCacheService(containerManager, proxyManager, storageFactory, config, regionResolver);
+    @Test
+    void proxyPortExhaustionSurfacesModeledCapacityFault() {
+        // A one-port range: the first replication group claims it, so the second must fail with
+        // the botocore/smithy-modeled fault for CreateReplicationGroup — wire code
+        // InsufficientCacheClusterCapacity at HTTP 400 (Sender) — not the invented
+        // InsufficientReplicationGroupCapacity/503 that no SDK can map.
+        ElastiCacheContainerManager cm = mock(ElastiCacheContainerManager.class);
+        ElastiCacheProxyManager pm = mock(ElastiCacheProxyManager.class);
+        StorageFactory sf = mock(StorageFactory.class);
+        EmulatorConfig cfg = mock(EmulatorConfig.class);
+        EmulatorConfig.ServicesConfig sc = mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.ElastiCacheServiceConfig ec = mock(EmulatorConfig.ElastiCacheServiceConfig.class);
+        when(cfg.services()).thenReturn(sc);
+        when(sc.elasticache()).thenReturn(ec);
+        when(ec.proxyBasePort()).thenReturn(17000);
+        when(ec.proxyMaxPort()).thenReturn(17000);
+        when(ec.defaultImage()).thenReturn("valkey/valkey:8");
+        when(cfg.hostname()).thenReturn(java.util.Optional.of("localhost"));
+        when(sf.create(anyString(), anyString(), any())).thenAnswer(inv -> AccountAwareStorageBackend.inMemory("000000000000"));
+        when(cm.start(anyString(), anyString()))
+                .thenReturn(new ElastiCacheContainerHandle("cid", "grp", "localhost", 6379));
+        doNothing().when(pm).startProxy(anyString(), any(), anyInt(), anyString(), anyInt(), any());
+        ElastiCacheService svc = new ElastiCacheService(cm, pm, sf, cfg,
+                org.mockito.Mockito.mock(Ec2Service.class),
+                new RegionResolver("us-east-1", "000000000000"));
+
+        svc.createReplicationGroup("g1", "d", AuthMode.PASSWORD, null, "us-east-1");
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> svc.createReplicationGroup("g2", "d", AuthMode.PASSWORD, null, "us-east-1"));
+        assertEquals("InsufficientCacheClusterCapacity", ex.getErrorCode());
+        assertEquals(400, ex.getHttpStatus());
     }
 
     @Test
@@ -67,9 +103,9 @@ class ElastiCacheServiceTest {
         service.createReplicationGroup("grp", "test", AuthMode.PASSWORD, null, "us-east-1");
 
         service.createUser("default-user-id", "default", AuthMode.PASSWORD,
-                List.of("default-pass"), "on ~* +@all");
+                List.of("default-pass"), "on ~* +@all", null);
         service.createUser("other-user-id", "other", AuthMode.PASSWORD,
-                List.of("other-pass"), "on ~* +@all");
+                List.of("other-pass"), "on ~* +@all", null);
 
         service.modifyReplicationGroup("grp",
                 List.of("default-user-id", "other-user-id"), null);
@@ -87,7 +123,7 @@ class ElastiCacheServiceTest {
         service.createReplicationGroup("grp", "test", AuthMode.PASSWORD, null, "us-east-1");
 
         service.createUser("other-user-id", "other", AuthMode.PASSWORD,
-                List.of("other-pass"), "on ~* +@all");
+                List.of("other-pass"), "on ~* +@all", null);
 
         service.modifyReplicationGroup("grp", List.of("other-user-id"), null);
 
@@ -123,9 +159,10 @@ class ElastiCacheServiceTest {
         assertThrows(RuntimeException.class,
                 () -> service.createReplicationGroup("grp", "test", AuthMode.PASSWORD, null, "us-east-1"));
 
-        // Rollback stopped the proxy and the already-started container.
+        // Rollback stops by the exact handle, not a fresh by-id lookup.
         verify(proxyManager).stopProxy("grp");
         verify(containerManager).stop(handle);
+        verify(containerManager, never()).stopByGroupId(anyString());
 
         // The reserved proxy port was released: a subsequent successful create reuses the base port
         // instead of skipping to the next one (which is what a leak would cause).
@@ -138,18 +175,16 @@ class ElastiCacheServiceTest {
     }
 
     @Test
-    void failedContainerStartReleasesPortWithoutTouchingProxyOrContainer() {
-        // Container start blows up before any handle exists.
-        doThrow(new RuntimeException("container boom"))
+    void failedContainerStartupCleansUpContainerByIdAndReleasesPort() {
+        // Models a readiness timeout: start() throws without ever returning a handle.
+        doThrow(new RuntimeException("readiness boom"))
                 .when(containerManager).start(eq("grp"), anyString());
 
-        // The original failure must propagate to the caller (we clean up, then rethrow).
         assertThrows(RuntimeException.class,
                 () -> service.createReplicationGroup("grp", "test", AuthMode.PASSWORD, null, "us-east-1"));
 
-        // No container started and no proxy started, so rollback must not call either stop.
         verify(proxyManager, never()).stopProxy(anyString());
-        verify(containerManager, never()).stop(any());
+        verify(containerManager).stopByGroupId("grp");
 
         // The reserved proxy port was still released: a subsequent successful create reuses the base port.
         when(containerManager.start(anyString(), anyString()))
@@ -158,5 +193,32 @@ class ElastiCacheServiceTest {
                 service.createReplicationGroup("grp2", "test", AuthMode.PASSWORD, null, "us-east-1");
         assertEquals(16379, recovered.getProxyPort(),
                 "Port from the failed create must be released so the next group reuses it");
+    }
+
+    @Test
+    void concurrentCreateForSameGroupIdIsRejectedWhileFirstIsProvisioning() throws InterruptedException {
+        CountDownLatch startedLatch = new CountDownLatch(1);
+        CountDownLatch releaseLatch = new CountDownLatch(1);
+        when(containerManager.start(anyString(), anyString())).thenAnswer(inv -> {
+            startedLatch.countDown();
+            assertTrue(releaseLatch.await(5, TimeUnit.SECONDS), "test timed out waiting for release");
+            return new ElastiCacheContainerHandle("cid", "grp", "localhost", 6379);
+        });
+
+        Thread firstRequest = new Thread(() ->
+                service.createReplicationGroup("grp", "test", AuthMode.PASSWORD, null, "us-east-1"));
+        firstRequest.start();
+        assertTrue(startedLatch.await(5, TimeUnit.SECONDS), "first request never reached container start");
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> service.createReplicationGroup("grp", "test", AuthMode.PASSWORD, null, "us-east-1"));
+        assertEquals("ReplicationGroupAlreadyExistsFault", ex.jsonType());
+        verify(containerManager, never()).stop(any());
+        verify(containerManager, never()).stopByGroupId(anyString());
+
+        releaseLatch.countDown();
+        firstRequest.join(5000);
+
+        assertEquals("grp", service.getReplicationGroup("grp").getReplicationGroupId());
     }
 }

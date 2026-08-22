@@ -33,6 +33,7 @@ import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -47,6 +48,7 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Answers.RETURNS_SELF;
+import static org.mockito.Answers.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
@@ -61,6 +63,7 @@ class Ec2ContainerManagerTest {
     private static final String TEST_USER_DATA_OUTPUT = "test-output";
     private static final String TEST_CONTAINER_ID = "container-1";
     private static final String TEST_LOG_STREAM_NAME = "yyyy/MM/dd/user-data";
+    private static final String TEST_SSH_PUBLIC_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest test@floci";
 
     @org.junit.jupiter.api.AfterEach
     void resetBridgeIpPolling() {
@@ -88,6 +91,27 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
+    void exposeReachablePrivateAddressPreservesAllocatedIpWhenAwsFaithful() {
+        // #1983: with awsFaithfulPrivateIp=true, the CFN/subnet-allocated private
+        // IP set at launch is left untouched — the container bridge IP is not
+        // reported (routing still uses it via containerBridgeIp, tracked elsewhere).
+        Instance instance = new Instance();
+        instance.setPrivateIpAddress("10.82.32.10");
+        instance.setPrivateDnsName("ip-10-82-32-10.ec2.internal");
+
+        InstanceNetworkInterface networkInterface = new InstanceNetworkInterface();
+        networkInterface.setPrivateIpAddress("10.82.32.10");
+        networkInterface.setPrivateDnsName("ip-10-82-32-10.ec2.internal");
+        instance.setNetworkInterfaces(List.of(networkInterface));
+
+        Ec2ContainerManager.exposeReachablePrivateAddress(instance, "192.168.215.21", true);
+
+        assertEquals("10.82.32.10", instance.getPrivateIpAddress());
+        assertEquals("ip-10-82-32-10.ec2.internal", instance.getPrivateDnsName());
+        assertEquals("10.82.32.10", networkInterface.getPrivateIpAddress());
+    }
+
+    @Test
     void restoreMetadataRegistrationRegistersRunningPersistedContainer() {
         ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
         when(lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(true);
@@ -107,7 +131,7 @@ class Ec2ContainerManagerTest {
                 mock(DockerHostResolver.class),
                 dockerClient,
                 mock(PortAllocator.class),
-                mock(EmulatorConfig.class),
+                mock(EmulatorConfig.class, RETURNS_DEEP_STUBS),
                 metadataServer,
                 mock(Ec2PortForwardManager.class));
 
@@ -370,6 +394,127 @@ class Ec2ContainerManagerTest {
         awaitUntil(() -> "running".equals(instance.getState().getName()), Duration.ofSeconds(2));
     }
 
+    @Test
+    void launchCreatesSshdPrivilegeSeparationDirectoryBeforeStartingSshd() throws Exception {
+        Ec2ContainerManager.containerBridgeIpAttempts = 1;
+        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
+        LaunchHarness harness = launchHarness();
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        InspectContainerResponse withIp = inspectResponse("172.18.0.12");
+        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(withIp);
+        harness.stubSuccessfulExecs(new CountDownLatch(0), new CountDownLatch(0));
+
+        harness.manager.launch(instance("i-sshd"), "ubuntu:24.04", TEST_SSH_PUBLIC_KEY, "us-west-2");
+
+        awaitUntil(() -> commandIndex(harness.executedCommands, "/usr/sbin/sshd") >= 0, Duration.ofSeconds(2));
+
+        int mkdirIndex = commandIndex(harness.executedCommands, "mkdir", "-p", "/run/sshd");
+        int sshdIndex = commandIndex(harness.executedCommands, "/usr/sbin/sshd");
+        assertTrue(mkdirIndex >= 0,
+                "sshd startup should create the /run/sshd privilege-separation directory");
+        assertTrue(mkdirIndex < sshdIndex,
+                "/run/sshd must be created before sshd starts, otherwise sshd exits with "
+                        + "\"Missing privilege separation directory\"");
+    }
+
+    @Test
+    void launchWithoutKeyPairStillStartsSshd() throws Exception {
+        // Regression for #2184: sshd previously only started when a key pair was supplied, so
+        // run-instances without --key-name left no daemon listening at all ("connection refused")
+        // instead of matching real AWS AMIs, which run sshd as part of normal boot regardless of
+        // whether a key pair is attached to the instance.
+        LaunchHarness harness = launchHarness();
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        InspectContainerResponse withIp = inspectResponse("172.18.0.20");
+        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(withIp);
+        harness.stubSuccessfulExecs(new CountDownLatch(0), new CountDownLatch(0));
+        Instance instance = instance("i-nokeypair");
+
+        harness.manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
+
+        awaitUntil(() -> "running".equals(instance.getState().getName()), Duration.ofSeconds(2));
+        ExecCreateCmd execCreate = harness.dockerClient.execCreateCmd(TEST_CONTAINER_ID);
+        verify(execCreate, timeout(2000)).withCmd(eq(new String[]{"/usr/sbin/sshd"}));
+        // No key pair was supplied, so nothing should have been written to authorized_keys.
+        verify(harness.dockerClient, never()).copyArchiveToContainerCmd(TEST_CONTAINER_ID);
+    }
+
+    private static final String[] SSHD_INSTALL_PROBE_CMD = {"sh", "-c",
+            "if ! command -v sshd >/dev/null 2>&1; then"
+            + "  if command -v dnf >/dev/null 2>&1; then dnf install -y openssh-server >/dev/null 2>&1;"
+            + "  elif command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server >/dev/null 2>&1;"
+            + "  elif command -v apk >/dev/null 2>&1; then apk add --no-cache openssh >/dev/null 2>&1;"
+            + "  fi;"
+            + "fi;"
+            + "command -v sshd >/dev/null 2>&1"};
+
+    @Test
+    void launchWhenSshdInstallFails_doesNotAttemptKeygenOrStart() throws Exception {
+        // Regression reported as a follow-up on #2245 (duytanisme): sshd not starting even when a
+        // key pair IS provided. Root cause: execInContainer() discards exit codes entirely, so a
+        // shell if/elif chain with no matching package manager - or whose install command itself
+        // failed (no network yet, apt lock held, etc.) - still exits 0 by bash convention with no
+        // final check, meaning startSshd() proceeded to ssh-keygen and sshd regardless and still
+        // logged success. This forces the install probe to report failure and asserts the later
+        // steps are never even attempted, rather than running against a daemon that was never
+        // installed.
+        LaunchHarness harness = launchHarness();
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        InspectContainerResponse withIp = inspectResponse("172.18.0.21");
+        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(withIp);
+
+        ExecCreateCmd execCreate = mock(ExecCreateCmd.class, withSettings().defaultAnswer(RETURNS_SELF));
+        when(harness.dockerClient.execCreateCmd(TEST_CONTAINER_ID)).thenReturn(execCreate);
+        AtomicReference<String[]> currentCommand = new AtomicReference<>();
+        when(execCreate.withCmd(any(String[].class))).thenAnswer(invocation -> {
+            Object[] args = invocation.getArguments();
+            currentCommand.set(args.length == 1 && args[0] instanceof String[] cmd
+                    ? cmd : Arrays.copyOf(args, args.length, String[].class));
+            return execCreate;
+        });
+        ExecCreateCmdResponse execResponse = mock(ExecCreateCmdResponse.class);
+        when(execResponse.getId()).thenReturn("exec-1");
+        when(execCreate.exec()).thenReturn(execResponse);
+
+        when(harness.dockerClient.execStartCmd(anyString())).thenAnswer(invocation -> {
+            ExecStartCmd execStart = mock(ExecStartCmd.class);
+            when(execStart.exec(any())).thenAnswer(startInvocation -> {
+                @SuppressWarnings("unchecked")
+                ResultCallback<Frame> callback = startInvocation.getArgument(0);
+                callback.onComplete();
+                return callback;
+            });
+            return execStart;
+        });
+
+        // Every exec succeeds except the sshd-install probe script, simulating an image with none
+        // of dnf/apt-get/apk, or whose install command itself failed.
+        InspectExecCmd inspectExec = mock(InspectExecCmd.class);
+        when(harness.dockerClient.inspectExecCmd(anyString())).thenReturn(inspectExec);
+        when(inspectExec.exec()).thenAnswer(invocation -> {
+            InspectExecResponse response = mock(InspectExecResponse.class);
+            boolean isSshdInstallProbe = Arrays.equals(currentCommand.get(), SSHD_INSTALL_PROBE_CMD);
+            when(response.getExitCodeLong()).thenReturn(isSshdInstallProbe ? 1L : 0L);
+            return response;
+        });
+
+        CopyArchiveToContainerCmd copy = mock(CopyArchiveToContainerCmd.class, withSettings().defaultAnswer(RETURNS_SELF));
+        when(harness.dockerClient.copyArchiveToContainerCmd(TEST_CONTAINER_ID)).thenReturn(copy);
+        when(copy.withTarInputStream(any(InputStream.class))).thenReturn(copy);
+
+        Instance instance = instance("i-sshdinstallfail");
+
+        harness.manager.launch(instance, "ubuntu:24.04", "ssh-ed25519 AAAAtest", "us-west-2");
+
+        awaitUntil(() -> "running".equals(instance.getState().getName()), Duration.ofSeconds(2));
+        verify(execCreate, timeout(2000)).withCmd(eq(SSHD_INSTALL_PROBE_CMD));
+        verify(execCreate, never()).withCmd(eq(new String[]{"ssh-keygen", "-A"}));
+        verify(execCreate, never()).withCmd(eq(new String[]{"/usr/sbin/sshd"}));
+    }
+
     private static LaunchHarness launchHarness() {
         ContainerBuilder containerBuilder = mock(ContainerBuilder.class);
         ContainerBuilder.Builder builder = mock(ContainerBuilder.Builder.class, withSettings().defaultAnswer(RETURNS_SELF));
@@ -408,7 +553,20 @@ class Ec2ContainerManagerTest {
                 config,
                 metadataServer,
                 mock(Ec2PortForwardManager.class));
-        return new LaunchHarness(manager, dockerClient, metadataServer, logStreamer, builder);
+        return new LaunchHarness(manager, dockerClient, metadataServer, logStreamer, builder,
+                new CopyOnWriteArrayList<>());
+    }
+
+    /**
+     * Index of the first exec matching {@code expected} exactly, or -1 when it was never run.
+     */
+    private static int commandIndex(List<String[]> executedCommands, String... expected) {
+        for (int i = 0; i < executedCommands.size(); i++) {
+            if (Arrays.equals(executedCommands.get(i), expected)) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     private static Instance instance(String instanceId) {
@@ -443,7 +601,8 @@ class Ec2ContainerManagerTest {
                                  DockerClient dockerClient,
                                  Ec2MetadataServer metadataServer,
                                  ContainerLogStreamer logStreamer,
-                                 ContainerBuilder.Builder builder) {
+                                 ContainerBuilder.Builder builder,
+                                 List<String[]> executedCommands) {
         void stubSuccessfulExecs(CountDownLatch userDataStarted, CountDownLatch finishUserData) throws Exception {
             AtomicReference<String[]> currentCommand = new AtomicReference<>();
             ExecCreateCmd execCreate = mock(ExecCreateCmd.class, withSettings().defaultAnswer(RETURNS_SELF));
@@ -459,6 +618,7 @@ class Ec2ContainerManagerTest {
                 } else {
                     currentCommand.set(Arrays.copyOf(args, args.length, String[].class));
                 }
+                executedCommands.add(currentCommand.get());
                 return execCreate;
             });
             when(execCreate.exec()).thenAnswer(invocation -> {

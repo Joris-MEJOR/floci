@@ -23,12 +23,16 @@ public class DbInstance {
     private DbEndpoint endpoint;
     private boolean iamDatabaseAuthenticationEnabled;
     private String parameterGroupName;
+    private String optionGroupName;
     private String dbSubnetGroupName;
     private String dbClusterIdentifier;
     private String vpcId;
     private List<String> vpcSecurityGroupIds = new ArrayList<>();
     private String availabilityZone;
     private boolean multiAz;
+    // AWS defaults this to true when CreateDBInstance omits it (minor engine upgrades are
+    // applied automatically unless explicitly opted out).
+    private boolean autoMinorVersionUpgrade = true;
     private Map<String, String> subnetAvailabilityZones = new LinkedHashMap<>();
     private String dbiResourceId;
     private String dbInstanceArn;
@@ -41,6 +45,7 @@ public class DbInstance {
 
     private String dockerVolumeName;
     private String volumeId;
+    private String containerStorageResourceId;
 
     private transient String containerId;
     private transient String containerHost;
@@ -109,6 +114,9 @@ public class DbInstance {
     public String getParameterGroupName() { return parameterGroupName; }
     public void setParameterGroupName(String parameterGroupName) { this.parameterGroupName = parameterGroupName; }
 
+    public String getOptionGroupName() { return optionGroupName; }
+    public void setOptionGroupName(String optionGroupName) { this.optionGroupName = optionGroupName; }
+
     public String getDbSubnetGroupName() { return dbSubnetGroupName; }
     public void setDbSubnetGroupName(String dbSubnetGroupName) { this.dbSubnetGroupName = dbSubnetGroupName; }
 
@@ -128,6 +136,11 @@ public class DbInstance {
 
     public boolean isMultiAz() { return multiAz; }
     public void setMultiAz(boolean multiAz) { this.multiAz = multiAz; }
+
+    public boolean isAutoMinorVersionUpgrade() { return autoMinorVersionUpgrade; }
+    public void setAutoMinorVersionUpgrade(boolean autoMinorVersionUpgrade) {
+        this.autoMinorVersionUpgrade = autoMinorVersionUpgrade;
+    }
 
     public Map<String, String> getSubnetAvailabilityZones() { return subnetAvailabilityZones; }
     public void setSubnetAvailabilityZones(Map<String, String> subnetAvailabilityZones) {
@@ -165,6 +178,11 @@ public class DbInstance {
 
     public String getVolumeId() { return volumeId; }
     public void setVolumeId(String volumeId) { this.volumeId = volumeId; }
+
+    public String getContainerStorageResourceId() { return containerStorageResourceId; }
+    public void setContainerStorageResourceId(String containerStorageResourceId) {
+        this.containerStorageResourceId = containerStorageResourceId;
+    }
 
     public String getContainerId() { return containerId; }
     public void setContainerId(String containerId) { this.containerId = containerId; }

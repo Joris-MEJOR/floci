@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.services.lambda.model.LambdaFileSystemConfig;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.lambda.zip.CodeStore;
 import io.github.hectorvent.floci.services.lambda.zip.ZipExtractor;
@@ -13,9 +14,15 @@ import org.junit.jupiter.api.Test;
 import java.io.ByteArrayOutputStream;
 import java.nio.file.Path;
 import java.util.Base64;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -49,6 +56,12 @@ class LambdaServiceTest {
         ));
     }
 
+    private static Map<String, Object> vpcConfig() {
+        return Map.of(
+                "SubnetIds", List.of("subnet-0123456789abcdef0"),
+                "SecurityGroupIds", List.of("sg-0123456789abcdef0"));
+    }
+
     @Test
     void createFunctionSucceeds() {
         LambdaFunction fn = service.createFunction(REGION, baseRequest("my-function"));
@@ -62,6 +75,151 @@ class LambdaServiceTest {
         assertNotNull(fn.getFunctionArn());
         assertTrue(fn.getFunctionArn().contains("my-function"));
         assertNotNull(fn.getRevisionId());
+    }
+
+    @Test
+    void createAndUpdateFunctionFileSystemConfig() {
+        Map<String, Object> request = baseRequest("efs-function");
+        request.put("VpcConfig", vpcConfig());
+        request.put("FileSystemConfigs", List.of(Map.of(
+                "Arn", "arn:aws:elasticfilesystem:us-east-1:000000000000:access-point/fsap-0123456789abcdef0",
+                "LocalMountPath", "/mnt/shared")));
+
+        LambdaFunction created = service.createFunction(REGION, request);
+        assertEquals(1, created.getFileSystemConfigs().size());
+        assertEquals("arn:aws:elasticfilesystem:us-east-1:000000000000:access-point/fsap-0123456789abcdef0",
+                created.getFileSystemConfigs().getFirst().getArn());
+        assertEquals("/mnt/shared", created.getFileSystemConfigs().getFirst().getLocalMountPath());
+
+        LambdaFunction updated = service.updateFunctionConfiguration(REGION, "efs-function",
+                Map.of("FileSystemConfigs", List.of()));
+        assertTrue(updated.getFileSystemConfigs().isEmpty());
+    }
+
+    @Test
+    void publishedVersionKeepsFileSystemConfigSnapshot() {
+        Map<String, Object> request = baseRequest("versioned-efs-function");
+        request.put("VpcConfig", vpcConfig());
+        request.put("FileSystemConfigs", List.of(Map.of(
+                "Arn", "arn:aws:elasticfilesystem:us-east-1:000000000000:access-point/fsap-0123456789abcdef0",
+                "LocalMountPath", "/mnt/shared")));
+
+        service.createFunction(REGION, request);
+        LambdaFunction version = service.publishVersion(REGION, "versioned-efs-function", null);
+        service.updateFunctionConfiguration(REGION, "versioned-efs-function",
+                Map.of(
+                        "FileSystemConfigs", List.of(),
+                        "VpcConfig", Map.of(
+                                "SubnetIds", List.of("subnet-updated"),
+                                "SecurityGroupIds", List.of("sg-updated"))));
+
+        assertEquals(vpcConfig(), version.getVpcConfig());
+        assertEquals(1, version.getFileSystemConfigs().size());
+        LambdaFileSystemConfig fileSystem = version.getFileSystemConfigs().getFirst();
+        assertEquals("arn:aws:elasticfilesystem:us-east-1:000000000000:access-point/fsap-0123456789abcdef0",
+                fileSystem.getArn());
+        assertEquals("/mnt/shared", fileSystem.getLocalMountPath());
+    }
+
+    @Test
+    void createFunctionRejectsInvalidFileSystemMountPath() {
+        Map<String, Object> request = baseRequest("invalid-efs-function");
+        request.put("FileSystemConfigs", List.of(Map.of(
+                "Arn", "arn:aws:elasticfilesystem:us-east-1:000000000000:access-point/fsap-0123456789abcdef0",
+                "LocalMountPath", "/tmp/shared")));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.createFunction(REGION, request));
+        assertEquals("InvalidParameterValueException", error.getErrorCode());
+    }
+
+    @Test
+    void createFunctionRejectsInvalidFileSystemAccessPointArn() {
+        Map<String, Object> request = baseRequest("invalid-efs-arn-function");
+        request.put("FileSystemConfigs", List.of(Map.of(
+                "Arn", "arn:aws:elasticfilesystem:us-east-1:000000000000:file-system/fs-0123456789abcdef0",
+                "LocalMountPath", "/mnt/shared")));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.createFunction(REGION, request));
+        assertEquals("InvalidParameterValueException", error.getErrorCode());
+    }
+
+    @Test
+    void createFunctionRejectsMoreThanOneFileSystemConfig() {
+        Map<String, Object> request = baseRequest("too-many-efs-function");
+        request.put("FileSystemConfigs", List.of(
+                Map.of(
+                        "Arn", "arn:aws:elasticfilesystem:us-east-1:000000000000:access-point/fsap-0123456789abcdef0",
+                        "LocalMountPath", "/mnt/shared"),
+                Map.of(
+                        "Arn", "arn:aws:elasticfilesystem:us-east-1:000000000000:access-point/fsap-0123456789abcdef1",
+                        "LocalMountPath", "/mnt/other")));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.createFunction(REGION, request));
+        assertEquals("InvalidParameterValueException", error.getErrorCode());
+    }
+
+    @Test
+    void createFunctionRejectsUnsupportedS3FilesAccessPointArn() {
+        Map<String, Object> request = baseRequest("s3-files-function");
+        String arn = "arn:aws:s3files:us-east-1:000000000000:"
+                + "file-system/fs-0123456789abcdef0/access-point/fsap-0123456789abcdef0";
+        request.put("FileSystemConfigs", List.of(Map.of(
+                "Arn", arn,
+                "LocalMountPath", "/mnt/shared")));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.createFunction(REGION, request));
+        assertEquals("InvalidParameterValueException", error.getErrorCode());
+    }
+
+    @Test
+    void createFunctionRejectsFileSystemConfigWithoutVpcConfig() {
+        Map<String, Object> request = baseRequest("efs-without-vpc-function");
+        request.put("FileSystemConfigs", List.of(Map.of(
+                "Arn", "arn:aws:elasticfilesystem:us-east-1:000000000000:access-point/fsap-0123456789abcdef0",
+                "LocalMountPath", "/mnt/shared")));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.createFunction(REGION, request));
+        assertEquals("InvalidParameterValueException", error.getErrorCode());
+    }
+
+    @Test
+    void updateFunctionAcceptsVpcAndFileSystemConfigTogether() {
+        service.createFunction(REGION, baseRequest("update-efs-function"));
+
+        LambdaFunction updated = service.updateFunctionConfiguration(REGION, "update-efs-function",
+                Map.of(
+                        "VpcConfig", vpcConfig(),
+                        "FileSystemConfigs", List.of(Map.of(
+                                "Arn", "arn:aws:elasticfilesystem:us-east-1:000000000000:"
+                                        + "access-point/fsap-0123456789abcdef0",
+                                "LocalMountPath", "/mnt/shared"))));
+
+        assertEquals(1, updated.getFileSystemConfigs().size());
+        assertEquals(vpcConfig(), updated.getVpcConfig());
+    }
+
+    @Test
+    void updateFunctionRejectsRemovingVpcWhileFileSystemConfigRemains() {
+        Map<String, Object> request = baseRequest("update-efs-vpc-function");
+        request.put("VpcConfig", vpcConfig());
+        request.put("FileSystemConfigs", List.of(Map.of(
+                "Arn", "arn:aws:elasticfilesystem:us-east-1:000000000000:access-point/fsap-0123456789abcdef0",
+                "LocalMountPath", "/mnt/shared")));
+        service.createFunction(REGION, request);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.updateFunctionConfiguration(REGION, "update-efs-vpc-function",
+                        Map.of("VpcConfig", Map.of(
+                                "SubnetIds", List.of(),
+                                "SecurityGroupIds", List.of()))));
+
+        assertEquals("InvalidParameterValueException", error.getErrorCode());
+        assertEquals(vpcConfig(), service.getFunction(REGION, "update-efs-vpc-function").getVpcConfig());
     }
 
     @Test
@@ -655,5 +813,76 @@ class LambdaServiceTest {
         } finally {
             pool.shutdownNow();
         }
+    }
+
+    @Test
+    void concurrentPolicyRestoreAddAndReadPreserveAllStatements() throws Exception {
+        LambdaFunction function = service.createFunction(REGION, baseRequest("policy-race-fn"));
+        service.addPermission(REGION, function.getFunctionName(), null, Map.of(
+                "StatementId", "baseline",
+                "Action", "lambda:InvokeFunction",
+                "Principal", "events.amazonaws.com"));
+
+        int mutationCount = 16;
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        List<Future<?>> futures = new java.util.ArrayList<>();
+        Set<String> expectedStatementIds = new HashSet<>();
+        expectedStatementIds.add("baseline");
+
+        try {
+            for (int i = 0; i < mutationCount; i++) {
+                String addedId = "added-" + i;
+                String restoredId = "restored-" + i;
+                expectedStatementIds.add(addedId);
+                expectedStatementIds.add(restoredId);
+
+                futures.add(pool.submit(() -> {
+                    start.await();
+                    service.addPermission(REGION, function.getFunctionName(), null, Map.of(
+                            "StatementId", addedId,
+                            "Action", "lambda:InvokeFunction",
+                            "Principal", "events.amazonaws.com"));
+                    return null;
+                }));
+                futures.add(pool.submit(() -> {
+                    start.await();
+                    service.restorePermissionStatement(REGION, function.getFunctionName(), Map.of(
+                            "Sid", restoredId,
+                            "Effect", "Allow",
+                            "Principal", Map.of("Service", "events.amazonaws.com"),
+                            "Action", "lambda:InvokeFunction",
+                            "Resource", function.getFunctionArn()));
+                    return null;
+                }));
+            }
+            futures.add(pool.submit(() -> {
+                start.await();
+                for (int i = 0; i < mutationCount; i++) {
+                    service.getPolicy(REGION, function.getFunctionName(), null);
+                }
+                return null;
+            }));
+
+            start.countDown();
+            for (Future<?> future : futures) {
+                future.get();
+            }
+        } finally {
+            start.countDown();
+            pool.shutdownNow();
+        }
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> policy = (Map<String, Object>) service
+                .getPolicy(REGION, function.getFunctionName(), null)
+                .get("policy");
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> statements = (List<Map<String, Object>>) policy.get("Statement");
+        Set<String> actualStatementIds = statements.stream()
+                .map(statement -> (String) statement.get("Sid"))
+                .collect(java.util.stream.Collectors.toSet());
+
+        assertEquals(expectedStatementIds, actualStatementIds);
     }
 }
