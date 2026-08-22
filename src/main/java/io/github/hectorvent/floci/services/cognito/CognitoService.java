@@ -322,7 +322,9 @@ public class CognitoService implements ResourceProvider {
         List<ExplorerResource> resources = new ArrayList<>();
         for (UserPool pool : poolStore.scan(k -> true)) {
             String arn = pool.getArn();
-            if (arn == null) continue;
+            if (arn == null) {
+                continue;
+            }
             AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
             resources.add(new ExplorerResource(
                     arn, "cognito-idp:userpool", "cognito-idp",

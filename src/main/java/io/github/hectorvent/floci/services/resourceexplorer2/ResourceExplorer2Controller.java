@@ -23,6 +23,16 @@ import java.util.Map;
 @Consumes(MediaType.APPLICATION_JSON)
 public class ResourceExplorer2Controller {
 
+    /**
+     * Per-operation MaxResults ceilings. AWS models a different maximum for each of these, and a
+     * value above it is a ValidationException — so a single shared constant would either reject
+     * page sizes AWS accepts or accept ones it rejects.
+     */
+    private static final int MAX_RESULTS_RESOURCES = 1000;
+    private static final int MAX_RESULTS_INDEXES = 100;
+    private static final int MAX_RESULTS_VIEWS = 50;
+    private static final int MAX_RESULTS_MEMBER_INDEXES = 10;
+
     private final ResourceExplorer2Service service;
     private final RegionResolver regionResolver;
     private final ObjectMapper objectMapper;
@@ -43,7 +53,7 @@ public class ResourceExplorer2Controller {
         String region = regionResolver.resolveRegion(headers);
         String filterString = req.has("Filters") && req.get("Filters").has("FilterString")
                 ? req.get("Filters").get("FilterString").asText(null) : null;
-        Integer maxResults = validatedMaxResults(req, 1000);
+        Integer maxResults = validatedMaxResults(req, MAX_RESULTS_RESOURCES);
         String nextToken = optString(req, "NextToken");
         String viewArn = optString(req, "ViewArn");
         try {
@@ -57,9 +67,11 @@ public class ResourceExplorer2Controller {
     @Path("/Search")
     public Response search(@Context HttpHeaders headers, String body) throws IOException {
         JsonNode req = parseBody(body);
-        if (!req.has("QueryString")) throw new AwsException("ValidationException", "QueryString is required", 400);
+        if (!req.has("QueryString")) {
+            throw new AwsException("ValidationException", "QueryString is required", 400);
+        }
         String queryString = req.get("QueryString").asText(null);
-        Integer maxResults = validatedMaxResults(req, 1000);
+        Integer maxResults = validatedMaxResults(req, MAX_RESULTS_RESOURCES);
         String nextToken = optString(req, "NextToken");
         String viewArn = optString(req, "ViewArn");
         String region = regionResolver.resolveRegion(headers);
@@ -70,7 +82,7 @@ public class ResourceExplorer2Controller {
     @Path("/ListSupportedResourceTypes")
     public Response listSupportedResourceTypes(String body) throws IOException {
         JsonNode req = parseBody(body);
-        Integer maxResults = validatedMaxResults(req, 100);
+        Integer maxResults = validatedMaxResults(req, MAX_RESULTS_RESOURCES);
         String nextToken = optString(req, "NextToken");
         return Response.ok(service.listSupportedResourceTypes(maxResults, nextToken)).build();
     }
@@ -113,7 +125,9 @@ public class ResourceExplorer2Controller {
     public Response deleteIndex(String body) throws IOException {
         JsonNode req = parseBody(body);
         String indexArn = optString(req, "Arn");
-        if (indexArn == null) throw new AwsException("ValidationException", "Arn is required", 400);
+        if (indexArn == null) {
+            throw new AwsException("ValidationException", "Arn is required", 400);
+        }
         Index deleted = service.deleteIndex(indexArn);
         var result = objectMapper.createObjectNode();
         result.put("Arn", deleted.arn());
@@ -127,11 +141,8 @@ public class ResourceExplorer2Controller {
     public Response listIndexes(String body) throws IOException {
         JsonNode req = parseBody(body);
         String type = optString(req, "Type");
-        List<String> regions = new ArrayList<>();
-        if (req.has("Regions") && req.get("Regions").isArray()) {
-            for (var r : req.get("Regions")) regions.add(r.asText());
-        }
-        Integer maxResults = validatedMaxResults(req, 100);
+        List<String> regions = stringArray(req, "Regions");
+        Integer maxResults = validatedMaxResults(req, MAX_RESULTS_INDEXES);
         String nextToken = optString(req, "NextToken");
         return Response.ok(service.listIndexes(type, regions, maxResults, nextToken)).build();
     }
@@ -141,8 +152,12 @@ public class ResourceExplorer2Controller {
     public Response updateIndexType(String body) throws IOException {
         JsonNode req = parseBody(body);
         String arn = optString(req, "Arn");
-        if (arn == null) throw new AwsException("ValidationException", "Arn is required", 400);
-        if (!req.has("Type")) throw new AwsException("ValidationException", "Type is required", 400);
+        if (arn == null) {
+            throw new AwsException("ValidationException", "Arn is required", 400);
+        }
+        if (!req.has("Type")) {
+            throw new AwsException("ValidationException", "Type is required", 400);
+        }
         IndexType type;
         try {
             type = IndexType.valueOf(req.get("Type").asText());
@@ -179,7 +194,9 @@ public class ResourceExplorer2Controller {
     public Response getView(String body) throws IOException {
         JsonNode req = parseBody(body);
         String viewArn = optString(req, "ViewArn");
-        if (viewArn == null) throw new AwsException("ValidationException", "ViewArn is required", 400);
+        if (viewArn == null) {
+            throw new AwsException("ValidationException", "ViewArn is required", 400);
+        }
         View view = service.getView(viewArn);
         var result = objectMapper.createObjectNode();
         result.set("View", service.buildViewNode(view));
@@ -193,7 +210,9 @@ public class ResourceExplorer2Controller {
     public Response deleteView(String body) throws IOException {
         JsonNode req = parseBody(body);
         String viewArn = optString(req, "ViewArn");
-        if (viewArn == null) throw new AwsException("ValidationException", "ViewArn is required", 400);
+        if (viewArn == null) {
+            throw new AwsException("ValidationException", "ViewArn is required", 400);
+        }
         service.deleteView(viewArn);
         var result = objectMapper.createObjectNode();
         result.put("ViewArn", viewArn);
@@ -205,7 +224,9 @@ public class ResourceExplorer2Controller {
     public Response updateView(String body) throws IOException {
         JsonNode req = parseBody(body);
         String viewArn = optString(req, "ViewArn");
-        if (viewArn == null) throw new AwsException("ValidationException", "ViewArn is required", 400);
+        if (viewArn == null) {
+            throw new AwsException("ValidationException", "ViewArn is required", 400);
+        }
         SearchFilter filters = parseFilters(req);
         List<IncludedProperty> includedProperties = parseIncludedProperties(req);
         View view = service.updateView(viewArn, filters, includedProperties);
@@ -216,22 +237,19 @@ public class ResourceExplorer2Controller {
 
     @POST
     @Path("/ListViews")
-    public Response listViews(String body) throws IOException {
+    public Response listViews(@Context HttpHeaders headers, String body) throws IOException {
         JsonNode req = parseBody(body);
-        Integer maxResults = validatedMaxResults(req, 100);
+        Integer maxResults = validatedMaxResults(req, MAX_RESULTS_VIEWS);
         String nextToken = optString(req, "NextToken");
-        return Response.ok(service.listViews(maxResults, nextToken)).build();
+        String region = regionResolver.resolveRegion(headers);
+        return Response.ok(service.listViews(region, maxResults, nextToken)).build();
     }
 
     @POST
     @Path("/BatchGetView")
     public Response batchGetView(String body) throws IOException {
         JsonNode req = parseBody(body);
-        List<String> arns = new ArrayList<>();
-        if (req.has("ViewArns") && req.get("ViewArns").isArray()) {
-            for (var v : req.get("ViewArns")) arns.add(v.asText());
-        }
-        return Response.ok(service.batchGetView(arns)).build();
+        return Response.ok(service.batchGetView(stringArray(req, "ViewArns"))).build();
     }
 
     @POST
@@ -239,7 +257,9 @@ public class ResourceExplorer2Controller {
     public Response associateDefaultView(@Context HttpHeaders headers, String body) throws IOException {
         JsonNode req = parseBody(body);
         String viewArn = optString(req, "ViewArn");
-        if (viewArn == null) throw new AwsException("ValidationException", "ViewArn is required", 400);
+        if (viewArn == null) {
+            throw new AwsException("ValidationException", "ViewArn is required", 400);
+        }
         service.associateDefaultView(regionResolver.resolveRegion(headers), viewArn);
         var result = objectMapper.createObjectNode();
         result.put("ViewArn", viewArn);
@@ -258,10 +278,145 @@ public class ResourceExplorer2Controller {
     public Response getDefaultView(@Context HttpHeaders headers) {
         String viewArn = service.getDefaultView(regionResolver.resolveRegion(headers));
         var result = objectMapper.createObjectNode();
-        if (viewArn != null) result.put("ViewArn", viewArn);
+        if (viewArn != null) {
+            result.put("ViewArn", viewArn);
+        }
         return Response.ok(result).build();
     }
 
+
+    @POST
+    @Path("/GetAccountLevelServiceConfiguration")
+    public Response getAccountLevelServiceConfiguration() {
+        return Response.ok(service.getAccountLevelServiceConfiguration()).build();
+    }
+
+    @POST
+    @Path("/ListIndexesForMembers")
+    public Response listIndexesForMembers(String body) throws IOException {
+        JsonNode req = parseBody(body);
+        List<String> accountIds = stringArray(req, "AccountIdList");
+        if (accountIds.isEmpty()) {
+            throw new AwsException("ValidationException", "AccountIdList is required", 400);
+        }
+        Integer maxResults = validatedMaxResults(req, MAX_RESULTS_MEMBER_INDEXES);
+        String nextToken = optString(req, "NextToken");
+        return Response.ok(service.listIndexesForMembers(accountIds, maxResults, nextToken)).build();
+    }
+
+    @POST
+    @Path("/ListManagedViews")
+    public Response listManagedViews(String body) throws IOException {
+        JsonNode req = parseBody(body);
+        Integer maxResults = validatedMaxResults(req, MAX_RESULTS_VIEWS);
+        String nextToken = optString(req, "NextToken");
+        return Response.ok(service.listManagedViews(maxResults, nextToken)).build();
+    }
+
+    @POST
+    @Path("/GetManagedView")
+    public Response getManagedView(String body) throws IOException {
+        JsonNode req = parseBody(body);
+        String managedViewArn = optString(req, "ManagedViewArn");
+        if (managedViewArn == null) {
+            throw new AwsException("ValidationException", "ManagedViewArn is required", 400);
+        }
+        return Response.ok(service.getManagedView(managedViewArn)).build();
+    }
+
+    @POST
+    @Path("/ListServiceViews")
+    public Response listServiceViews(String body) throws IOException {
+        JsonNode req = parseBody(body);
+        Integer maxResults = validatedMaxResults(req, MAX_RESULTS_VIEWS);
+        String nextToken = optString(req, "NextToken");
+        return Response.ok(service.listServiceViews(maxResults, nextToken)).build();
+    }
+
+    @POST
+    @Path("/GetServiceView")
+    public Response getServiceView(String body) throws IOException {
+        JsonNode req = parseBody(body);
+        String serviceViewArn = optString(req, "ServiceViewArn");
+        if (serviceViewArn == null) {
+            throw new AwsException("ValidationException", "ServiceViewArn is required", 400);
+        }
+        return Response.ok(service.getServiceView(serviceViewArn)).build();
+    }
+
+    @POST
+    @Path("/ListServiceIndexes")
+    public Response listServiceIndexes(String body) throws IOException {
+        JsonNode req = parseBody(body);
+        List<String> regions = stringArray(req, "Regions");
+        Integer maxResults = validatedMaxResults(req, MAX_RESULTS_INDEXES);
+        String nextToken = optString(req, "NextToken");
+        return Response.ok(service.listServiceIndexes(regions, maxResults, nextToken)).build();
+    }
+
+    @POST
+    @Path("/GetServiceIndex")
+    public Response getServiceIndex(@Context HttpHeaders headers) {
+        return Response.ok(service.getServiceIndex(regionResolver.resolveRegion(headers))).build();
+    }
+
+    @POST
+    @Path("/ListStreamingAccessForServices")
+    public Response listStreamingAccessForServices(String body) throws IOException {
+        JsonNode req = parseBody(body);
+        Integer maxResults = validatedMaxResults(req, MAX_RESULTS_VIEWS);
+        String nextToken = optString(req, "NextToken");
+        return Response.ok(service.listStreamingAccessForServices(maxResults, nextToken)).build();
+    }
+
+    @POST
+    @Path("/CreateResourceExplorerSetup")
+    public Response createResourceExplorerSetup(String body) throws IOException {
+        JsonNode req = parseBody(body);
+        String taskId = service.createResourceExplorerSetup(
+                stringArray(req, "RegionList"),
+                optString(req, "ViewName"),
+                stringArray(req, "AggregatorRegions"));
+        var result = objectMapper.createObjectNode();
+        result.put("TaskId", taskId);
+        return Response.ok(result).build();
+    }
+
+    @POST
+    @Path("/DeleteResourceExplorerSetup")
+    public Response deleteResourceExplorerSetup(String body) throws IOException {
+        JsonNode req = parseBody(body);
+        Boolean deleteInAllRegions = req.has("DeleteInAllRegions")
+                ? req.get("DeleteInAllRegions").asBoolean() : null;
+        String taskId = service.deleteResourceExplorerSetup(
+                deleteInAllRegions, stringArray(req, "RegionList"));
+        var result = objectMapper.createObjectNode();
+        result.put("TaskId", taskId);
+        return Response.ok(result).build();
+    }
+
+    @POST
+    @Path("/GetResourceExplorerSetup")
+    public Response getResourceExplorerSetup(String body) throws IOException {
+        JsonNode req = parseBody(body);
+        String taskId = optString(req, "TaskId");
+        if (taskId == null) {
+            throw new AwsException("ValidationException", "TaskId is required", 400);
+        }
+        Integer maxResults = validatedMaxResults(req, MAX_RESULTS_INDEXES);
+        String nextToken = optString(req, "NextToken");
+        return Response.ok(service.getResourceExplorerSetup(taskId, maxResults, nextToken)).build();
+    }
+
+    private static List<String> stringArray(JsonNode req, String field) {
+        List<String> values = new ArrayList<>();
+        if (req.has(field) && req.get(field).isArray()) {
+            for (JsonNode value : req.get(field)) {
+                values.add(value.asText());
+            }
+        }
+        return values;
+    }
 
     private static String optString(JsonNode req, String field) {
         return req.has(field) ? req.get(field).asText(null) : null;
@@ -295,7 +450,9 @@ public class ResourceExplorer2Controller {
     }
 
     private Integer validatedMaxResults(JsonNode req, int max) {
-        if (!req.has("MaxResults")) return null;
+        if (!req.has("MaxResults")) {
+            return null;
+        }
         int value = req.get("MaxResults").intValue();
         if (value < 1 || value > max) {
             throw new AwsException("ValidationException", "MaxResults must be between 1 and " + max, 400);

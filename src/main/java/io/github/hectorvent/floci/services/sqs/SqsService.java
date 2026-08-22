@@ -215,10 +215,14 @@ public class SqsService implements Resettable, ResourceProvider {
         List<ExplorerResource> resources = new ArrayList<>();
         for (String key : queueStore.keys()) {
             int sep = key.indexOf("::");
-            if (sep < 0) continue;
+            if (sep < 0) {
+                continue;
+            }
             String region = key.substring(0, sep);
             Queue queue = queueStore.get(key).orElse(null);
-            if (queue == null) continue;
+            if (queue == null) {
+                continue;
+            }
             String account = queue.getAccountId() != null ? queue.getAccountId() : regionResolver.getAccountId();
             String arn = AwsArnUtils.Arn.of("sqs", region, account, queue.getQueueName()).toString();
             resources.add(new ExplorerResource(

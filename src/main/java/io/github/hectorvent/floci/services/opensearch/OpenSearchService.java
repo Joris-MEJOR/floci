@@ -376,7 +376,9 @@ public class OpenSearchService implements ResourceProvider {
     public List<ExplorerResource> getResources() {
         List<ExplorerResource> resources = new ArrayList<>();
         for (Domain domain : listDomainNames(null)) {
-            if (domain.getArn() == null) continue;
+            if (domain.getArn() == null) {
+                continue;
+            }
             AwsArnUtils.Arn parsed = AwsArnUtils.parse(domain.getArn());
             resources.add(new ExplorerResource(
                     domain.getArn(), "es:domain", "es",

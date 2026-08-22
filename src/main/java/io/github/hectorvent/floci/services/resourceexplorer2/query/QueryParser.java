@@ -10,10 +10,22 @@ import java.util.List;
  * comma-OR, negation ({@code -}), wildcards ({@code *}), quoted strings,
  * backslash escaping, and free-form text keywords.
  *
+ * <p>Escapes survive tokenization intact and are resolved only where the meaning of the
+ * character is decided — splitting a filter's comma-separated values, finding the colon that
+ * separates a filter prefix from its value, and recognising a trailing wildcard. That ordering
+ * is what makes {@code tag.key:comma\,literal} one value rather than two, and
+ * {@code "my\-key\-word"} a keyword rather than a negation.
+ *
  * @see <a href="https://docs.aws.amazon.com/resource-explorer/latest/userguide/using-search-query-syntax.html">
  *     Search query syntax reference</a>
  */
 public final class QueryParser {
+
+    /**
+     * Characters that carry meaning to the parser and therefore have to be neutralised when they
+     * appear inside a quoted phrase, which AWS defines as literal text.
+     */
+    private static final String OPERATOR_CHARACTERS = "*\"-:=\\,";
 
     private QueryParser() {}
 
@@ -40,37 +52,27 @@ public final class QueryParser {
         List<String> tokens = new ArrayList<>();
         StringBuilder current = new StringBuilder();
         boolean inQuotes = false;
-        // Track whether the current token has any content (including quoted empty strings)
+        // Tracks whether the current token has any content, including a quoted empty string.
         boolean hadContent = false;
 
         for (int i = 0; i < input.length(); i++) {
             char c = input.charAt(i);
 
-            if (inQuotes) {
-                if (c == '\\' && i + 1 < input.length() && input.charAt(i + 1) == '"') {
-                    // Escaped quote inside quoted string
-                    current.append('"');
-                    i++;
-                    hadContent = true;
-                } else if (c == '"') {
-                    // Closing quote — mark that we had content even if the string is empty
-                    inQuotes = false;
-                    hadContent = true;
-                } else {
-                    current.append(c);
-                    hadContent = true;
-                }
+            if (c == '\\' && i + 1 < input.length()) {
+                current.append(c).append(input.charAt(i + 1));
+                i++;
+                hadContent = true;
                 continue;
             }
 
-            // Unquoted context
             if (c == '"') {
-                inQuotes = true;
+                inQuotes = !inQuotes;
+                hadContent = true;
                 continue;
             }
 
-            if (Character.isWhitespace(c)) {
-                if (hadContent || !current.isEmpty()) {
+            if (!inQuotes && Character.isWhitespace(c)) {
+                if (hadContent) {
                     tokens.add(current.toString());
                     current.setLength(0);
                     hadContent = false;
@@ -78,11 +80,14 @@ public final class QueryParser {
                 continue;
             }
 
+            if (inQuotes && OPERATOR_CHARACTERS.indexOf(c) >= 0) {
+                current.append('\\');
+            }
             current.append(c);
             hadContent = true;
         }
 
-        if (hadContent || !current.isEmpty()) {
+        if (hadContent) {
             tokens.add(current.toString());
         }
 
@@ -102,63 +107,105 @@ public final class QueryParser {
                 working = working.substring(1);
             }
 
-            int colonIndex = working.indexOf(':');
+            int colonIndex = indexOfUnescaped(working, ':');
             FilterAttribute attribute = colonIndex >= 0
-                    ? FilterAttribute.fromPrefix(working.substring(0, colonIndex))
+                    ? FilterAttribute.fromPrefix(unescape(working.substring(0, colonIndex)))
                     : null;
             if (attribute != null) {
                 String valuePortion = working.substring(colonIndex + 1);
                 List<ParsedQuery.FilterValue> values = parseFilterValues(valuePortion);
                 filters.add(new ParsedQuery.Filter(attribute, values, negated));
             } else {
-                keywords.add(new ParsedQuery.Keyword(working, negated));
+                keywords.add(new ParsedQuery.Keyword(toKeywordValue(working), negated));
             }
         }
 
         return new ParsedQuery(keywords, filters);
     }
 
+    /**
+     * A trailing wildcard is dropped rather than recorded: keyword matching is a substring test,
+     * so {@code ec2*} and {@code ec2} already select the same resources. Dropping it only where it
+     * is unescaped keeps a literal {@code \*} searchable.
+     */
+    private static String toKeywordValue(String raw) {
+        String value = endsWithUnescaped(raw, '*') ? raw.substring(0, raw.length() - 1) : raw;
+        return unescape(value);
+    }
+
     private static List<ParsedQuery.FilterValue> parseFilterValues(String valuePortion) {
         List<ParsedQuery.FilterValue> values = new ArrayList<>();
-        StringBuilder current = new StringBuilder();
-        boolean escaped = false;
-
-        for (int i = 0; i < valuePortion.length(); i++) {
-            char c = valuePortion.charAt(i);
-
-            if (escaped) {
-                current.append(c);
-                escaped = false;
-                continue;
-            }
-
-            if (c == '\\') {
-                if (i == valuePortion.length() - 1) {
-                    // Dangling backslash — treat literally
-                    current.append(c);
-                } else {
-                    escaped = true;
-                }
-                continue;
-            }
-
-            if (c == ',') {
-                values.add(toFilterValue(current.toString()));
-                current.setLength(0);
-                continue;
-            }
-
-            current.append(c);
+        for (String raw : splitUnescaped(valuePortion, ',')) {
+            values.add(toFilterValue(raw));
         }
-
-        values.add(toFilterValue(current.toString()));
         return values;
     }
 
     private static ParsedQuery.FilterValue toFilterValue(String raw) {
-        if (raw.endsWith("*")) {
-            return new ParsedQuery.FilterValue(raw.substring(0, raw.length() - 1), true);
+        if (endsWithUnescaped(raw, '*')) {
+            return new ParsedQuery.FilterValue(unescape(raw.substring(0, raw.length() - 1)), true);
         }
-        return new ParsedQuery.FilterValue(raw, false);
+        return new ParsedQuery.FilterValue(unescape(raw), false);
+    }
+
+    private static int indexOfUnescaped(String value, char target) {
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c == '\\') {
+                i++;
+                continue;
+            }
+            if (c == target) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static List<String> splitUnescaped(String value, char separator) {
+        List<String> parts = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c == '\\' && i + 1 < value.length()) {
+                current.append(c).append(value.charAt(i + 1));
+                i++;
+                continue;
+            }
+            if (c == separator) {
+                parts.add(current.toString());
+                current.setLength(0);
+                continue;
+            }
+            current.append(c);
+        }
+        parts.add(current.toString());
+        return parts;
+    }
+
+    private static boolean endsWithUnescaped(String value, char target) {
+        if (value.isEmpty() || value.charAt(value.length() - 1) != target) {
+            return false;
+        }
+        int backslashes = 0;
+        for (int i = value.length() - 2; i >= 0 && value.charAt(i) == '\\'; i--) {
+            backslashes++;
+        }
+        return backslashes % 2 == 0;
+    }
+
+    /** Resolves escape sequences. A backslash with nothing after it is literal text, as AWS treats it. */
+    private static String unescape(String value) {
+        StringBuilder out = new StringBuilder(value.length());
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c == '\\' && i + 1 < value.length()) {
+                out.append(value.charAt(i + 1));
+                i++;
+                continue;
+            }
+            out.append(c);
+        }
+        return out.toString();
     }
 }

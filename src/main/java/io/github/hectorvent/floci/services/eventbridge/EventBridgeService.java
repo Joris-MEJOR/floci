@@ -39,9 +39,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.regex.Pattern;
+import io.github.hectorvent.floci.core.resource.ExplorerResource;
+import io.github.hectorvent.floci.core.resource.ResourceProvider;
+import io.github.hectorvent.floci.core.resource.SupportedResourceType;
+import java.util.Set;
 
 @ApplicationScoped
-public class EventBridgeService {
+public class EventBridgeService implements ResourceProvider {
 
     private static final Logger LOG = Logger.getLogger(EventBridgeService.class);
 
@@ -1579,4 +1583,38 @@ public class EventBridgeService {
         }
     }
 
+    // ─── Resource Explorer 2 ───────────────────────────────────────────────────
+
+    @Override
+    public List<ExplorerResource> getResources() {
+        List<ExplorerResource> resources = new ArrayList<>();
+        for (EventBus bus : busStore.scan(k -> true)) {
+            addExplorerResource(resources, bus.getArn(), "events:event-bus",
+                    bus.getCreatedTime(), bus.getTags());
+        }
+        for (Rule rule : ruleStore.scan(k -> true)) {
+            addExplorerResource(resources, rule.getArn(), "events:rule",
+                    rule.getCreatedAt(), rule.getTags());
+        }
+        return resources;
+    }
+
+    @Override
+    public Set<SupportedResourceType> getSupportedResourceTypes() {
+        return Set.of(
+                new SupportedResourceType("events:event-bus", "events", true),
+                new SupportedResourceType("events:rule", "events", true));
+    }
+
+    private static void addExplorerResource(List<ExplorerResource> out, String arn, String resourceType,
+                                            Instant createdAt, Map<String, String> tags) {
+        if (arn == null) {
+            return;
+        }
+        AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+        out.add(new ExplorerResource(arn, resourceType, "events",
+                parsed.region(), parsed.accountId(),
+                createdAt != null ? createdAt : Instant.now(),
+                tags != null ? tags : Map.of()));
+    }
 }

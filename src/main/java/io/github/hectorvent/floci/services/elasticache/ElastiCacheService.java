@@ -621,7 +621,9 @@ public class ElastiCacheService implements ResourceProvider {
     public List<ExplorerResource> getResources() {
         List<ExplorerResource> resources = new ArrayList<>();
         for (ReplicationGroup group : groups.scan(k -> true)) {
-            if (group.getArn() == null) continue;
+            if (group.getArn() == null) {
+                continue;
+            }
             AwsArnUtils.Arn parsed = AwsArnUtils.parse(group.getArn());
             resources.add(new ExplorerResource(
                     group.getArn(), "elasticache:cluster", "elasticache",

@@ -3049,7 +3049,9 @@ public class DynamoDbService implements ResourceProvider {
     public List<ExplorerResource> getResources() {
         List<ExplorerResource> resources = new ArrayList<>();
         for (TableDefinition table : tableStore.scan(k -> true)) {
-            if (table.getTableArn() == null) continue;
+            if (table.getTableArn() == null) {
+                continue;
+            }
             AwsArnUtils.Arn parsed = AwsArnUtils.parse(table.getTableArn());
             resources.add(new ExplorerResource(
                     table.getTableArn(), "dynamodb:table", "dynamodb",

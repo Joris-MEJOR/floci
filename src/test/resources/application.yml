@@ -75,7 +75,7 @@ floci:
         flush-interval-ms: 60000
       resourceexplorer2:
         mode: memory
-        flush-interval-ms: 5000
+        flush-interval-ms: 60000
       fis:
         flush-interval-ms: 60000
       guardduty:

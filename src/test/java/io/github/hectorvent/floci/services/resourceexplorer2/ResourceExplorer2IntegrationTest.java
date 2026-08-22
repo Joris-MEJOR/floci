@@ -32,6 +32,15 @@ class ResourceExplorer2IntegrationTest {
             "AWS4-HMAC-SHA256 Credential=test/20260528/us-east-1/resource-explorer-2/aws4_request";
     private static final String DYNAMO_TYPE = "application/x-amz-json-1.0";
 
+    /**
+     * A bounded slice of the emulator, for the tests whose arithmetic needs to know the whole
+     * result set. The suite shares one emulator instance across every service, and thirty services
+     * now expose their resources here — comfortably more than the thousand results Search returns,
+     * so an unscoped query hits the cap and totals stop being comparable to each other. These two
+     * services keep the slice small and never empty: the fixtures above create a bucket and a table.
+     */
+    private static final String BOUNDED_SCOPE = "service:s3,dynamodb";
+
     private static boolean fixturesProvisioned = false;
 
     private record IndexRef(String auth, String arn) {}
@@ -77,7 +86,9 @@ class ResourceExplorer2IntegrationTest {
     @BeforeEach
     void provisionFixturesOnce() {
         RestAssuredJsonUtils.configureAwsContentTypes();
-        if (fixturesProvisioned) return;
+        if (fixturesProvisioned) {
+            return;
+        }
 
         // Create S3 bucket used by ListResources, DataProvenance, and FilterSemantics groups
         given()
@@ -453,7 +464,7 @@ class ResourceExplorer2IntegrationTest {
 
         @Test
         void searchWithEmptyQueryReturnsAllResources() {
-            given()
+            var response = given()
                 .header("Authorization", AUTH)
                 .contentType("application/json")
                 .body("""
@@ -464,8 +475,15 @@ class ResourceExplorer2IntegrationTest {
             .then()
                 .statusCode(200)
                 .body("Count.TotalResources", greaterThanOrEqualTo(0))
-                .body("Count.Complete", equalTo(true))
-                .body("Resources", notNullValue());
+                .body("Resources", notNullValue())
+                .extract().response();
+
+            // Unscoped, so how many resources the shared emulator holds is not knowable here.
+            // Complete says whether the 1000-result cap bit, which is exactly what TotalResources
+            // reaching the cap means — assert that relationship rather than a fixed value.
+            int total = response.path("Count.TotalResources");
+            boolean complete = response.path("Count.Complete");
+            assertEquals(total < 1000, complete);
         }
     }
 
@@ -838,14 +856,12 @@ class ResourceExplorer2IntegrationTest {
         @Test
         void searchCountCompleteIsTrueWhenFewResources() {
             // Complete=true means total matched resources <= 1000 (no cap was applied).
-            // With only a handful of test resources, Complete must be TRUE on every page,
+            // Scoped to a handful of resources, Complete must be TRUE on every page,
             // even when MaxResults=1 causes pagination (NextToken is still emitted).
             given()
                 .header("Authorization", AUTH)
                 .contentType("application/json")
-                .body("""
-                    {"QueryString": "", "MaxResults": 1}
-                    """)
+                .body("{\"QueryString\": \"" + BOUNDED_SCOPE + "\", \"MaxResults\": 1}")
             .when()
                 .post("/Search")
             .then()
@@ -860,9 +876,7 @@ class ResourceExplorer2IntegrationTest {
             given()
                 .header("Authorization", AUTH)
                 .contentType("application/json")
-                .body("""
-                    {"QueryString": "", "MaxResults": 1000}
-                    """)
+                .body("{\"QueryString\": \"" + BOUNDED_SCOPE + "\", \"MaxResults\": 1000}")
             .when()
                 .post("/Search")
             .then()
@@ -1252,10 +1266,12 @@ class ResourceExplorer2IntegrationTest {
 
         @Test
         void paginationReturnsAllResourcesAcrossPages() {
+            // Scoped: paging the whole emulator one resource at a time would need thousands of
+            // round trips, and the total would not fit the single 1000-result page it is read from.
             int totalCount = given()
                 .header("Authorization", AUTH)
                 .contentType("application/json")
-                .body("{\"MaxResults\": 1000}")
+                .body("{\"MaxResults\": 1000, \"Filters\": {\"FilterString\": \"" + BOUNDED_SCOPE + "\"}}")
             .when()
                 .post("/ListResources")
             .then()
@@ -1268,8 +1284,9 @@ class ResourceExplorer2IntegrationTest {
 
             do {
                 String body = nextToken == null
-                        ? "{\"MaxResults\": 1}"
-                        : "{\"MaxResults\": 1, \"NextToken\": \"" + nextToken + "\"}";
+                        ? "{\"MaxResults\": 1, \"Filters\": {\"FilterString\": \"" + BOUNDED_SCOPE + "\"}}"
+                        : "{\"MaxResults\": 1, \"NextToken\": \"" + nextToken
+                                + "\", \"Filters\": {\"FilterString\": \"" + BOUNDED_SCOPE + "\"}}";
 
                 var response = given()
                     .header("Authorization", AUTH)
@@ -1292,10 +1309,11 @@ class ResourceExplorer2IntegrationTest {
 
         @Test
         void listResourcesMaxResultsGreaterThanTotalReturnsAll() {
+            // Scoped, so that a page size of 999 really is larger than the total being asked for.
             int totalCount = given()
                 .header("Authorization", AUTH)
                 .contentType("application/json")
-                .body("{\"MaxResults\": 1000}")
+                .body("{\"MaxResults\": 1000, \"Filters\": {\"FilterString\": \"" + BOUNDED_SCOPE + "\"}}")
             .when()
                 .post("/ListResources")
             .then()
@@ -1304,7 +1322,7 @@ class ResourceExplorer2IntegrationTest {
             given()
                 .header("Authorization", AUTH)
                 .contentType("application/json")
-                .body("{\"MaxResults\": 999}")
+                .body("{\"MaxResults\": 999, \"Filters\": {\"FilterString\": \"" + BOUNDED_SCOPE + "\"}}")
             .when()
                 .post("/ListResources")
             .then()
@@ -1318,9 +1336,7 @@ class ResourceExplorer2IntegrationTest {
             String nextToken = given()
                 .header("Authorization", AUTH)
                 .contentType("application/json")
-                .body("""
-                    {"QueryString": "", "MaxResults": 1}
-                    """)
+                .body("{\"QueryString\": \"" + BOUNDED_SCOPE + "\", \"MaxResults\": 1}")
             .when()
                 .post("/Search")
             .then()
@@ -1332,7 +1348,8 @@ class ResourceExplorer2IntegrationTest {
             given()
                 .header("Authorization", AUTH)
                 .contentType("application/json")
-                .body("{\"QueryString\": \"\", \"MaxResults\": 1, \"NextToken\": \"" + nextToken + "\"}")
+                .body("{\"QueryString\": \"" + BOUNDED_SCOPE + "\", \"MaxResults\": 1, \"NextToken\": \""
+                        + nextToken + "\"}")
             .when()
                 .post("/Search")
             .then()
@@ -1567,10 +1584,11 @@ class ResourceExplorer2IntegrationTest {
 
         @Test
         void negatedFilterExcludesCorrectly() {
-            // All three queries must use the same page size. ListResources defaults to a 100-result
-            // page; the full suite shares one emulator instance and can hold >100 resources, so an
-            // unspecified MaxResults would truncate the s3 and non-s3 counts inconsistently against
-            // the MaxResults:1000 total and break the arithmetic.
+            // All three queries must use the same page size and the same universe. ListResources
+            // defaults to a 100-result page and the shared emulator holds far more than that, so an
+            // unspecified MaxResults would truncate the counts inconsistently; and the universe has
+            // to stay inside one 1000-result page, or the total is capped while the parts are not
+            // and the arithmetic breaks.
             int s3Count = given()
                 .header("Authorization", AUTH)
                 .contentType("application/json")
@@ -1583,7 +1601,7 @@ class ResourceExplorer2IntegrationTest {
             int total = given()
                 .header("Authorization", AUTH)
                 .contentType("application/json")
-                .body("{\"MaxResults\": 1000}")
+                .body("{\"MaxResults\": 1000, \"Filters\": {\"FilterString\": \"" + BOUNDED_SCOPE + "\"}}")
             .when()
                 .post("/ListResources")
             .then()
@@ -1592,7 +1610,8 @@ class ResourceExplorer2IntegrationTest {
             given()
                 .header("Authorization", AUTH)
                 .contentType("application/json")
-                .body("{\"MaxResults\": 1000, \"Filters\": {\"FilterString\": \"-service:s3\"}}")
+                .body("{\"MaxResults\": 1000, \"Filters\": {\"FilterString\": \""
+                        + BOUNDED_SCOPE + " -service:s3\"}}")
             .when()
                 .post("/ListResources")
             .then()
@@ -1945,6 +1964,431 @@ class ResourceExplorer2IntegrationTest {
                 .statusCode(200)
                 .body("Tags", notNullValue())
                 .body("View.Tags", nullValue());
+        }
+    }
+
+    private static String authFor(String region) {
+        return "AWS4-HMAC-SHA256 Credential=test/20260528/" + region + "/resource-explorer-2/aws4_request";
+    }
+
+    /** Creates the index a non-default Region needs before it can hold views. */
+    private String createIndexIn(String region) {
+        return trackIndex(authFor(region), given()
+            .header("Authorization", authFor(region))
+            .contentType("application/json")
+            .body("{}")
+        .when()
+            .post("/CreateIndex")
+        .then()
+            .statusCode(200)
+            .extract().path("Arn"));
+    }
+
+    @Nested
+    class ViewRegionScoping {
+
+        @Test
+        void listViewsReturnsOnlyTheCallingRegionsViews() {
+            createIndexIn("eu-central-1");
+            String remoteView = trackView(given()
+                .header("Authorization", authFor("eu-central-1"))
+                .contentType("application/json")
+                .body("{\"ViewName\": \"scoping-eu-view\"}")
+            .when()
+                .post("/CreateView")
+            .then()
+                .statusCode(200)
+                .extract().path("View.ViewArn"));
+
+            given()
+                .header("Authorization", authFor("eu-central-1"))
+                .contentType("application/json")
+            .when()
+                .post("/ListViews")
+            .then()
+                .statusCode(200)
+                .body("Views", hasItem(remoteView));
+
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+            .when()
+                .post("/ListViews")
+            .then()
+                .statusCode(200)
+                .body("Views", not(hasItem(remoteView)));
+        }
+    }
+
+    @Nested
+    class MaxResultsCeilings {
+
+        @Test
+        void listSupportedResourceTypesAcceptsUpToOneThousand() {
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body("{\"MaxResults\": 500}")
+            .when()
+                .post("/ListSupportedResourceTypes")
+            .then()
+                .statusCode(200)
+                .body("ResourceTypes", notNullValue());
+        }
+
+        @Test
+        void listViewsRejectsAPageLargerThanFifty() {
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body("{\"MaxResults\": 51}")
+            .when()
+                .post("/ListViews")
+            .then()
+                .statusCode(400)
+                .body("__type", containsString("ValidationException"));
+
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body("{\"MaxResults\": 50}")
+            .when()
+                .post("/ListViews")
+            .then()
+                .statusCode(200);
+        }
+
+        @Test
+        void listIndexesRejectsAPageLargerThanOneHundred() {
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body("{\"MaxResults\": 101}")
+            .when()
+                .post("/ListIndexes")
+            .then()
+                .statusCode(400);
+        }
+    }
+
+    @Nested
+    class TagFiltersRequireTagData {
+
+        private String viewWithoutTags() {
+            return trackView(given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body("{\"ViewName\": \"no-tag-data-view\", \"IncludedProperties\": []}")
+            .when()
+                .post("/CreateView")
+            .then()
+                .statusCode(200)
+                .extract().path("View.ViewArn"));
+        }
+
+        @Test
+        void searchWithATagFilterAgainstAViewWithoutTagsIsRejected() {
+            String viewArn = viewWithoutTags();
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body("{\"QueryString\": \"tag:env=test\", \"ViewArn\": \"" + viewArn + "\"}")
+            .when()
+                .post("/Search")
+            .then()
+                .statusCode(400)
+                .body("__type", containsString("ValidationException"));
+        }
+
+        @Test
+        void aNonTagFilterAgainstTheSameViewStillWorks() {
+            String viewArn = viewWithoutTags();
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body("{\"Filters\": {\"FilterString\": \"service:s3\"}, \"ViewArn\": \"" + viewArn + "\"}")
+            .when()
+                .post("/ListResources")
+            .then()
+                .statusCode(200);
+        }
+    }
+
+    @Nested
+    class QuerySemantics {
+
+        @Test
+        void freeFormKeywordsAreOredNotAnded() {
+            // "s3" and "dynamodb" share no resource, so an AND reading would return nothing.
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body("{\"QueryString\": \"s3 dynamodb\"}")
+            .when()
+                .post("/Search")
+            .then()
+                .statusCode(200)
+                .body("Resources.ResourceType", hasItems("s3:bucket", "dynamodb:table"));
+        }
+
+        @Test
+        void supportsTagsFilterMatchesTaggableTypes() {
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body("{\"Filters\": {\"FilterString\": \"resourcetype.supports:tags service:s3\"}}")
+            .when()
+                .post("/ListResources")
+            .then()
+                .statusCode(200)
+                .body("Resources.size()", greaterThan(0));
+        }
+    }
+
+    @Nested
+    class Ec2Resources {
+
+        @Test
+        void vpcsAreDiscoverable() {
+            given()
+                .header("Authorization", "AWS4-HMAC-SHA256 Credential=test/20260528/us-east-1/ec2/aws4_request")
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "CreateVpc")
+                .formParam("CidrBlock", "10.42.0.0/16")
+                .formParam("Version", "2016-11-15")
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200);
+
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body("{\"Filters\": {\"FilterString\": \"resourcetype:ec2:vpc\"}}")
+            .when()
+                .post("/ListResources")
+            .then()
+                .statusCode(200)
+                .body("Resources.size()", greaterThan(0))
+                .body("Resources[0].Service", equalTo("ec2"));
+        }
+    }
+
+    @Nested
+    class AwsOwnedResources {
+
+        @Test
+        void managedAndServiceViewsAreEmpty() {
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body("{}")
+            .when()
+                .post("/ListManagedViews")
+            .then()
+                .statusCode(200)
+                .body("ManagedViews.size()", equalTo(0));
+
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body("{}")
+            .when()
+                .post("/ListServiceViews")
+            .then()
+                .statusCode(200)
+                .body("ServiceViews.size()", equalTo(0));
+
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body("{}")
+            .when()
+                .post("/ListStreamingAccessForServices")
+            .then()
+                .statusCode(200)
+                .body("StreamingAccessForServices.size()", equalTo(0));
+        }
+
+        @Test
+        void getManagedViewReportsNotFound() {
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body("{\"ManagedViewArn\": \"arn:aws:resource-explorer-2:us-east-1:000000000000:managed-view/x/1\"}")
+            .when()
+                .post("/GetManagedView")
+            .then()
+                .statusCode(404)
+                .body("__type", containsString("ResourceNotFoundException"));
+        }
+
+        @Test
+        void accountLevelServiceConfigurationReportsNoOrganization() {
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+            .when()
+                .post("/GetAccountLevelServiceConfiguration")
+            .then()
+                .statusCode(200)
+                .body("OrgConfiguration.AWSServiceAccessStatus", equalTo("DISABLED"));
+        }
+
+        @Test
+        void serviceIndexMirrorsTheRegionsIndex() {
+            String indexArn = given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+            .when()
+                .post("/GetIndex")
+            .then()
+                .statusCode(200)
+                .extract().path("Arn");
+
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+            .when()
+                .post("/GetServiceIndex")
+            .then()
+                .statusCode(200)
+                .body("Arn", equalTo(indexArn))
+                .body("Type", notNullValue());
+
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body("{}")
+            .when()
+                .post("/ListServiceIndexes")
+            .then()
+                .statusCode(200)
+                .body("Indexes.Arn", hasItem(indexArn));
+        }
+
+        @Test
+        void memberIndexesAreReturnedOnlyForThisAccount() {
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body("{\"AccountIdList\": [\"000000000000\"]}")
+            .when()
+                .post("/ListIndexesForMembers")
+            .then()
+                .statusCode(200)
+                .body("Indexes.size()", greaterThan(0))
+                .body("Indexes[0].AccountId", equalTo("000000000000"));
+
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body("{\"AccountIdList\": [\"111122223333\"]}")
+            .when()
+                .post("/ListIndexesForMembers")
+            .then()
+                .statusCode(200)
+                .body("Indexes.size()", equalTo(0));
+        }
+    }
+
+    @Nested
+    class MultiRegionSetup {
+
+        @Test
+        void createThenDeleteSetupInOneRegion() {
+            String taskId = given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body("{\"RegionList\": [\"ap-south-1\"], \"ViewName\": \"setup-view\"}")
+            .when()
+                .post("/CreateResourceExplorerSetup")
+            .then()
+                .statusCode(200)
+                .extract().path("TaskId");
+
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body("{\"TaskId\": \"" + taskId + "\"}")
+            .when()
+                .post("/GetResourceExplorerSetup")
+            .then()
+                .statusCode(200)
+                .body("Regions[0].Region", equalTo("ap-south-1"))
+                .body("Regions[0].Index.Status", equalTo("SUCCEEDED"))
+                .body("Regions[0].Index.Index.Region", equalTo("ap-south-1"))
+                .body("Regions[0].View.Status", equalTo("SUCCEEDED"))
+                .body("Regions[0].View.View.ViewArn", containsString("setup-view"));
+
+            String deleteTaskId = given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body("{\"RegionList\": [\"ap-south-1\"]}")
+            .when()
+                .post("/DeleteResourceExplorerSetup")
+            .then()
+                .statusCode(200)
+                .extract().path("TaskId");
+
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body("{\"TaskId\": \"" + deleteTaskId + "\"}")
+            .when()
+                .post("/GetResourceExplorerSetup")
+            .then()
+                .statusCode(200)
+                .body("Regions[0].Index.Status", equalTo("SUCCEEDED"));
+
+            given()
+                .header("Authorization", authFor("ap-south-1"))
+                .contentType("application/json")
+            .when()
+                .post("/GetIndex")
+            .then()
+                .statusCode(404);
+        }
+
+        @Test
+        void regionListAndDeleteInAllRegionsAreMutuallyExclusive() {
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body("{\"DeleteInAllRegions\": true, \"RegionList\": [\"us-east-1\"]}")
+            .when()
+                .post("/DeleteResourceExplorerSetup")
+            .then()
+                .statusCode(400)
+                .body("__type", containsString("ValidationException"));
+        }
+
+        @Test
+        void anAggregatorRegionOutsideTheRegionListIsRejected() {
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body("""
+                    {"RegionList": ["ap-northeast-1"], "ViewName": "setup-view",
+                     "AggregatorRegions": ["sa-east-1"]}
+                    """)
+            .when()
+                .post("/CreateResourceExplorerSetup")
+            .then()
+                .statusCode(400)
+                .body("__type", containsString("ValidationException"));
+        }
+
+        @Test
+        void getResourceExplorerSetupReportsAnUnknownTask() {
+            given()
+                .header("Authorization", AUTH)
+                .contentType("application/json")
+                .body("{\"TaskId\": \"00000000-0000-0000-0000-000000000000\"}")
+            .when()
+                .post("/GetResourceExplorerSetup")
+            .then()
+                .statusCode(404);
         }
     }
 }

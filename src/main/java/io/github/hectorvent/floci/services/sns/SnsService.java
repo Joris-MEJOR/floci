@@ -911,7 +911,9 @@ public class SnsService implements Resettable, ResourceProvider {
         List<ExplorerResource> resources = new ArrayList<>();
         for (Topic topic : topicStore.scan(k -> true)) {
             String arn = topic.getTopicArn();
-            if (arn == null) continue;
+            if (arn == null) {
+                continue;
+            }
             AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
             resources.add(new ExplorerResource(
                     arn, "sns:topic", "sns",

@@ -5054,7 +5054,9 @@ public class RdsService implements Resettable, ResourceProvider {
         List<ExplorerResource> resources = new ArrayList<>();
         for (DbInstance instance : listDbInstances(null)) {
             String arn = instance.getDbInstanceArn();
-            if (arn == null) continue;
+            if (arn == null) {
+                continue;
+            }
             AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
             resources.add(new ExplorerResource(arn, "rds:db", "rds",
                     parsed.region(), parsed.accountId(),
@@ -5063,7 +5065,9 @@ public class RdsService implements Resettable, ResourceProvider {
         }
         for (DbCluster cluster : listDbClusters(null)) {
             String arn = cluster.getDbClusterArn();
-            if (arn == null) continue;
+            if (arn == null) {
+                continue;
+            }
             AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
             resources.add(new ExplorerResource(arn, "rds:cluster", "rds",
                     parsed.region(), parsed.accountId(),

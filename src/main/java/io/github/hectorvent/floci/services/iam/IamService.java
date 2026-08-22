@@ -1287,7 +1287,9 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
 
     private void addIamResource(List<ExplorerResource> out, String arn, String type,
                                 Instant createDate, Map<String, String> tags) {
-        if (arn == null) return;
+        if (arn == null) {
+            return;
+        }
         AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
         // IAM is a global service: its ARNs carry no region. Resource Explorer reports
         // global resources with the region "global" (not an empty string).

@@ -277,6 +277,41 @@ class QueryParserTest {
             ParsedQuery query = QueryParser.parse("service:ec2\\");
             assertEquals("ec2\\", query.filters().getFirst().values().getFirst().value());
         }
+
+        @Test
+        void escapedHyphenIsAKeywordNotANegation() {
+            ParsedQuery query = QueryParser.parse("\"my\\-key\\-word\"");
+            assertEquals(1, query.keywords().size());
+            assertEquals("my-key-word", query.keywords().getFirst().value());
+            assertFalse(query.keywords().getFirst().negated());
+        }
+
+        @Test
+        void escapedWildcardIsLiteralNotAPrefixMatch() {
+            ParsedQuery query = QueryParser.parse("tag.value:literal\\*");
+            var value = query.filters().getFirst().values().getFirst();
+            assertEquals("literal*", value.value());
+            assertFalse(value.prefixMatch());
+        }
+
+        @Test
+        void escapedColonDoesNotSplitOffAFilterPrefix() {
+            ParsedQuery query = QueryParser.parse("not\\:a\\:filter");
+            assertEquals(1, query.keywords().size());
+            assertEquals("not:a:filter", query.keywords().getFirst().value());
+            assertTrue(query.filters().isEmpty());
+        }
+
+        @Test
+        void aQuotedPhraseNeutralisesEveryOperatorInside() {
+            // Nothing in the quotes is an operator: no negation, no comma-OR, no wildcard.
+            ParsedQuery query = QueryParser.parse("tag.key:\"-a,b*\"");
+            var filter = query.filters().getFirst();
+            assertFalse(filter.negated());
+            assertEquals(1, filter.values().size());
+            assertEquals("-a,b*", filter.values().getFirst().value());
+            assertFalse(filter.values().getFirst().prefixMatch());
+        }
     }
 
     @Nested

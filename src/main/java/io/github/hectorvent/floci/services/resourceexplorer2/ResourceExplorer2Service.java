@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.resourceexplorer2.model.IncludedProperty;
@@ -17,6 +18,8 @@ import io.github.hectorvent.floci.services.resourceexplorer2.model.Index;
 import io.github.hectorvent.floci.services.resourceexplorer2.model.IndexState;
 import io.github.hectorvent.floci.services.resourceexplorer2.model.IndexType;
 import io.github.hectorvent.floci.services.resourceexplorer2.model.SearchFilter;
+import io.github.hectorvent.floci.services.resourceexplorer2.model.SetupOutcome;
+import io.github.hectorvent.floci.services.resourceexplorer2.model.SetupTask;
 import io.github.hectorvent.floci.services.resourceexplorer2.model.Taggable;
 import io.github.hectorvent.floci.services.resourceexplorer2.model.View;
 import io.github.hectorvent.floci.services.resourceexplorer2.query.ParsedQuery;
@@ -33,6 +36,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -54,6 +58,8 @@ public class ResourceExplorer2Service {
     private final StorageBackend<String, View> viewStore;
     /** Default view ARN per region. Persisted, not derived, so an explicit choice survives restarts. */
     private final StorageBackend<String, String> defaultViewStore;
+    /** Completed setup tasks, keyed by the TaskId GetResourceExplorerSetup reads back. */
+    private final StorageBackend<String, SetupTask> setupTaskStore;
 
     /**
      * The maximum number of matching resources {@code Search} returns across all pages. Per the AWS
@@ -77,6 +83,10 @@ public class ResourceExplorer2Service {
     private static final int UNLIMITED_RESULTS = Integer.MAX_VALUE;
     /** Allowed view name characters per the CreateView API: letters, digits, hyphen, 1-64 chars. */
     private static final Pattern VIEW_NAME_PATTERN = Pattern.compile("[a-zA-Z0-9\\-]{1,64}");
+    /** Region pattern the setup APIs apply to every entry of RegionList and AggregatorRegions. */
+    private static final Pattern REGION_PATTERN = Pattern.compile("[a-z-]+-[a-z]+-[0-9]");
+    /** AWS caps AggregatorRegions at one entry, since an account has at most one aggregator index. */
+    private static final int MAX_AGGREGATOR_REGIONS = 1;
 
     @Inject
     public ResourceExplorer2Service(Instance<ResourceProvider> providers,
@@ -95,6 +105,9 @@ public class ResourceExplorer2Service {
         this.defaultViewStore = storageFactory.create("resourceexplorer2",
                 "resourceexplorer2-default-views.json",
                 new TypeReference<>() {});
+        this.setupTaskStore = storageFactory.create("resourceexplorer2",
+                "resourceexplorer2-setup-tasks.json",
+                new TypeReference<>() {});
     }
 
     /**
@@ -107,12 +120,24 @@ public class ResourceExplorer2Service {
                              StorageBackend<String, Index> indexStore,
                              StorageBackend<String, View> viewStore,
                              StorageBackend<String, String> defaultViewStore) {
+        this(providers, regionResolver, objectMapper, indexStore, viewStore, defaultViewStore,
+                new InMemoryStorage<>());
+    }
+
+    ResourceExplorer2Service(Instance<ResourceProvider> providers,
+                             RegionResolver regionResolver,
+                             ObjectMapper objectMapper,
+                             StorageBackend<String, Index> indexStore,
+                             StorageBackend<String, View> viewStore,
+                             StorageBackend<String, String> defaultViewStore,
+                             StorageBackend<String, SetupTask> setupTaskStore) {
         this.providers = providers;
         this.regionResolver = regionResolver;
         this.objectMapper = objectMapper;
         this.indexStore = indexStore;
         this.viewStore = viewStore;
         this.defaultViewStore = defaultViewStore;
+        this.setupTaskStore = setupTaskStore;
     }
 
     void onStartup(@Observes StartupEvent event) {
@@ -160,13 +185,24 @@ public class ResourceExplorer2Service {
         return AwsArnUtils.parse(view.viewArn()).region();
     }
 
+    private List<Index> activeIndexes(String type, List<String> regions) {
+        return indexStore.scan(_ -> true).stream()
+                .filter(i -> i.state() != IndexState.DELETED)
+                .filter(i -> type == null || type.equalsIgnoreCase(i.type().name()))
+                .filter(i -> regions == null || regions.isEmpty()
+                        || regions.stream().anyMatch(r -> r.equalsIgnoreCase(i.region())))
+                .toList();
+    }
+
+    private Optional<Index> activeIndex(String region) {
+        return indexStore.scan(_ -> true).stream()
+                .filter(i -> region.equals(i.region()) && i.state() != IndexState.DELETED)
+                .findFirst();
+    }
+
     /** Creates a LOCAL index. Real AWS always creates LOCAL; promote via {@link #updateIndexType}. */
     public Index createIndex(String region, Map<String, String> tags) {
-        boolean alreadyExists = !indexStore.scan(_ -> true).stream()
-                .filter(i -> region.equals(i.region()) && i.state() != IndexState.DELETED)
-                .toList()
-                .isEmpty();
-        if (alreadyExists) {
+        if (activeIndex(region).isPresent()) {
             throw new AwsException("ConflictException",
                     "An index already exists for region: " + region, 409);
         }
@@ -181,9 +217,7 @@ public class ResourceExplorer2Service {
 
     public Index getIndex(String region) {
         ensureDefaultRegionProvisioned();
-        return indexStore.scan(_ -> true).stream()
-                .filter(i -> region.equals(i.region()) && i.state() != IndexState.DELETED)
-                .findFirst()
+        return activeIndex(region)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                         "No index found for region: " + region, 404));
     }
@@ -236,27 +270,26 @@ public class ResourceExplorer2Service {
 
     public ObjectNode listIndexes(String type, List<String> regions, Integer maxResults, String nextToken) {
         ensureDefaultRegionProvisioned();
-        List<Index> all = indexStore.scan(_ -> true).stream()
-                .filter(i -> i.state() != IndexState.DELETED)
-                .filter(i -> type == null || type.equalsIgnoreCase(i.type().name()))
-                .filter(i -> regions == null || regions.isEmpty() ||
-                        regions.stream().anyMatch(r -> r.equalsIgnoreCase(i.region())))
-                .toList();
+        List<Index> all = activeIndexes(type, regions);
         Paginated<Index> page = paginate(all, maxResults, nextToken, 100);
 
         ObjectNode result = objectMapper.createObjectNode();
         ArrayNode arr = result.putArray("Indexes");
         for (Index idx : page.items()) {
-            ObjectNode node = objectMapper.createObjectNode();
-            node.put("Arn", idx.arn());
-            node.put("Region", idx.region());
-            node.put("Type", idx.type().name());
-            arr.add(node);
+            arr.add(indexNode(idx));
         }
         if (page.nextToken() != null) {
             result.put("NextToken", page.nextToken());
         }
         return result;
+    }
+
+    private ObjectNode indexNode(Index index) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("Arn", index.arn());
+        node.put("Region", index.region());
+        node.put("Type", index.type().name());
+        return node;
     }
 
     public View createView(String region, String viewName, String scope, SearchFilter filters,
@@ -329,9 +362,17 @@ public class ResourceExplorer2Service {
         return updated;
     }
 
-    public ObjectNode listViews(Integer maxResults, String nextToken) {
+    /**
+     * Lists the views in one Region. AWS scopes this to "the AWS Region in which you call this
+     * operation", so a view created in another Region is not listed here even though floci keeps
+     * every Region's views in one store.
+     *
+     * @see <a href="https://docs.aws.amazon.com/resource-explorer/latest/apireference/API_ListViews.html">AWS API: ListViews</a>
+     */
+    public ObjectNode listViews(String region, Integer maxResults, String nextToken) {
         ensureDefaultRegionProvisioned();
         List<String> all = viewStore.scan(_ -> true).stream()
+                .filter(v -> region.equals(regionOf(v)))
                 .map(View::viewArn)
                 .toList();
         Paginated<String> page = paginate(all, maxResults, nextToken, 100);
@@ -418,7 +459,9 @@ public class ResourceExplorer2Service {
         ParsedQuery viewFilter = (view.filters() != null && view.filters().filterString() != null)
                 ? QueryParser.parseFilterOnly(view.filters().filterString())
                 : new ParsedQuery(List.of(), List.of());
-        Page p = paginateResources(ResourceFilter.combine(viewFilter, requestFilter), maxResults, nextToken, UNLIMITED_RESULTS);
+        ParsedQuery combined = ResourceFilter.combine(viewFilter, requestFilter);
+        rejectTagFilterWithoutTagData(combined, view);
+        Page p = paginateResources(combined, maxResults, nextToken, UNLIMITED_RESULTS);
 
         ObjectNode result = objectMapper.createObjectNode();
         ArrayNode resources = result.putArray("Resources");
@@ -440,7 +483,9 @@ public class ResourceExplorer2Service {
         ParsedQuery viewFilter = (view.filters() != null && view.filters().filterString() != null)
                 ? QueryParser.parse(view.filters().filterString())
                 : new ParsedQuery(List.of(), List.of());
-        Page p = paginateResources(ResourceFilter.combine(viewFilter, requestFilter), maxResults, nextToken, MAX_RESOURCE_RESULTS);
+        ParsedQuery combined = ResourceFilter.combine(viewFilter, requestFilter);
+        rejectTagFilterWithoutTagData(combined, view);
+        Page p = paginateResources(combined, maxResults, nextToken, MAX_RESOURCE_RESULTS);
 
         ObjectNode result = objectMapper.createObjectNode();
         ArrayNode resources = result.putArray("Resources");
@@ -456,6 +501,37 @@ public class ResourceExplorer2Service {
         }
         result.put("ViewArn", view.viewArn());
         return result;
+    }
+
+    /**
+     * AWS documents every tag filter — {@code tag:}, {@code tag.key:}, {@code tag.value:} and
+     * {@code application:}, which reads a tag — as requiring a view whose {@code IncludedProperties}
+     * name {@code tags}. Against a view without it the query is rejected rather than silently
+     * evaluated on data the view is not allowed to expose.
+     *
+     * @see <a href="https://docs.aws.amazon.com/resource-explorer/latest/userguide/using-search-query-syntax.html">
+     *     Search query syntax reference</a>
+     */
+    private static void rejectTagFilterWithoutTagData(ParsedQuery query, View view) {
+        if (!ResourceFilter.usesTagData(query) || view.includesTags()) {
+            return;
+        }
+        throw new AwsException("ValidationException",
+                "The view " + view.viewArn() + " does not include tag data, so the query cannot "
+                        + "filter on tags. Add an IncludedProperty named 'tags' to the view.", 400);
+    }
+
+    /** Resource types whose provider advertises tag support, for {@code resourcetype.supports:tags}. */
+    private Set<String> taggableResourceTypes() {
+        Set<String> taggable = new HashSet<>();
+        for (ResourceProvider provider : providers) {
+            for (SupportedResourceType type : provider.getSupportedResourceTypes()) {
+                if (type.supportsTags()) {
+                    taggable.add(type.resourceType());
+                }
+            }
+        }
+        return taggable;
     }
 
     private record Page(List<ExplorerResource> page, int end, int total, int uncappedTotal) {}
@@ -484,8 +560,9 @@ public class ResourceExplorer2Service {
                         provider.getClass().getSimpleName());
             }
         }
+        Set<String> taggableResourceTypes = taggableResourceTypes();
         List<ExplorerResource> filtered = all.stream()
-                .filter(r -> ResourceFilter.matches(r, combined))
+                .filter(r -> ResourceFilter.matches(r, combined, taggableResourceTypes))
                 .toList();
         int uncappedTotal = filtered.size();
         PageBounds b = pageBounds(filtered.size(), maxResults, nextToken, resultCap);
@@ -551,6 +628,304 @@ public class ResourceExplorer2Service {
         return result;
     }
 
+    // ── Managed, service-owned, and organization-scoped reads ────────────────
+    //
+    // These describe resources only AWS itself creates: views a trusted service registers
+    // (managed and service views), streaming grants it holds, and indexes belonging to other
+    // accounts in an organization. floci models neither trusted services nor Organizations, so
+    // each answers with the wire-accurate empty result rather than an error — a caller
+    // enumerating them completes, and one asking for a specific ARN gets the same
+    // ResourceNotFoundException a live account with no such view would return.
+
+    public ObjectNode listManagedViews(Integer maxResults, String nextToken) {
+        return emptyList("ManagedViews", maxResults, nextToken);
+    }
+
+    public ObjectNode getManagedView(String managedViewArn) {
+        throw new AwsException("ResourceNotFoundException",
+                "Managed view not found: " + managedViewArn, 404);
+    }
+
+    public ObjectNode listServiceViews(Integer maxResults, String nextToken) {
+        return emptyList("ServiceViews", maxResults, nextToken);
+    }
+
+    public ObjectNode getServiceView(String serviceViewArn) {
+        throw new AwsException("ResourceNotFoundException",
+                "Service view not found: " + serviceViewArn, 404);
+    }
+
+    public ObjectNode listStreamingAccessForServices(Integer maxResults, String nextToken) {
+        return emptyList("StreamingAccessForServices", maxResults, nextToken);
+    }
+
+    /**
+     * The index a trusted service reads in the request Region. Same index {@code GetIndex}
+     * returns, reported with the narrower {@code ServiceIndex} shape.
+     */
+    public ObjectNode getServiceIndex(String region) {
+        ensureDefaultRegionProvisioned();
+        Index index = activeIndex(region)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                        "No index found for region: " + region, 404));
+        ObjectNode result = objectMapper.createObjectNode();
+        result.put("Arn", index.arn());
+        result.put("Type", index.type().name());
+        return result;
+    }
+
+    public ObjectNode listServiceIndexes(List<String> regions, Integer maxResults, String nextToken) {
+        ensureDefaultRegionProvisioned();
+        Paginated<Index> page = paginate(activeIndexes(null, regions), maxResults, nextToken, 100);
+        ObjectNode result = objectMapper.createObjectNode();
+        ArrayNode indexes = result.putArray("Indexes");
+        for (Index index : page.items()) {
+            indexes.add(indexNode(index));
+        }
+        if (page.nextToken() != null) {
+            result.put("NextToken", page.nextToken());
+        }
+        return result;
+    }
+
+    /**
+     * Indexes belonging to the listed member accounts. floci emulates a single account, so the
+     * result is this account's indexes when its id is among those asked for, and empty otherwise —
+     * which is what a management account sees for an account with no index.
+     */
+    public ObjectNode listIndexesForMembers(List<String> accountIds, Integer maxResults, String nextToken) {
+        ensureDefaultRegionProvisioned();
+        String accountId = regionResolver.getAccountId();
+        List<Index> owned = accountIds.contains(accountId) ? activeIndexes(null, null) : List.of();
+        Paginated<Index> page = paginate(owned, maxResults, nextToken, 10);
+
+        ObjectNode result = objectMapper.createObjectNode();
+        ArrayNode indexes = result.putArray("Indexes");
+        for (Index index : page.items()) {
+            ObjectNode node = indexNode(index);
+            node.put("AccountId", accountId);
+            indexes.add(node);
+        }
+        if (page.nextToken() != null) {
+            result.put("NextToken", page.nextToken());
+        }
+        return result;
+    }
+
+    /**
+     * floci models no AWS Organization, so multi-account search is reported as {@code DISABLED}
+     * and no service-linked role is returned — the answer a standalone account gives.
+     */
+    public ObjectNode getAccountLevelServiceConfiguration() {
+        ObjectNode result = objectMapper.createObjectNode();
+        result.putObject("OrgConfiguration").put("AWSServiceAccessStatus", "DISABLED");
+        return result;
+    }
+
+    private ObjectNode emptyList(String field, Integer maxResults, String nextToken) {
+        Paginated<String> page = paginate(List.of(), maxResults, nextToken, 50);
+        ObjectNode result = objectMapper.createObjectNode();
+        result.putArray(field);
+        if (page.nextToken() != null) {
+            result.put("NextToken", page.nextToken());
+        }
+        return result;
+    }
+
+    // ── Multi-Region setup ───────────────────────────────────────────────────
+
+    /**
+     * Turns Resource Explorer on across several Regions in one call: an index per Region, a view
+     * per Region, and at most one Region promoted to aggregator.
+     *
+     * <p>A Region that already has an index reuses it rather than failing, because the operation
+     * describes a target state rather than a create. Each Region's index and view step is recorded
+     * independently, so one Region's failure — a name already taken, an aggregator already
+     * elsewhere — is reported through that Region's {@code ErrorDetails} instead of abandoning the
+     * rest of the task.
+     *
+     * @return the task id to read back with {@link #getResourceExplorerSetup}
+     * @see <a href="https://docs.aws.amazon.com/resource-explorer/latest/apireference/API_CreateResourceExplorerSetup.html">
+     *     AWS API: CreateResourceExplorerSetup</a>
+     */
+    public String createResourceExplorerSetup(List<String> regionList, String viewName,
+                                              List<String> aggregatorRegions) {
+        if (regionList == null || regionList.isEmpty()) {
+            throw new AwsException("ValidationException", "RegionList must contain at least one Region.", 400);
+        }
+        validateRegions(regionList, "RegionList");
+        List<String> aggregators = aggregatorRegions != null ? aggregatorRegions : List.of();
+        if (aggregators.size() > MAX_AGGREGATOR_REGIONS) {
+            throw new AwsException("ValidationException",
+                    "AggregatorRegions accepts at most " + MAX_AGGREGATOR_REGIONS + " Region.", 400);
+        }
+        validateRegions(aggregators, "AggregatorRegions");
+        for (String aggregator : aggregators) {
+            if (!regionList.contains(aggregator)) {
+                throw new AwsException("ValidationException",
+                        "AggregatorRegions entry " + aggregator + " must also appear in RegionList.", 400);
+            }
+        }
+        if (viewName == null || !VIEW_NAME_PATTERN.matcher(viewName).matches()) {
+            throw new AwsException("ValidationException",
+                    "View name must match [a-zA-Z0-9-] and be 1-64 characters: " + viewName, 400);
+        }
+
+        List<SetupTask.RegionOutcome> outcomes = new ArrayList<>();
+        for (String region : regionList) {
+            outcomes.add(setUpRegion(region, viewName, aggregators.contains(region)));
+        }
+        return recordTask(outcomes);
+    }
+
+    private SetupTask.RegionOutcome setUpRegion(String region, String viewName, boolean aggregator) {
+        SetupOutcome indexOutcome;
+        Index index;
+        try {
+            index = activeIndex(region).orElseGet(() -> createIndex(region, Map.of()));
+            if (aggregator && index.type() != IndexType.AGGREGATOR) {
+                index = updateIndexType(index.arn(), IndexType.AGGREGATOR);
+            }
+            indexOutcome = SetupOutcome.succeeded(index.arn());
+        } catch (AwsException e) {
+            LOG.warnf("Setup failed to prepare the index in %s: %s", region, e.getMessage());
+            return new SetupTask.RegionOutcome(region, SetupOutcome.failed(e.getErrorCode(), e.getMessage()), null);
+        }
+
+        SetupOutcome viewOutcome;
+        try {
+            View view = createView(region, viewName, null, null,
+                    List.of(new IncludedProperty("tags")), Map.of());
+            if (defaultViewStore.get(region).isEmpty()) {
+                defaultViewStore.put(region, view.viewArn());
+            }
+            viewOutcome = SetupOutcome.succeeded(view.viewArn());
+        } catch (AwsException e) {
+            LOG.warnf("Setup failed to create view %s in %s: %s", viewName, region, e.getMessage());
+            viewOutcome = SetupOutcome.failed(e.getErrorCode(), e.getMessage());
+        }
+        return new SetupTask.RegionOutcome(region, indexOutcome, viewOutcome);
+    }
+
+    /**
+     * Turns Resource Explorer off in the given Regions, or everywhere it is on.
+     *
+     * @see <a href="https://docs.aws.amazon.com/resource-explorer/latest/apireference/API_DeleteResourceExplorerSetup.html">
+     *     AWS API: DeleteResourceExplorerSetup</a>
+     */
+    public String deleteResourceExplorerSetup(Boolean deleteInAllRegions, List<String> regionList) {
+        boolean allRegions = Boolean.TRUE.equals(deleteInAllRegions);
+        boolean hasRegionList = regionList != null && !regionList.isEmpty();
+        if (allRegions && hasRegionList) {
+            throw new AwsException("ValidationException",
+                    "RegionList must not be provided when DeleteInAllRegions is true.", 400);
+        }
+        if (!allRegions && !hasRegionList) {
+            throw new AwsException("ValidationException",
+                    "Provide either RegionList or DeleteInAllRegions.", 400);
+        }
+        List<String> regions;
+        if (allRegions) {
+            regions = activeIndexes(null, null).stream().map(Index::region).distinct().toList();
+        } else {
+            validateRegions(regionList, "RegionList");
+            regions = regionList;
+        }
+
+        List<SetupTask.RegionOutcome> outcomes = new ArrayList<>();
+        for (String region : regions) {
+            outcomes.add(tearDownRegion(region));
+        }
+        return recordTask(outcomes);
+    }
+
+    private SetupTask.RegionOutcome tearDownRegion(String region) {
+        SetupOutcome viewOutcome = SetupOutcome.succeeded(null);
+        for (View view : viewStore.scan(_ -> true)) {
+            if (region.equals(regionOf(view))) {
+                deleteView(view.viewArn());
+            }
+        }
+        Optional<Index> index = activeIndex(region);
+        if (index.isEmpty()) {
+            return new SetupTask.RegionOutcome(region,
+                    SetupOutcome.failed("ResourceNotFoundException", "No index found for region: " + region),
+                    viewOutcome);
+        }
+        deleteIndex(index.get().arn());
+        return new SetupTask.RegionOutcome(region, SetupOutcome.succeeded(index.get().arn()), viewOutcome);
+    }
+
+    private String recordTask(List<SetupTask.RegionOutcome> outcomes) {
+        String taskId = UUID.randomUUID().toString();
+        setupTaskStore.put(taskId, new SetupTask(taskId, outcomes, Instant.now()));
+        return taskId;
+    }
+
+    private void validateRegions(List<String> regions, String field) {
+        for (String region : regions) {
+            if (region == null || !REGION_PATTERN.matcher(region).matches()) {
+                throw new AwsException("ValidationException",
+                        field + " contains an invalid AWS Region: " + region, 400);
+            }
+        }
+    }
+
+    /**
+     * Reports a setup task's per-Region outcome. floci runs the task synchronously, so the status
+     * is already terminal by the time the task id can be used here.
+     */
+    public ObjectNode getResourceExplorerSetup(String taskId, Integer maxResults, String nextToken) {
+        SetupTask task = setupTaskStore.get(taskId)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                        "Setup task not found: " + taskId, 404));
+        Paginated<SetupTask.RegionOutcome> page = paginate(task.regions(), maxResults, nextToken, 100);
+
+        ObjectNode result = objectMapper.createObjectNode();
+        ArrayNode regions = result.putArray("Regions");
+        for (SetupTask.RegionOutcome outcome : page.items()) {
+            ObjectNode node = objectMapper.createObjectNode();
+            node.put("Region", outcome.region());
+            if (outcome.index() != null) {
+                node.set("Index", setupStatusNode(outcome.index(), "Index", storedIndexNode(outcome.index().arn())));
+            }
+            if (outcome.view() != null) {
+                node.set("View", setupStatusNode(outcome.view(), "View", storedViewNode(outcome.view().arn())));
+            }
+            regions.add(node);
+        }
+        if (page.nextToken() != null) {
+            result.put("NextToken", page.nextToken());
+        }
+        return result;
+    }
+
+    /** The index a create step produced, or null once a delete step has removed it. */
+    private ObjectNode storedIndexNode(String arn) {
+        return arn == null ? null : indexStore.get(arn).map(this::indexNode).orElse(null);
+    }
+
+    /** The view a create step produced, or null once a delete step has removed it. */
+    private ObjectNode storedViewNode(String arn) {
+        return arn == null ? null : viewStore.get(arn).map(this::buildViewNode).orElse(null);
+    }
+
+    /** Wraps a step's status with the resource it produced, when that resource still exists. */
+    private ObjectNode setupStatusNode(SetupOutcome outcome, String resourceField, ObjectNode resource) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("Status", outcome.status());
+        if (resource != null) {
+            node.set(resourceField, resource);
+        }
+        if (outcome.errorCode() != null) {
+            ObjectNode error = objectMapper.createObjectNode();
+            error.put("Code", outcome.errorCode());
+            error.put("Message", outcome.errorMessage());
+            node.set("ErrorDetails", error);
+        }
+        return node;
+    }
+
     public Map<String, String> listTags(String arn) {
         Map<String, String> tags = resolveTaggable(arn).entity().tags();
         return tags != null ? tags : Map.of();
@@ -601,7 +976,9 @@ public class ResourceExplorer2Service {
     }
 
     private static int decodeNextToken(String token) {
-        if (token == null) return 0;
+        if (token == null) {
+            return 0;
+        }
         try {
             return Integer.parseInt(new String(Base64.getDecoder().decode(token)));
         } catch (Exception e) {

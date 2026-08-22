@@ -214,7 +214,9 @@ public class PipesService implements TagHandler, ResourceProvider {
         List<ExplorerResource> resources = new ArrayList<>();
         for (Pipe pipe : storage.scan(k -> true)) {
             String arn = pipe.getArn();
-            if (arn == null) continue;
+            if (arn == null) {
+                continue;
+            }
             AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
             resources.add(new ExplorerResource(
                     arn, "pipes:pipe", "pipes",

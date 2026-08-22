@@ -508,7 +508,9 @@ public class LightsailService implements ResourceProvider {
         List<ExplorerResource> resources = new ArrayList<>();
         for (ObjectNode node : resourceStore.scan(key -> true)) {
             String arn = node.path("arn").asText(null);
-            if (arn == null) continue;
+            if (arn == null) {
+                continue;
+            }
             AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
             resources.add(new ExplorerResource(
                     arn,

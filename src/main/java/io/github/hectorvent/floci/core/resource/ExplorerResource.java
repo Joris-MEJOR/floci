@@ -28,10 +28,10 @@ import java.util.Map;
  * @param service         AWS service namespace — the service segment of the ARN, e.g. {@code acm},
  *                        {@code kafka}, {@code cognito-idp}. This is the prefix of
  *                        {@link #resourceType}, not necessarily the floci module name.
- * @param owningAccountId 12-digit account id that owns the resource; usually
- *                        {@code AwsArnUtils.parse(arn).accountId()}.
  * @param region          AWS region the resource lives in, e.g. {@code us-east-1}; usually
  *                        {@code AwsArnUtils.parse(arn).region()}.
+ * @param owningAccountId 12-digit account id that owns the resource; usually
+ *                        {@code AwsArnUtils.parse(arn).accountId()}.
  * @param lastReportedAt  when Resource Explorer last observed the resource. floci has no scan
  *                        pipeline, so providers pass the resource's creation timestamp (falling back
  *                        to {@code Instant.now()} when unknown).

@@ -494,7 +494,9 @@ public class EcrService implements ResourceProvider {
         List<ExplorerResource> resources = new ArrayList<>();
         for (Repository repo : repoStore.scan(k -> true)) {
             String arn = repo.getRepositoryArn();
-            if (arn == null) continue;
+            if (arn == null) {
+                continue;
+            }
             AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
             resources.add(new ExplorerResource(
                     arn, "ecr:repository", "ecr",

@@ -489,7 +489,9 @@ public class AcmService implements ResourceProvider {
         List<ExplorerResource> resources = new ArrayList<>();
         for (Certificate cert : store.scan(k -> true)) {
             String arn = cert.getArn();
-            if (arn == null) continue;
+            if (arn == null) {
+                continue;
+            }
             AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
             resources.add(new ExplorerResource(
                     arn, "acm:certificate", "acm",

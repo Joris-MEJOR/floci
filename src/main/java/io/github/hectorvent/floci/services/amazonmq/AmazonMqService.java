@@ -164,7 +164,9 @@ public class AmazonMqService implements ResourceProvider {
         List<ExplorerResource> resources = new ArrayList<>();
         for (Broker broker : storage.scan(k -> true)) {
             String arn = broker.getBrokerArn();
-            if (arn == null) continue;
+            if (arn == null) {
+                continue;
+            }
             AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
             resources.add(new ExplorerResource(
                     arn, "mq:broker", "mq",

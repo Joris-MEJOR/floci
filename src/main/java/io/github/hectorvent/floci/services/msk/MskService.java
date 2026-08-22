@@ -285,7 +285,9 @@ public class MskService implements ResourceProvider {
         List<ExplorerResource> resources = new ArrayList<>();
         for (MskCluster cluster : storage.scan(k -> true)) {
             String arn = cluster.getClusterArn();
-            if (arn == null) continue;
+            if (arn == null) {
+                continue;
+            }
             AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
             resources.add(new ExplorerResource(
                     arn, "kafka:cluster", "kafka",

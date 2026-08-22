@@ -29,9 +29,14 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
+import io.github.hectorvent.floci.core.resource.ExplorerResource;
+import io.github.hectorvent.floci.core.resource.ResourceProvider;
+import io.github.hectorvent.floci.core.resource.SupportedResourceType;
+import java.time.Instant;
+import java.util.Set;
 
 @ApplicationScoped
-public class CloudWatchLogsService {
+public class CloudWatchLogsService implements ResourceProvider {
 
     private static final Logger LOG = Logger.getLogger(CloudWatchLogsService.class);
 
@@ -966,5 +971,40 @@ public class CloudWatchLogsService {
         } catch (NumberFormatException e) {
             return defaultValue;
         }
+    }
+
+    // ─── Resource Explorer 2 ───────────────────────────────────────────────────
+
+    /**
+     * Log groups carry no Region of their own — the store keys them {@code region::name} — so the
+     * key is the only place the Region can come from.
+     */
+    @Override
+    public List<ExplorerResource> getResources() {
+        List<ExplorerResource> resources = new ArrayList<>();
+        for (String key : groupStore.keys()) {
+            int separator = key.indexOf("::");
+            if (separator < 0) {
+                continue;
+            }
+            LogGroup group = groupStore.get(key).orElse(null);
+            if (group == null || group.getLogGroupName() == null) {
+                continue;
+            }
+            String region = key.substring(0, separator);
+            resources.add(new ExplorerResource(
+                    "arn:aws:logs:" + region + ":" + regionResolver.getAccountId()
+                            + ":log-group:" + group.getLogGroupName() + ":*",
+                    "logs:log-group", "logs",
+                    region, regionResolver.getAccountId(),
+                    group.getCreatedTime() > 0 ? Instant.ofEpochMilli(group.getCreatedTime()) : Instant.now(),
+                    group.getTags() != null ? group.getTags() : Map.of()));
+        }
+        return resources;
+    }
+
+    @Override
+    public Set<SupportedResourceType> getSupportedResourceTypes() {
+        return Set.of(new SupportedResourceType("logs:log-group", "logs", true));
     }
 }

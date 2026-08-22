@@ -260,9 +260,13 @@ public class LambdaService implements ResourceProvider {
     public List<ExplorerResource> getResources() {
         List<ExplorerResource> resources = new ArrayList<>();
         for (LambdaFunction fn : functionStore.listAll()) {
-            if (!"$LATEST".equals(fn.getVersion())) continue;
+            if (!"$LATEST".equals(fn.getVersion())) {
+                continue;
+            }
             String arn = fn.getFunctionArn();
-            if (arn == null) continue;
+            if (arn == null) {
+                continue;
+            }
             AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
             resources.add(new ExplorerResource(
                     arn, "lambda:function", "lambda",
