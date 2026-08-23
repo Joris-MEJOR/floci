@@ -75,6 +75,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
@@ -311,9 +312,9 @@ public class AslExecutor {
                 // Update per-state context fields
                 updateStateContext(execContext, currentStateName);
 
-                boolean jsonata = isJsonata(stateDef, topLevelQueryLanguage);
+                var jsonata = isJsonata(stateDef, topLevelQueryLanguage);
                 try {
-                    StateResult stateResult = executeState(currentStateName, type, stateDef, currentInput,
+                    var stateResult = executeStateWithRetry(currentStateName, type, stateDef, currentInput,
                             history, eventId, sm, jsonata, topLevelQueryLanguage, execContext, variables);
                     addEvent(history, eventId, stateExitedEventType(type), eventId.get() - 1,
                             Map.of("name", currentStateName, "output", stateResult.output().toString()));
@@ -370,6 +371,84 @@ public class AslExecutor {
             exec.setStopDate(System.currentTimeMillis() / 1000.0);
             exec.setStatus("FAILED");
             onUpdate.accept(exec, history);
+        }
+    }
+
+    /**
+     * Executes a state, honoring its {@code Retry} policy: a {@code FailStateException} matched by
+     * a retrier re-runs the state after the retrier's backoff until its {@code MaxAttempts} are
+     * used up. Errors that no retrier matches (or that exhaust their retrier) propagate to the
+     * caller's Catch handling, preserving Retry-before-Catch order.
+     */
+    private StateResult executeStateWithRetry(String name, String type, JsonNode stateDef, JsonNode input,
+                                              List<HistoryEvent> history, AtomicLong eventId, StateMachine sm,
+                                              boolean jsonata, String topLevelQueryLanguage, JsonNode context,
+                                              ObjectNode variables) throws Exception {
+        var retriers = stateDef.path("Retry");
+        var attemptsPerRetrier = new HashMap<Integer, Integer>();
+        var attempt = 0;
+        while (true) {
+            try {
+                return executeState(name, type, stateDef, input, history, eventId, sm, jsonata,
+                        topLevelQueryLanguage, context, variables);
+            } catch (FailStateException e) {
+                var retrierIndex = findMatchingRetrier(retriers, e);
+                if (retrierIndex < 0) {
+                    throw e;
+                }
+                var retrier = retriers.get(retrierIndex);
+                var attemptsUsed = attemptsPerRetrier.merge(retrierIndex, 1, Integer::sum);
+                if (attemptsUsed > retrier.path("MaxAttempts").asInt(3)) {
+                    throw e;
+                }
+                sleepBeforeRetry(retrier, attemptsUsed);
+                attempt++;
+                updateRetryCount(context, attempt);
+            }
+        }
+    }
+
+    private int findMatchingRetrier(JsonNode retriers, FailStateException failure) {
+        if (!retriers.isArray()) {
+            return -1;
+        }
+        var error = failure.error != null ? failure.error : "States.Runtime";
+        for (var i = 0; i < retriers.size(); i++) {
+            if (catchMatches(retriers.get(i), error)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private void sleepBeforeRetry(JsonNode retrier, int attemptsUsed) throws InterruptedException {
+        var delaySeconds = retryDelaySeconds(retrier, attemptsUsed, ThreadLocalRandom.current().nextDouble());
+        if (delaySeconds > 0) {
+            Thread.sleep((long) (delaySeconds * 1000));
+        }
+    }
+
+    /**
+     * Computes the delay before a retry attempt. {@code random} is a value in [0, 1) used when
+     * the retrier declares {@code JitterStrategy: FULL}, which draws the delay uniformly between
+     * zero and the computed delay. Jitter applies after the caps, matching AWS.
+     */
+    static double retryDelaySeconds(JsonNode retrier, int attemptsUsed, double random) {
+        var interval = retrier.path("IntervalSeconds").asDouble(1.0);
+        var backoffRate = retrier.path("BackoffRate").asDouble(2.0);
+        var delaySeconds = interval * Math.pow(backoffRate, attemptsUsed - 1.0);
+        var maxDelay = retrier.path("MaxDelaySeconds").asDouble(MAX_WAIT_SECONDS);
+        // Like the Wait state, cap the delay at MAX_WAIT_SECONDS to keep emulated runs fast.
+        delaySeconds = Math.min(delaySeconds, Math.min(maxDelay, MAX_WAIT_SECONDS));
+        if ("FULL".equals(retrier.path("JitterStrategy").asText(null))) {
+            delaySeconds *= random;
+        }
+        return delaySeconds;
+    }
+
+    private void updateRetryCount(JsonNode context, int retryCount) {
+        if (context.get("State") instanceof ObjectNode state) {
+            state.put("RetryCount", retryCount);
         }
     }
 
@@ -540,7 +619,10 @@ public class AslExecutor {
             String region = extractRegionFromArn(sm.getStateMachineArn());
             LambdaFunction fn = functionStore.get(region, functionName).orElse(null);
             if (fn == null) {
-                throw new RuntimeException("Lambda function not found: " + functionName);
+                // A missing function is a task failure on AWS, so it must stay reachable for
+                // Retry and Catch instead of surfacing as States.Runtime.
+                throw new FailStateException("Lambda.ResourceNotFoundException",
+                        "Lambda function not found: " + functionName);
             }
 
             String payloadStr = objectMapper.writeValueAsString(lambdaPayload);
@@ -1443,13 +1525,16 @@ public class AslExecutor {
             // Each branch gets an isolated copy of the current variables: assignments inside a
             // branch are scoped to that branch and do not leak back to the parent after the state.
             ObjectNode branchVariables = variables.deepCopy();
+            // Each branch also gets its own copy of the context object so State.RetryCount and
+            // Task.Token writes cannot race across concurrent branches.
+            var branchContext = ((ObjectNode) context).deepCopy();
 
             // Run each branch on its own worker thread under the execution's account: the request
             // scope is thread-bound, so without this a branch's Task integrations would resolve to
             // the default account rather than the execution's.
             futures.add(executor.submit(() -> callUnderExecutionAccount(sm,
-                    () -> executeBranch(startAt, branchStates, capturedInput, sm, topLevelQueryLanguage, context,
-                            branchVariables))));
+                    () -> executeBranch(startAt, branchStates, capturedInput, sm, topLevelQueryLanguage,
+                            branchContext, branchVariables))));
         }
 
         int timeoutSeconds = stateDef.path("TimeoutSeconds").asInt(0);
@@ -1475,6 +1560,16 @@ public class AslExecutor {
         } catch (InterruptedException e) {
             futures.forEach(future -> future.cancel(true));
             Thread.currentThread().interrupt();
+            throw e;
+        } catch (ExecutionException e) {
+            futures.forEach(future -> future.cancel(true));
+            // Unwrap so a branch's FailStateException reaches the Parallel state's own
+            // Retry and Catch handling instead of surfacing as States.Runtime. An Error
+            // cause stays wrapped so the execution-level Exception handlers still
+            // publish a terminal FAILED update instead of leaving the execution RUNNING.
+            if (e.getCause() instanceof Exception exception) {
+                throw exception;
+            }
             throw e;
         } catch (Exception | Error e) {
             futures.forEach(future -> future.cancel(true));
@@ -1997,9 +2092,10 @@ public class AslExecutor {
             }
             String type = stateDef.path("Type").asText();
             boolean stateJsonata = isJsonata(stateDef, topLevelQueryLanguage);
+            updateStateContext(context, currentState);
             StateResult result;
             try {
-                result = executeState(currentState, type, stateDef, currentInput, ignored, eventId, sm,
+                result = executeStateWithRetry(currentState, type, stateDef, currentInput, ignored, eventId, sm,
                         stateJsonata, topLevelQueryLanguage, context, variables);
             } catch (FailStateException e) {
                 StateResult caught = handleCatch(stateDef, currentInput, e, stateJsonata, context, variables);

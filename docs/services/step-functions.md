@@ -51,6 +51,21 @@ Results remain in input order even when iterations finish out of order. If an it
 the Map state fails promptly, cancels its active sibling iterations, and does not start queued
 iterations.
 
+## Retry policies
+
+`Task`, `Parallel`, and `Map` states honor their `Retry` field. `ErrorEquals` matching
+follows AWS semantics, including the `States.ALL` and `States.TaskFailed` wildcards.
+`States.Runtime` is never retried. AWS defaults apply when fields are omitted
+(`MaxAttempts` 3, `IntervalSeconds` 1, `BackoffRate` 2.0), `MaxDelaySeconds` is honored,
+and each retrier keeps its own attempt counter. `Retry` is evaluated before `Catch`, and
+`$$.State.RetryCount` increments per attempt. Attempt counts, defaults, and backoff
+timing were verified against real AWS Step Functions.
+
+`JitterStrategy` supports `NONE` (the default) and `FULL`. `FULL` draws the delay
+uniformly between zero and the computed delay, as on AWS. One deviation. The delay
+between attempts is capped at 30 seconds, the same cap Floci applies to `Wait` states,
+so emulated runs stay fast.
+
 ## Configuration
 
 | Variable | Default | Description |
