@@ -164,6 +164,7 @@ public class RumService implements ResourceProvider {
                 storage,
                 customEvents,
                 deobfuscation);
+        updated.setOwnerAccountId(current.getOwnerAccountId());
         monitorStore.put(key, updated);
     }
 
@@ -192,8 +193,9 @@ public class RumService implements ResourceProvider {
         // RUM's stored model carries neither an ARN nor a region (its GetAppMonitor response has no
         // such fields), so the region is recovered from the storage key and the ARN is rebuilt here.
         // The owning account is the one captured when the monitor was created, not the account of the
-        // caller listing resources, falling back to the default account for monitors reloaded from
-        // disk (where the transient owner account was not persisted).
+        // caller listing resources. Monitors reloaded from disk carry no owner account (the field is
+        // transient), but monitorStore.keys() is already scoped to the calling account by the
+        // account-aware backend, so a monitor reachable here is owned by that caller by construction.
         List<ExplorerResource> resources = new ArrayList<>();
         for (String key : monitorStore.keys()) {
             AppMonitor monitor = monitorStore.get(key).orElse(null);
@@ -203,7 +205,7 @@ public class RumService implements ResourceProvider {
             String region = regionFromKey(key);
             String accountId = monitor.getOwnerAccountId() != null
                     ? monitor.getOwnerAccountId()
-                    : regionResolver.getDefaultAccountId();
+                    : regionResolver.getAccountId();
             String arn = AwsArnUtils.Arn.of(SERVICE, region, accountId,
                     RESOURCE_APP_MONITOR + "/" + monitor.getName()).toString();
             resources.add(new ExplorerResource(

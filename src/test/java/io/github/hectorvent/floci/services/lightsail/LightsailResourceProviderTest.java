@@ -32,7 +32,7 @@ class LightsailResourceProviderTest {
     void setUp() {
         StorageFactory storageFactory = new StorageFactory(null, null) {
             @Override
-            public <V> AccountAwareStorageBackend<V> create(String serviceName, String fileName,
+            public synchronized <V> AccountAwareStorageBackend<V> create(String serviceName, String fileName,
                     TypeReference<Map<String, V>> typeReference) {
                 return AccountAwareStorageBackend.inMemory(ACCOUNT);
             }

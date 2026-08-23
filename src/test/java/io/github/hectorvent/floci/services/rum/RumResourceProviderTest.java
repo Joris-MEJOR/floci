@@ -91,6 +91,21 @@ class RumResourceProviderTest {
             assertEquals("111111111111", monitor.owningAccountId());
             assertEquals("arn:aws:rum:" + REGION + ":111111111111:appmonitor/web", monitor.arn());
         }
+
+        @Test
+        void updateKeepsTheOwnerAccountCapturedAtCreation() {
+            MutableAccountResolver resolver = new MutableAccountResolver();
+            RumService svc = new RumService(new InMemoryStorage<>(), resolver);
+
+            resolver.accountId = "111111111111";
+            svc.createAppMonitor(REGION, monitorRequest("web", "example.com"));
+            svc.updateAppMonitor(REGION, "web", monitorRequest("web", "updated.example.com"));
+
+            resolver.accountId = "999999999999";
+            ExplorerResource monitor = only(svc.getResources(), "rum:appmonitor");
+            assertEquals("111111111111", monitor.owningAccountId());
+            assertEquals("arn:aws:rum:" + REGION + ":111111111111:appmonitor/web", monitor.arn());
+        }
     }
 
     private static final class MutableAccountResolver extends RegionResolver {

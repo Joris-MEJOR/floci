@@ -49,9 +49,15 @@ class ResourceExplorer2Test {
 
     @AfterAll
     static void cleanup() {
-        if (client != null) client.close();
-        if (altRegionClient != null) altRegionClient.close();
-        if (s3 != null) s3.close();
+        if (client != null) {
+            client.close();
+        }
+        if (altRegionClient != null) {
+            altRegionClient.close();
+        }
+        if (s3 != null) {
+            s3.close();
+        }
     }
 
     // -----------------------------------------------------------------------

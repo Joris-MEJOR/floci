@@ -1376,7 +1376,7 @@ class ResourceExplorer2IntegrationTest {
 
         @Test
         void listViewsHasNextTokenWhenNeeded() {
-            String tempView = trackView(given()
+            trackView(given()
                 .header("Authorization", AUTH)
                 .contentType("application/json")
                 .body("{\"ViewName\": \"temp-pagination-view\"}")
@@ -1680,15 +1680,14 @@ class ResourceExplorer2IntegrationTest {
             // AWS Search treats free-form text as a narrowing filter: resources whose
             // attributes don't match the keyword are excluded. A keyword that matches
             // nothing must therefore return zero resources — not the full set.
-            int totalCount = given()
+            given()
                 .header("Authorization", AUTH)
                 .contentType("application/json")
                 .body("{\"QueryString\": \"\", \"MaxResults\": 1000}")
             .when()
                 .post("/Search")
             .then()
-                .body("Resources.size()", greaterThan(0))
-                .extract().path("Resources.size()");
+                .body("Resources.size()", greaterThan(0));
 
             given()
                 .header("Authorization", AUTH)
@@ -1911,7 +1910,7 @@ class ResourceExplorer2IntegrationTest {
         @Test
         void createIndexReturns200WithCreatingState() {
             // AWS botocore service-2.json: CreateIndex responseCode = 200.
-            String arn = trackIndex(authFor("ca-central-1"), given()
+            trackIndex(authFor("ca-central-1"), given()
                 .header("Authorization", authFor("ca-central-1"))
                 .contentType("application/json")
                 .body("{}")
@@ -1928,7 +1927,7 @@ class ResourceExplorer2IntegrationTest {
         @Test
         void createViewResponseViewNodeHasNoTagsField() {
             // AWS SDK View shape does NOT include Tags — Tags is only on GetViewResponse top-level.
-            String viewArn = trackView(given()
+            trackView(given()
                 .header("Authorization", AUTH)
                 .contentType("application/json")
                 .body("{\"ViewName\": \"fidelity-notags-view\", \"Tags\": {\"owner\": \"team-a\"}}")

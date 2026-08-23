@@ -32,7 +32,8 @@ public class AppMonitor {
     // The account that created this monitor, captured so Resource Explorer 2 can report the true
     // owning account in the reconstructed ARN. RUM's GetAppMonitor response has no ARN or account
     // field, so this is @JsonIgnore'd to keep it out of the API body; it is likewise not persisted,
-    // so getResources() falls back to the default account for monitors reloaded from disk.
+    // so getResources() recovers the owner from the account-scoped storage key for monitors
+    // reloaded from disk.
     @JsonIgnore
     private String ownerAccountId;
 
