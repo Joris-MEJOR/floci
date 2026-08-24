@@ -21,46 +21,95 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           # CONTRIBUTING.md and AGENTS.md both state:
           #
           #   "Do not include Co-Authored-By trailers for AI tools in commit
           #    messages. Attribution should be limited to human contributors."
           #
-          # This job enforces that. It deliberately does NOT reject
-          # Co-authored-by outright: human co-authors are legitimate and GitHub
-          # adds the trailer on every squash merge that carries review commits,
-          # so main already holds ~125 of them.
+          # This job enforces that. It does NOT try to recognise an AI by its
+          # name. Names are not a usable signal in either direction: Claude and
+          # Devin are ordinary human given names, so matching on them rejects
+          # real contributors, while any list of product names is stale the
+          # moment a new agent ships.
           #
-          # Matching is anchored on the address a tool commits from, plus
-          # product names no person is called. A bare substring match on the
-          # tool name is NOT safe: Claude and Devin are ordinary human given
-          # names, so "claude" alone would reject a contributor the convention
-          # explicitly allows.
+          # Instead a co-author is rejected only on evidence that the identity
+          # is not a person:
+          #
+          #   1. Its GitHub privacy address resolves to an account of type Bot.
+          #      GitHub is the authority here, and agents commit through GitHub
+          #      Apps, so this keeps working for tools that do not exist yet.
+          #   2. Its address is a noreply@ mailbox on some other domain - a
+          #      fabricated, uncontactable address. No person's git identity is
+          #      noreply@.
+          #
+          # A false positive costs far more than a false negative here: a
+          # missed trailer is untidy attribution, but a blocked contributor is
+          # a person turned away by a linter. So anything this cannot resolve
+          # is allowed through, and a GitHub API failure never fails the build.
           #
           # Merge commits are skipped via --no-merges, matching the
           # Conventional Commits job.
 
-          # Addresses these tools commit from. noreply@anthropic.com rather
-          # than the bare domain, so a person working at one of these companies
-          # is not caught by their own work email.
-          AI_EMAIL='noreply@anthropic\.com|devin-ai-integration|\+copilot@users\.noreply\.github\.com|noreply@openai\.com|cursoragent@cursor\.com'
-
-          # Display names, as a backstop for tools not in the address list.
-          # Every entry is a phrase no human display name takes.
-          AI_NAME='claude (code|opus|sonnet|haiku)|devin ai|copilot autofix|github copilot|cursor agent|openai codex|chatgpt|gemini code assist|\baider\b|powered by ai'
-
-          # A tool name in the display name only counts when the address is the
-          # matching vendor's, which catches "Claude <claude@anthropic.com>"
-          # while leaving "Claude Dupont <claude.dupont@example.fr>" alone.
-          AI_TOKEN='claude|copilot|devin|codex|cursor|gemini|chatgpt'
-          AI_VENDOR='@anthropic\.com|@openai\.com|@cursor\.(com|sh)|@users\.noreply\.github\.com'
+          # Bot accounts that may legitimately co-author. Keep this short.
+          ALLOWED_BOTS='dependabot[bot]'
 
           # Trailer keys and generator markers that are AI-only by construction.
+          # These are literal strings no person writes, not identity matching.
           AI_ONLY_TRAILER='^(claude-session|codex-session|chatgpt-session):'
           AI_MARKER='(Generated with \[Claude Code\]|🤖 Generated with)'
 
+          CACHE=$(mktemp)
           FAILED=0
+
+          # Prints "bot <login>" if the address belongs to a bot account,
+          # "noreply" for a fabricated noreply mailbox, nothing otherwise.
+          classify() {
+            local email="$1" local_part login id cached type
+            local_part=${email%@*}
+
+            case "$email" in
+              *@users.noreply.github.com)
+                case "$local_part" in
+                  *+*) id=${local_part%%+*}; login=${local_part#*+} ;;
+                  *)   id=""; login=$local_part ;;
+                esac
+
+                # A [bot] suffix is GitHub's own convention; no lookup needed.
+                case "$login" in
+                  *'[bot]'*) printf 'bot %s' "$login"; return ;;
+                esac
+
+                cached=$(grep -m1 "^${id}|${login} " "$CACHE" 2>/dev/null || true)
+                if [ -n "$cached" ]; then
+                  type=${cached##* }
+                else
+                  if [ -n "$id" ]; then
+                    type=$(gh api "user/$id" --jq .type 2>/dev/null || echo "")
+                  else
+                    type=$(gh api "users/$login" --jq .type 2>/dev/null || echo "")
+                  fi
+                  # Unresolvable (deleted account, API trouble) is not evidence.
+                  [ -z "$type" ] && type="Unknown"
+                  printf '%s|%s %s\n' "$id" "$login" "$type" >> "$CACHE"
+                fi
+
+                if [ "$type" = "Bot" ]; then
+                  printf 'bot %s' "$login"
+                fi
+                ;;
+              *)
+                # noreply@example.com, but not GitHub's own privacy domain.
+                case "$local_part" in
+                  noreply|no-reply) printf 'noreply' ;;
+                esac
+                ;;
+            esac
+            # Never let a "this is a person" verdict look like a failure:
+            # the job runs under set -e and this is called in a $( ).
+            return 0
+          }
 
           for sha in $(git log --no-merges --format=%H "$BASE_SHA".."$HEAD_SHA"); do
             subject=$(git show -s --format=%s "$sha")
@@ -71,23 +120,22 @@ jobs:
 
               case "$lower" in
                 co-authored-by:*)
-                  value=${lower#co-authored-by:}
-                  email=$(printf '%s' "$value" | sed -n 's/.*<\(.*\)>.*/\1/p')
-                  name=$(printf '%s' "$value" | sed 's/<[^>]*>//' | sed 's/^ *//; s/ *$//')
+                  email=$(printf '%s' "$lower" | sed -n 's/.*<\(.*\)>.*/\1/p')
+                  [ -z "$email" ] && continue
 
-                  hit=0
-                  if [ -n "$email" ] && printf '%s' "$email" | grep -qE "$AI_EMAIL"; then
-                    hit=1
-                  elif printf '%s' "$name" | grep -qE "$AI_NAME"; then
-                    hit=1
-                  elif printf '%s' "$name" | grep -qE "$AI_TOKEN" \
-                       && [ -n "$email" ] && printf '%s' "$email" | grep -qE "$AI_VENDOR"; then
-                    hit=1
-                  fi
-
-                  if [ "$hit" -eq 1 ]; then
-                    offending="${offending}${line}"$'\n'
-                  fi
+                  verdict=$(classify "$email")
+                  case "$verdict" in
+                    bot\ *)
+                      login=${verdict#bot }
+                      # -F because a login like dependabot[bot] is not a pattern.
+                      if ! printf '%s\n' "$ALLOWED_BOTS" | grep -Fxq "$login"; then
+                        offending="${offending}${line}    <- ${login} is a bot account"$'\n'
+                      fi
+                      ;;
+                    noreply)
+                      offending="${offending}${line}    <- noreply address, not a contactable person"$'\n'
+                      ;;
+                  esac
                   ;;
                 *)
                   offending="${offending}${line}"$'\n'
@@ -115,9 +163,8 @@ jobs:
             echo "  CONTRIBUTING.md: \"Do not include Co-Authored-By trailers for AI tools in"
             echo "  commit messages. Attribution should be limited to human contributors.\""
             echo ""
-            echo "  Human co-authors are fine — only trailers naming an AI tool are rejected."
-            echo "  If this fired on a person, that is a bug in the matcher and not your commit:"
-            echo "  please say so on the pull request."
+            echo "  Co-authoring a person is fine and is never rejected — this only fires when"
+            echo "  the address belongs to a bot account or is a noreply mailbox."
             echo ""
             echo "  To fix a single commit:"
             echo "    git commit --amend            # delete the trailer lines, save"
