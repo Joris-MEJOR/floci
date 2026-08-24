@@ -1,0 +1,104 @@
+name: AI Attribution
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-trailers:
+    name: Commits omit AI attribution trailers
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Check commit trailers
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # CONTRIBUTING.md and AGENTS.md both state:
+          #
+          #   "Do not include Co-Authored-By trailers for AI tools in commit
+          #    messages. Attribution should be limited to human contributors."
+          #
+          # This job enforces that. It deliberately does NOT reject
+          # Co-authored-by outright: human co-authors are legitimate and GitHub
+          # adds the trailer on every squash merge that carries review commits,
+          # so main already holds ~125 of them. Only trailers naming an AI tool
+          # are rejected, plus the session/marker lines such tools add on their
+          # own.
+          #
+          # Remove an entry from AI_IDENTITY to start allowing that tool.
+          # Merge commits are skipped via --no-merges, matching the
+          # Conventional Commits job.
+
+          AI_IDENTITY='claude|copilot|cursor|devin|codex|chatgpt|openai|anthropic|gemini|aider|windsurf'
+          AI_ONLY_TRAILER='^(claude-session|codex-session|chatgpt-session):'
+          AI_MARKER='(Generated with \[Claude Code\]|🤖 Generated with)'
+
+          FAILED=0
+
+          for sha in $(git log --no-merges --format=%H "$BASE_SHA".."$HEAD_SHA"); do
+            subject=$(git show -s --format=%s "$sha")
+            offending=""
+
+            while IFS= read -r line; do
+              lower=$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')
+              case "$lower" in
+                co-authored-by:*)
+                  # A co-author is only a problem when it names an AI tool.
+                  if printf '%s' "$lower" | grep -qE "^co-authored-by:.*($AI_IDENTITY)"; then
+                    offending="${offending}${line}"$'\n'
+                  fi
+                  ;;
+                *)
+                  # Session trailers and generator markers are AI-only by construction.
+                  offending="${offending}${line}"$'\n'
+                  ;;
+              esac
+            done < <(git show -s --format=%B "$sha" | grep -iE "^co-authored-by:|$AI_ONLY_TRAILER|$AI_MARKER" || true)
+
+            if [ -n "$offending" ]; then
+              echo "::error::Commit carries AI attribution: $sha $subject"
+              echo ""
+              echo "  Commit: $sha"
+              echo "  $subject"
+              echo ""
+              echo "  Offending line(s):"
+              printf '%s' "$offending" | sed 's/^/    /'
+              echo ""
+              FAILED=1
+            else
+              echo "ok: $sha $subject"
+            fi
+          done
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo ""
+            echo "  CONTRIBUTING.md: \"Do not include Co-Authored-By trailers for AI tools in"
+            echo "  commit messages. Attribution should be limited to human contributors.\""
+            echo ""
+            echo "  Human co-authors are fine — only trailers naming an AI tool are rejected."
+            echo ""
+            echo "  To fix a single commit:"
+            echo "    git commit --amend            # delete the trailer lines, save"
+            echo "    git push --force-with-lease"
+            echo ""
+            echo "  To fix several:"
+            echo "    git rebase --root -x 'git commit --amend --no-edit'"
+            echo "  or rewrite the messages with:"
+            echo "    git filter-branch --msg-filter \\"
+            echo "      'grep -viE \"^co-authored-by:.*(claude|copilot|cursor|devin|codex)|^claude-session:\"' \\"
+            echo "      \"\$BASE_SHA\"..HEAD"
+            echo ""
+            echo "  Configure your agent not to add them in the first place — for Claude Code,"
+            echo "  set includeCoAuthoredBy: false in .claude/settings.json."
+          fi
+
+          exit $FAILED
