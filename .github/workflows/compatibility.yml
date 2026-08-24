@@ -10,6 +10,7 @@ on:
       - 'docker/entrypoint.sh'
       - 'docker/localstack-parity.sh'
       - 'compatibility-tests/**'
+      - '.github/ci/compat-timing-report.py'
       - '.github/workflows/compatibility.yml'
 
 permissions:
