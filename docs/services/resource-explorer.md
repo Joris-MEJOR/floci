@@ -155,6 +155,12 @@ results carry no tag data.
 - **A stale `NextToken` returns an empty page.** A token pointing past a result set that shrank
   between calls is answered with an empty page rather than an error, which is how AWS handles a
   replayed token.
+- **Paginated results are ordered by ARN.** AWS treats `NextToken` as opaque and documents no
+  result order — `Search` is relevance-ranked. floci's token is an offset into a list rebuilt on
+  every call from provider and storage iteration, neither of which is ordered, so the results are
+  sorted by ARN before the page is cut. Without that total order the second page would index into
+  a differently arranged list and silently drop or repeat resources. The same ordering applies to
+  `ListIndexes`, `ListViews` and `ListSupportedResourceTypes`.
 - **The default view is stored, not inferred.** The per-Region default is persisted on its own
   rather than derived from a view's name, so `DisassociateDefaultView` survives a restart.
 - **IAM tags are indexed.** AWS does not index tags attached to IAM users and roles; floci does,

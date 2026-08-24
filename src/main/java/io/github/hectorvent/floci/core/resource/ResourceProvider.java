@@ -45,7 +45,8 @@ public interface ResourceProvider {
      * <p>
      * Build the list from live storage rather
      * than caching. Return an empty list when the service holds nothing; never return {@code null}.
-     * Ordering is not significant — the service applies its own pagination.
+     * Ordering is not significant — Resource Explorer sorts by ARN before paginating, so an
+     * unordered store scan is safe to return as-is.
      */
     List<ExplorerResource> getResources();
 

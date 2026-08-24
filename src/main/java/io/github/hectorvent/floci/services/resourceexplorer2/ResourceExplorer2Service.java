@@ -35,6 +35,7 @@ import org.jboss.logging.Logger;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -191,6 +192,7 @@ public class ResourceExplorer2Service {
                 .filter(i -> type == null || type.equalsIgnoreCase(i.type().name()))
                 .filter(i -> regions == null || regions.isEmpty()
                         || regions.stream().anyMatch(r -> r.equalsIgnoreCase(i.region())))
+                .sorted(Comparator.comparing(Index::arn))
                 .toList();
     }
 
@@ -260,6 +262,14 @@ public class ResourceExplorer2Service {
 
     private record Paginated<T>(List<T> items, String nextToken) {}
 
+    /**
+     * Slices one page out of {@code all} at the offset carried by {@code nextToken}.
+     * <p>
+     * The offset only identifies the same element across two calls if {@code all} is in a
+     * deterministic order, so every caller sorts on a unique key before calling this. The lists
+     * come from {@code StorageBackend.scan} or from iterating {@code Instance<ResourceProvider>},
+     * neither of which promises an order.
+     */
     private <T> Paginated<T> paginate(List<T> all, Integer maxResults, String nextToken, int defaultMax) {
         int effectiveMax = (maxResults != null && maxResults > 0) ? maxResults : defaultMax;
         int offset = Math.min(decodeNextToken(nextToken), all.size());
@@ -374,6 +384,7 @@ public class ResourceExplorer2Service {
         List<String> all = viewStore.scan(_ -> true).stream()
                 .filter(v -> region.equals(regionOf(v)))
                 .map(View::viewArn)
+                .sorted()
                 .toList();
         Paginated<String> page = paginate(all, maxResults, nextToken, 100);
 
@@ -538,6 +549,11 @@ public class ResourceExplorer2Service {
 
     /**
      * Gathers every provider's resources, applies {@code combined}, and returns one page.
+     * <p>
+     * Sorted by ARN before slicing. {@code NextToken} is an offset, and the list is rebuilt on
+     * every call by iterating {@code Instance<ResourceProvider>} and each provider's store scan —
+     * neither ordered — so without a total order over a unique key the second page would index
+     * into a differently arranged list and silently drop or repeat resources.
      *
      * @param resultCap the maximum number of matching resources the operation returns across all
      *     pages. This is a real per-operation difference in the AWS API, not an internal tuning knob:
@@ -563,6 +579,7 @@ public class ResourceExplorer2Service {
         Set<String> taggableResourceTypes = taggableResourceTypes();
         List<ExplorerResource> filtered = all.stream()
                 .filter(r -> ResourceFilter.matches(r, combined, taggableResourceTypes))
+                .sorted(Comparator.comparing(ExplorerResource::arn))
                 .toList();
         int uncappedTotal = filtered.size();
         PageBounds b = pageBounds(filtered.size(), maxResults, nextToken, resultCap);
@@ -611,7 +628,9 @@ public class ResourceExplorer2Service {
         for (SupportedResourceType t : all) {
             deduplicated.put(t.resourceType(), t);
         }
-        List<SupportedResourceType> list = new ArrayList<>(deduplicated.values());
+        List<SupportedResourceType> list = deduplicated.values().stream()
+                .sorted(Comparator.comparing(SupportedResourceType::resourceType))
+                .toList();
         Paginated<SupportedResourceType> page = paginate(list, maxResults, nextToken, 100);
 
         ObjectNode result = objectMapper.createObjectNode();
