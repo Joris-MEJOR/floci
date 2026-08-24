@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -30,15 +30,33 @@ jobs:
           # This job enforces that. It deliberately does NOT reject
           # Co-authored-by outright: human co-authors are legitimate and GitHub
           # adds the trailer on every squash merge that carries review commits,
-          # so main already holds ~125 of them. Only trailers naming an AI tool
-          # are rejected, plus the session/marker lines such tools add on their
-          # own.
+          # so main already holds ~125 of them.
           #
-          # Remove an entry from AI_IDENTITY to start allowing that tool.
+          # Matching is anchored on the address a tool commits from, plus
+          # product names no person is called. A bare substring match on the
+          # tool name is NOT safe: Claude and Devin are ordinary human given
+          # names, so "claude" alone would reject a contributor the convention
+          # explicitly allows.
+          #
           # Merge commits are skipped via --no-merges, matching the
           # Conventional Commits job.
 
-          AI_IDENTITY='claude|copilot|cursor|devin|codex|chatgpt|openai|anthropic|gemini|aider|windsurf'
+          # Addresses these tools commit from. noreply@anthropic.com rather
+          # than the bare domain, so a person working at one of these companies
+          # is not caught by their own work email.
+          AI_EMAIL='noreply@anthropic\.com|devin-ai-integration|\+copilot@users\.noreply\.github\.com|noreply@openai\.com|cursoragent@cursor\.com'
+
+          # Display names, as a backstop for tools not in the address list.
+          # Every entry is a phrase no human display name takes.
+          AI_NAME='claude (code|opus|sonnet|haiku)|devin ai|copilot autofix|github copilot|cursor agent|openai codex|chatgpt|gemini code assist|\baider\b|powered by ai'
+
+          # A tool name in the display name only counts when the address is the
+          # matching vendor's, which catches "Claude <claude@anthropic.com>"
+          # while leaving "Claude Dupont <claude.dupont@example.fr>" alone.
+          AI_TOKEN='claude|copilot|devin|codex|cursor|gemini|chatgpt'
+          AI_VENDOR='@anthropic\.com|@openai\.com|@cursor\.(com|sh)|@users\.noreply\.github\.com'
+
+          # Trailer keys and generator markers that are AI-only by construction.
           AI_ONLY_TRAILER='^(claude-session|codex-session|chatgpt-session):'
           AI_MARKER='(Generated with \[Claude Code\]|🤖 Generated with)'
 
@@ -50,15 +68,28 @@ jobs:
 
             while IFS= read -r line; do
               lower=$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')
+
               case "$lower" in
                 co-authored-by:*)
-                  # A co-author is only a problem when it names an AI tool.
-                  if printf '%s' "$lower" | grep -qE "^co-authored-by:.*($AI_IDENTITY)"; then
+                  value=${lower#co-authored-by:}
+                  email=$(printf '%s' "$value" | sed -n 's/.*<\(.*\)>.*/\1/p')
+                  name=$(printf '%s' "$value" | sed 's/<[^>]*>//' | sed 's/^ *//; s/ *$//')
+
+                  hit=0
+                  if [ -n "$email" ] && printf '%s' "$email" | grep -qE "$AI_EMAIL"; then
+                    hit=1
+                  elif printf '%s' "$name" | grep -qE "$AI_NAME"; then
+                    hit=1
+                  elif printf '%s' "$name" | grep -qE "$AI_TOKEN" \
+                       && [ -n "$email" ] && printf '%s' "$email" | grep -qE "$AI_VENDOR"; then
+                    hit=1
+                  fi
+
+                  if [ "$hit" -eq 1 ]; then
                     offending="${offending}${line}"$'\n'
                   fi
                   ;;
                 *)
-                  # Session trailers and generator markers are AI-only by construction.
                   offending="${offending}${line}"$'\n'
                   ;;
               esac
@@ -85,6 +116,8 @@ jobs:
             echo "  commit messages. Attribution should be limited to human contributors.\""
             echo ""
             echo "  Human co-authors are fine — only trailers naming an AI tool are rejected."
+            echo "  If this fired on a person, that is a bug in the matcher and not your commit:"
+            echo "  please say so on the pull request."
             echo ""
             echo "  To fix a single commit:"
             echo "    git commit --amend            # delete the trailer lines, save"
@@ -92,10 +125,6 @@ jobs:
             echo ""
             echo "  To fix several:"
             echo "    git rebase --root -x 'git commit --amend --no-edit'"
-            echo "  or rewrite the messages with:"
-            echo "    git filter-branch --msg-filter \\"
-            echo "      'grep -viE \"^co-authored-by:.*(claude|copilot|cursor|devin|codex)|^claude-session:\"' \\"
-            echo "      \"\$BASE_SHA\"..HEAD"
             echo ""
             echo "  Configure your agent not to add them in the first place — for Claude Code,"
             echo "  set includeCoAuthoredBy: false in .claude/settings.json."
