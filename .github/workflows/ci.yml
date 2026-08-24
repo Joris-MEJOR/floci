@@ -33,7 +33,18 @@ jobs:
         with:
           java-version: '25'
           distribution: 'temurin'
-          cache: maven
+
+      # setup-java's built-in `cache: maven` never actually saves a cache on this action
+      # version - every run restores nothing ("maven cache is not found") and then fails to
+      # save with "Path Validation Error: Path(s) specified in the action for caching do(es)
+      # not exist", so every run has been resolving all dependencies cold. Using actions/cache
+      # directly instead, which is the same mechanism setup-java's option wraps.
+      - uses: actions/cache@v6.1.0
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            maven-${{ runner.os }}-
 
       - name: Run tests
         run: mvn test -B
