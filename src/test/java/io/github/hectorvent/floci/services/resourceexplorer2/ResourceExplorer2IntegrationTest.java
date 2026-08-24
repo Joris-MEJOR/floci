@@ -1044,11 +1044,14 @@ class ResourceExplorer2IntegrationTest {
         @Test
         @Order(3)
         void dynamoDbTagResourceUpdatesResourceExplorer() {
+            // Scoped to the caller's Region: ListResources spans every Region the view covers, but
+            // the TagResource below resolves the table in the request's Region, so an out-of-Region
+            // ARN would be reported as not found.
             String tableArn = given()
                 .header("Authorization", AUTH)
                 .contentType("application/json")
                 .body("""
-                    {"Filters": {"FilterString": "resourcetype:dynamodb:table"}}
+                    {"Filters": {"FilterString": "resourcetype:dynamodb:table region:us-east-1"}}
                     """)
             .when()
                 .post("/ListResources")
