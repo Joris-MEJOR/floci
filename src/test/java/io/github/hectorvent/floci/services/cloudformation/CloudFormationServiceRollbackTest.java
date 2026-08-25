@@ -24,6 +24,7 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import io.github.hectorvent.floci.core.common.ResetCoordinator;
 
 /**
  * Covers rollback cleanup when another actor removes a resource after its create succeeded.
@@ -49,7 +50,7 @@ class CloudFormationServiceRollbackTest {
                 config,
                 mock(RegionResolver.class),
                 Clock.systemUTC(),
-                new InMemoryStorageFactory());
+                new InMemoryStorageFactory(), new ResetCoordinator());
     }
 
     @Test

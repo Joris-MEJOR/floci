@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationResourceProvisioner;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.GroupIdentifier;
@@ -29,9 +30,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import io.github.hectorvent.floci.core.common.ResetCoordinator;
 
 @ApplicationScoped
-public class CloudControlService {
+public class CloudControlService implements Resettable {
 
     /** Cloud Control has no account context in the request; Floci's default test account. */
     private static final String ACCOUNT = "000000000000";
@@ -55,6 +57,15 @@ public class CloudControlService {
     /** RequestToken → ProgressEvent. Cloud Control is async; clients poll by token. */
     private final Map<String, ProgressEvent> requests = new ConcurrentHashMap<>();
     /** Token insertion order, so the map can be bounded without losing in-flight requests. */
+    /**
+     * Incremented by {@link #clear()}. CreateResource provisions on a background thread, so a
+     * reset that merely cleared the maps would let an operation started beforehand write its
+     * result back afterwards and resurrect a resource the reset removed. Work captures the epoch
+     * at submit time and drops its writes if it no longer matches. Interrupting is not an option
+     * here — provisioning can be long, and a reset must not block on it.
+     */
+    private final ResetCoordinator resetCoordinator;
+
     private final java.util.concurrent.ConcurrentLinkedQueue<String> requestOrder =
             new java.util.concurrent.ConcurrentLinkedQueue<>();
     /**
@@ -81,12 +92,13 @@ public class CloudControlService {
     @Inject
     public CloudControlService(S3Service s3Service, Ec2Service ec2Service,
                                IamService iamService, CloudFormationResourceProvisioner provisioner,
-                               ObjectMapper mapper) {
+                               ObjectMapper mapper, ResetCoordinator resetCoordinator) {
         this.s3Service = s3Service;
         this.ec2Service = ec2Service;
         this.iamService = iamService;
         this.provisioner = provisioner;
         this.mapper = mapper;
+        this.resetCoordinator = resetCoordinator;
     }
 
     /**
@@ -111,25 +123,32 @@ public class CloudControlService {
         String token = UUID.randomUUID().toString();
         ProgressEvent pending = new ProgressEvent(typeName, null, token, "CREATE", "IN_PROGRESS", null, null);
         record(pending);
+        long epoch = resetCoordinator.currentEpoch();
         executor.submit(() -> {
             try {
                 var resource = provisioner.provisionStandalone(typeName, props, region, ACCOUNT);
-                if (resource == null || resource.getPhysicalId() == null) {
-                    record(pending.failed("CreateResource is not supported for " + typeName + "."));
-                } else {
-                    String model = resourceModel(region, typeName, resource.getPhysicalId(), props);
-                    // Kept so GetResource can read back a type the read side does not list, and so
-                    // DeleteResource has the attributes its delete path needs.
-                    created.put(createdKey(region, typeName, resource.getPhysicalId()),
-                            new CreatedResource(
-                                    resource.getAttributes() == null
-                                            ? Map.of() : Map.copyOf(resource.getAttributes()),
-                                    model));
-                    record(new ProgressEvent(typeName, resource.getPhysicalId(),
-                            token, "CREATE", "SUCCESS", null, model));
-                }
+                // The staleness check and the state writes are one atomic commit under the
+                // coordinator's read lock: a reset can no longer interleave between them and
+                // resurrect pre-reset request status or created-resource state.
+                resetCoordinator.applyIfCurrent(epoch, () -> {
+                    if (resource == null || resource.getPhysicalId() == null) {
+                        record(pending.failed("CreateResource is not supported for " + typeName + "."));
+                    } else {
+                        String model = resourceModel(region, typeName, resource.getPhysicalId(), props);
+                        // Kept so GetResource can read back a type the read side does not list, and so
+                        // DeleteResource has the attributes its delete path needs.
+                        created.put(createdKey(region, typeName, resource.getPhysicalId()),
+                                new CreatedResource(
+                                        resource.getAttributes() == null
+                                                ? Map.of() : Map.copyOf(resource.getAttributes()),
+                                        model));
+                        record(new ProgressEvent(typeName, resource.getPhysicalId(),
+                                token, "CREATE", "SUCCESS", null, model));
+                    }
+                });
             } catch (Exception e) {
-                record(pending.failed(e.getMessage() == null ? e.toString() : e.getMessage()));
+                resetCoordinator.applyIfCurrent(epoch, () ->
+                        record(pending.failed(e.getMessage() == null ? e.toString() : e.getMessage())));
             }
         });
         return pending;
@@ -436,4 +455,14 @@ public class CloudControlService {
     }
 
     public record ResourceDescription(String identifier, String properties) {}
+
+    /**
+     * In-flight request progress and the created-resource index are plain maps, so a reset would otherwise leave GetResourceRequestStatus reporting resources that no longer exist.
+     */
+    @Override
+    public void clear() {
+        requests.clear();
+        requestOrder.clear();
+        created.clear();
+    }
 }

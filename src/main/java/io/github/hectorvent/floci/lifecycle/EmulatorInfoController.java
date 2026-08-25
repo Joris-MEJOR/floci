@@ -10,16 +10,22 @@ import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.core.common.ResetCoordinator;
 import io.github.hectorvent.floci.core.common.Resettable;
 import jakarta.enterprise.inject.Instance;
 import jakarta.ws.rs.POST;
 
 import java.util.LinkedHashMap;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
+import org.jboss.logging.Logger;
 
 @Path("{prefix:(_floci|_localstack)}")
 @Produces(MediaType.APPLICATION_JSON)
 public class EmulatorInfoController {
+
+    private static final Logger LOG = Logger.getLogger(EmulatorInfoController.class);
 
     private final ServiceRegistry serviceRegistry;
     private final InitLifecycleState initLifecycleState;
@@ -27,16 +33,19 @@ public class EmulatorInfoController {
 
     private final StorageFactory storageFactory;
     private final Instance<Resettable> resettables;
+    private final ResetCoordinator resetCoordinator;
 
     @Inject
     public EmulatorInfoController(ServiceRegistry serviceRegistry,
                                   InitLifecycleState initLifecycleState,
                                   StorageFactory storageFactory,
-                                  Instance<Resettable> resettables) {
+                                  Instance<Resettable> resettables,
+                                  ResetCoordinator resetCoordinator) {
         this.serviceRegistry = serviceRegistry;
         this.initLifecycleState = initLifecycleState;
         this.storageFactory = storageFactory;
         this.resettables = resettables;
+        this.resetCoordinator = resetCoordinator;
         this.version = resolveVersion();
     }
 
@@ -93,7 +102,11 @@ public class EmulatorInfoController {
     @POST
     @Path("/state/reset")
     public Response reset() {
-        performReset();
+        List<String> failed = performReset();
+        if (!failed.isEmpty()) {
+            return Response.status(500)
+                    .entity(Map.of("status", "PARTIAL", "failed", failed)).build();
+        }
         return Response.ok(Map.of("status", "OK")).build();
     }
 
@@ -103,11 +116,37 @@ public class EmulatorInfoController {
         return reset();
     }
 
-    private void performReset() {
-        for (Resettable r : resettables) {
-            r.clear();
-        }
-        storageFactory.clearAll();
+    /**
+     * Clearing the services and clearing storage are one transition, not two steps. Background
+     * work landing between them would otherwise write state back after its service was cleared
+     * but while the storage it reads is still populated, so the whole sequence runs inside
+     * {@link ResetCoordinator#runReset} and fenced workers cannot interleave with it.
+     */
+    private List<String> performReset() {
+        // Containment: every clear() is attempted and storage is always cleared, so one failing
+        // service cannot abort the rest of the transition (CDI gives the loop no useful order to
+        // fail early in). Failures are collected and reported as a 500 PARTIAL instead of the
+        // pre-containment behavior of returning OK for a reset that silently did not finish.
+        List<String> failed = new ArrayList<>();
+        resetCoordinator.runReset(() -> {
+            for (Resettable r : resettables) {
+                try {
+                    r.clear();
+                } catch (RuntimeException e) {
+                    // CDI hands this loop client proxies; report the bean class, not the proxy.
+                    String name = r.getClass().getSimpleName().replace("_ClientProxy", "");
+                    failed.add(name);
+                    LOG.errorv(e, "State reset: {0}.clear() failed", name);
+                }
+            }
+            try {
+                storageFactory.clearAll();
+            } catch (RuntimeException e) {
+                failed.add("StorageFactory");
+                LOG.error("State reset: storage clearAll failed", e);
+            }
+        });
+        return failed;
     }
 
     static String resolveVersion() {

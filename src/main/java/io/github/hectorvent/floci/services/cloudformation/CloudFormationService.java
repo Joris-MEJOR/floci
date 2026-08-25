@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.quarkus.arc.Arc;
@@ -38,12 +39,13 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import io.github.hectorvent.floci.core.common.ResetCoordinator;
 
 /**
  * CloudFormation stack lifecycle management — Create, Update, Delete stacks via ChangeSets.
  */
 @ApplicationScoped
-public class CloudFormationService {
+public class CloudFormationService implements Resettable {
 
     private static final Logger LOG = Logger.getLogger(CloudFormationService.class);
 
@@ -52,6 +54,18 @@ public class CloudFormationService {
     // Global exports registry: region:exportName -> exportValue
     private final ConcurrentHashMap<String, String> exports = new ConcurrentHashMap<>();
     private final ExecutorService executor = Executors.newCachedThreadPool();
+
+    /**
+     * Stack provisioning runs on {@link #executor}, so a reset that only cleared the maps would let
+     * an execution started beforehand register its exports and nested stacks afterwards, resurrecting
+     * state the reset removed. {@link #clear()} cancels those executions and waits briefly for them
+     * to stop; the shared {@link ResetCoordinator} epoch fences any write that still slips
+     * through, and its read lock makes each fenced commit atomic with its staleness check.
+     */
+    private final java.util.Set<java.util.concurrent.Future<?>> inFlight =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    private final ResetCoordinator resetCoordinator;
 
     private final CloudFormationResourceProvisioner provisioner;
     private final S3Service s3Service;
@@ -73,7 +87,8 @@ public class CloudFormationService {
     public CloudFormationService(CloudFormationResourceProvisioner provisioner, S3Service s3Service,
                                  ObjectMapper objectMapper, EmulatorConfig config,
                                  RegionResolver regionResolver, Clock clock,
-                                 StorageFactory storageFactory) {
+                                 StorageFactory storageFactory, ResetCoordinator resetCoordinator) {
+        this.resetCoordinator = resetCoordinator;
         this.provisioner = provisioner;
         this.s3Service = s3Service;
         this.objectMapper = objectMapper;
@@ -110,6 +125,31 @@ public class CloudFormationService {
 
     private void persistStack(Stack stack) {
         stackBackend.putForAccount(storageAccount, key(stack.getStackName(), stack.getRegion()), stack);
+    }
+
+    /**
+     * Stacks, the deleted-stack tombstones and the cross-stack export registry live in memory
+     * rather than in a StorageBackend, so {@code storageFactory.clearAll()} does not reach them
+     * and a reset would otherwise leave every stack readable via DescribeStacks.
+     */
+    @Override
+    public void clear() {
+        for (java.util.concurrent.Future<?> f : inFlight) {
+            f.cancel(true);
+        }
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(2);
+        while (!inFlight.isEmpty() && System.nanoTime() < deadline) {
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        inFlight.clear();
+        stacks.clear();
+        deletedStacks.clear();
+        exports.clear();
     }
 
     private void unpersistStack(String stackName, String region) {
@@ -327,8 +367,21 @@ public class CloudFormationService {
         String templateBody = cs.getTemplateBody();
         Map<String, String> params = cs.getParameters() != null ? cs.getParameters() : Map.of();
 
-        return executor.submit(() -> runUnderAccount(accountId,
-                () -> executeTemplate(stack, templateBody, params, isCreate, region, accountId)));
+        long epoch = resetCoordinator.currentEpoch();
+        java.util.concurrent.Future<?>[] holder = new java.util.concurrent.Future<?>[1];
+        holder[0] = executor.submit(() -> {
+            try {
+                if (!resetCoordinator.isCurrent(epoch)) {
+                    return;
+                }
+                runUnderAccount(accountId,
+                        () -> executeTemplate(stack, templateBody, params, isCreate, region, accountId, epoch));
+            } finally {
+                inFlight.remove(holder[0]);
+            }
+        });
+        inFlight.add(holder[0]);
+        return holder[0];
     }
 
     /**
@@ -406,7 +459,20 @@ public class CloudFormationService {
         addEvent(stack, stack.getStackName(), stack.getStackId(),
                 "AWS::CloudFormation::Stack", "DELETE_IN_PROGRESS", null);
 
-        return executor.submit(() -> runUnderAccount(accountId, () -> deleteStackResources(stack, region)));
+        long epoch = resetCoordinator.currentEpoch();
+        java.util.concurrent.Future<?>[] holder = new java.util.concurrent.Future<?>[1];
+        holder[0] = executor.submit(() -> {
+            try {
+                if (!resetCoordinator.isCurrent(epoch)) {
+                    return;
+                }
+                runUnderAccount(accountId, () -> deleteStackResources(stack, region, epoch));
+            } finally {
+                inFlight.remove(holder[0]);
+            }
+        });
+        inFlight.add(holder[0]);
+        return holder[0];
     }
 
     // ── GetTemplate ───────────────────────────────────────────────────────────
@@ -623,7 +689,7 @@ public class CloudFormationService {
     }
 
     private void executeTemplate(Stack stack, String templateBody, Map<String, String> params,
-                                 boolean isCreate, String region, String accountId) {
+                                 boolean isCreate, String region, String accountId, long epoch) {
         StackUpdateSnapshot previousState = snapshotForUpdate(stack);
         boolean updateCommitted = false;
         Set<String> attemptedResourceIds = new LinkedHashSet<>();
@@ -669,6 +735,12 @@ public class CloudFormationService {
                 List<String> sortedLogicalIds = topologicalSort(resources, conditions);
 
                 for (String logicalId : sortedLogicalIds) {
+                    // A reset aborts a running execution at the next resource boundary instead of
+                    // only at the terminal commit; clear() cancels the future, this covers the
+                    // stretch until the cancel lands.
+                    if (!resetCoordinator.isCurrent(epoch)) {
+                        return;
+                    }
                     JsonNode resDef = resources.get(logicalId);
                     String type = resDef.path("Type").asText();
                     String deletionPolicy = resDef.path("DeletionPolicy").asText(null);
@@ -702,7 +774,7 @@ public class CloudFormationService {
                     if ("AWS::CloudFormation::Stack".equals(type)) {
                         resource = executeNestedStack(stack, logicalId,
                                 props.isMissingNode() ? null : props,
-                                engine, region, accountId, isCreate);
+                                engine, region, accountId, isCreate, epoch);
                     } else {
                         resource = provisioner.provision(logicalId, type, props.isMissingNode() ? null : props,
                                 engine, region, accountId, stack.getStackName(),
@@ -801,20 +873,27 @@ public class CloudFormationService {
                 });
             }
 
-            removeStackExports(stack, region);
-            stack.getOutputs().clear();
-            stack.getOutputs().putAll(newOutputs);
-            stack.getExports().clear();
-            stack.getExports().putAll(newExports);
-            stack.getOutputExportNames().clear();
-            stack.getOutputExportNames().putAll(newOutputExportNames);
-            newExports.forEach((exportName, value) -> {
-                String exportKey = exportKey(region, exportName);
-                exports.put(exportKey, value);
-                exportBackend.putForAccount(storageAccount, exportKey, value);
-                LOG.infov("Registered export {0} = {1} from stack {2}",
-                        exportName, value, stack.getStackName());
+            // The whole export/output commit is fenced as one atomic unit: a reset can no
+            // longer land between the staleness check and the export registrations.
+            boolean committed = resetCoordinator.applyIfCurrent(epoch, () -> {
+                removeStackExports(stack, region);
+                stack.getOutputs().clear();
+                stack.getOutputs().putAll(newOutputs);
+                stack.getExports().clear();
+                stack.getExports().putAll(newExports);
+                stack.getOutputExportNames().clear();
+                stack.getOutputExportNames().putAll(newOutputExportNames);
+                newExports.forEach((exportName, value) -> {
+                    String exportKey = exportKey(region, exportName);
+                    exports.put(exportKey, value);
+                    exportBackend.putForAccount(storageAccount, exportKey, value);
+                    LOG.infov("Registered export {0} = {1} from stack {2}",
+                            exportName, value, stack.getStackName());
+                });
             });
+            if (!committed) {
+                return; // state was reset while this template ran; drop the terminal commit
+            }
 
             if (!isCreate) {
                 updateCommitted = true;
@@ -837,14 +916,19 @@ public class CloudFormationService {
                 return;
             }
 
-            stack.setStatus("CREATE_COMPLETE");
-            stack.setLastUpdatedTime(now());
-            addEvent(stack, stack.getStackName(), stack.getStackId(),
-                    "AWS::CloudFormation::Stack", "CREATE_COMPLETE", null);
-            persistStack(stack);
-            LOG.infov("Stack {0} execution complete: CREATE_COMPLETE", stack.getStackName());
+            resetCoordinator.applyIfCurrent(epoch, () -> {
+                stack.setStatus("CREATE_COMPLETE");
+                stack.setLastUpdatedTime(now());
+                addEvent(stack, stack.getStackName(), stack.getStackId(),
+                        "AWS::CloudFormation::Stack", "CREATE_COMPLETE", null);
+                persistStack(stack);
+                LOG.infov("Stack {0} execution complete: CREATE_COMPLETE", stack.getStackName());
+            });
 
         } catch (Exception e) {
+            if (!resetCoordinator.isCurrent(epoch)) {
+                return; // state was reset while this template ran; do not persist failure state
+            }
             if (!isCreate && updateCommitted) {
                 LOG.errorv(
                         "Stack {0} update cleanup could not finish: {1}",
@@ -1350,7 +1434,7 @@ public class CloudFormationService {
         return failures;
     }
 
-    private void deleteStackResources(Stack stack, String region) {
+    private void deleteStackResources(Stack stack, String region, long epoch) {
         try {
             List<StackResource> resources = new ArrayList<>(stack.getResources().values());
             Collections.reverse(resources); // Delete in reverse order
@@ -1403,27 +1487,35 @@ public class CloudFormationService {
                 stack.setStatusReason(reason);
                 addEvent(stack, stack.getStackName(), stack.getStackId(),
                         "AWS::CloudFormation::Stack", "DELETE_FAILED", reason);
-                persistStack(stack);
+                if (resetCoordinator.isCurrent(epoch)) {
+                    persistStack(stack);
+                }
                 LOG.errorv("Stack {0} delete failed: {1}", stack.getStackName(), reason);
                 throw new IllegalStateException(reason);
             }
 
-            stack.setStatus("DELETE_COMPLETE");
-            addEvent(stack, stack.getStackName(), stack.getStackId(),
-                    "AWS::CloudFormation::Stack", "DELETE_COMPLETE", null);
-            removeStackExports(stack, region);
-            stacks.remove(key(stack.getStackName(), region));
-            unpersistStack(stack.getStackName(), region);
-            deletedStacks.put(stack.getStackId(), new DeletedStackEntry(
-                    stack,
-                    now().plusSeconds(config.services().cloudformation().deletedStackRetentionSeconds())));
-            LOG.infov("Stack {0} deleted", stack.getStackName());
+            // Tombstone commit is fenced: a reset between resource deletion and this block can
+            // no longer reinsert a deleted-stack tombstone into freshly cleared state.
+            resetCoordinator.applyIfCurrent(epoch, () -> {
+                stack.setStatus("DELETE_COMPLETE");
+                addEvent(stack, stack.getStackName(), stack.getStackId(),
+                        "AWS::CloudFormation::Stack", "DELETE_COMPLETE", null);
+                removeStackExports(stack, region);
+                stacks.remove(key(stack.getStackName(), region));
+                unpersistStack(stack.getStackName(), region);
+                deletedStacks.put(stack.getStackId(), new DeletedStackEntry(
+                        stack,
+                        now().plusSeconds(config.services().cloudformation().deletedStackRetentionSeconds())));
+                LOG.infov("Stack {0} deleted", stack.getStackName());
+            });
 
         } catch (Exception e) {
             LOG.errorv("Stack {0} delete failed: {1}", stack.getStackName(), e.getMessage());
             stack.setStatus("DELETE_FAILED");
             stack.setStatusReason(e.getMessage());
-            persistStack(stack);
+            if (resetCoordinator.isCurrent(epoch)) {
+                persistStack(stack);
+            }
             throw (e instanceof RuntimeException re ? re : new RuntimeException(e));
         }
     }
@@ -1687,7 +1779,7 @@ public class CloudFormationService {
 
     private StackResource executeNestedStack(Stack parentStack, String logicalId, JsonNode props,
                                              CloudFormationTemplateEngine engine, String region,
-                                             String accountId, boolean isCreate) {
+                                             String accountId, boolean isCreate, long epoch) {
         StackResource resource = new StackResource();
         resource.setLogicalId(logicalId);
         resource.setResourceType("AWS::CloudFormation::Stack");
@@ -1712,7 +1804,7 @@ public class CloudFormationService {
                     childParams.put(e.getKey(), engine.resolve(e.getValue())));
         }
 
-        executeTemplate(childStack, childTemplate, childParams, isCreate, region, accountId);
+        executeTemplate(childStack, childTemplate, childParams, isCreate, region, accountId, epoch);
 
         resource.setPhysicalId(childStack.getStackId());
         resource.getAttributes().put("Arn", childStack.getStackId());
