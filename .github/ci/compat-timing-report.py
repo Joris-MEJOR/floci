@@ -16,12 +16,17 @@ def main():
     for f in glob.glob(os.path.join(d, '*.xml')):
         try:
             root = ET.parse(f).getroot()
-        except ET.ParseError:
+        except (ET.ParseError, OSError) as exc:
+            print(f'warning: skipping unreadable JUnit XML {f}: {exc}', file=sys.stderr)
             continue
         suites = root.iter('testsuite') if root.tag != 'testsuite' else [root]
         for ts in suites:
-            rows.append((float(ts.get('time') or 0), int(ts.get('tests') or 0),
-                         ts.get('name') or os.path.basename(f)))
+            try:
+                rows.append((float(ts.get('time') or 0), int(ts.get('tests') or 0),
+                             ts.get('name') or os.path.basename(f)))
+            except ValueError as exc:
+                print(f'warning: skipping suite with non-numeric attributes in {f}: {exc}',
+                      file=sys.stderr)
     rows.sort(reverse=True)
     total_t = sum(r[0] for r in rows)
     total_n = sum(r[1] for r in rows)

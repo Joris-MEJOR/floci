@@ -240,6 +240,8 @@ jobs:
       # machine-readable across runs.
       - name: Report slowest test classes
         if: always() && steps.tests.outcome != 'skipped'
+        # Measurement-only: a reporting bug must never fail an otherwise-green leg.
+        continue-on-error: true
         run: python3 .github/ci/compat-timing-report.py test-results
 
       - name: Upload test results
