@@ -139,7 +139,10 @@ public class MskService implements ResourceProvider {
             throw new AwsException("BadRequestException",
                     "Configuration name must match the pattern \"^[0-9A-Za-z][0-9A-Za-z-]{0,}$\".", 400);
         }
-        if (serverProperties == null || serverProperties.isBlank()) {
+        // Only an absent member (null) is rejected. A zero-length blob is a legitimate value
+        // meaning "no property overrides": Terraform modules that build serverProperties by
+        // joining a map defaulting to {} send exactly that, and real MSK accepts it.
+        if (serverProperties == null) {
             throw new AwsException("BadRequestException", "serverProperties is required.", 400);
         }
         if (configurationStorage.scan(k -> true).stream().anyMatch(c -> c.getName().equals(name))) {
@@ -183,7 +186,9 @@ public class MskService implements ResourceProvider {
     }
 
     public MskConfiguration updateConfiguration(String arn, String description, String serverProperties) {
-        if (serverProperties == null || serverProperties.isBlank()) {
+        // Same absent-vs-empty distinction as createConfiguration: "" is a valid revision
+        // body that clears every override, only a missing member is an error.
+        if (serverProperties == null) {
             throw new AwsException("BadRequestException", "serverProperties is required.", 400);
         }
 

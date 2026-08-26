@@ -149,6 +149,25 @@ class MskServiceTest {
     }
 
     @Test
+    void createConfigurationAcceptsEmptyServerProperties() {
+        // A zero-length blob means "no property overrides" - Gruntwork's msk module joins a
+        // map that defaults to {} and creates aws_msk_configuration unconditionally.
+        MskConfiguration configuration = mskService.createConfiguration(
+                "empty-props-config", "desc", List.of("3.6.0"), "");
+
+        assertEquals("", configuration.getServerPropertiesByRevision().get(1L));
+        assertEquals(ConfigurationState.ACTIVE, configuration.getState());
+    }
+
+    @Test
+    void createConfigurationAcceptsNonEmptyServerProperties() {
+        MskConfiguration configuration = mskService.createConfiguration(
+                "props-config", "desc", List.of("3.6.0"), "num.partitions=3");
+
+        assertEquals("num.partitions=3", configuration.getServerPropertiesByRevision().get(1L));
+    }
+
+    @Test
     void createConfigurationRejectsDuplicateName() {
         mskService.createConfiguration("test-config", "desc", List.of("3.6.0"), "props");
         assertThrows(AwsException.class, () ->
@@ -240,6 +259,28 @@ class MskServiceTest {
                 "test-config", "desc", List.of("3.6.0"), "props");
         assertThrows(AwsException.class, () ->
                 mskService.updateConfiguration(created.getArn(), "desc", null));
+    }
+
+    @Test
+    void updateConfigurationAcceptsEmptyServerProperties() {
+        MskConfiguration created = mskService.createConfiguration(
+                "test-config", "desc", List.of("3.6.0"), "num.partitions=3");
+
+        MskConfiguration updated = mskService.updateConfiguration(created.getArn(), "cleared", "");
+
+        assertEquals(2L, updated.getLatestRevision().getRevision());
+        assertEquals("", updated.getServerPropertiesByRevision().get(2L));
+    }
+
+    @Test
+    void updateConfigurationAcceptsNonEmptyServerProperties() {
+        MskConfiguration created = mskService.createConfiguration(
+                "test-config", "desc", List.of("3.6.0"), "");
+
+        MskConfiguration updated = mskService.updateConfiguration(
+                created.getArn(), "desc", "num.partitions=3");
+
+        assertEquals("num.partitions=3", updated.getServerPropertiesByRevision().get(2L));
     }
 
     @Test

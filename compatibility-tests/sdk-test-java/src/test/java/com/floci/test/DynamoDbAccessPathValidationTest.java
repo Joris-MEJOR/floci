@@ -85,6 +85,16 @@ class DynamoDbAccessPathValidationTest {
     }
 
     @Test
+    void queryRejectsKeyConditionValuesWithWrongSchemaTypes() {
+        assertValidationException(() -> ddb.query(request -> request
+                .tableName(TABLE)
+                .keyConditionExpression("pk = :pk AND sk > :sk")
+                .expressionAttributeValues(Map.of(
+                        ":pk", value("p1"),
+                        ":sk", numberValue("1")))));
+    }
+
+    @Test
     void acceptsTableKeyConditionsInEitherOrder() {
         var response = ddb.query(request -> request
                 .tableName(TABLE)
@@ -184,6 +194,23 @@ class DynamoDbAccessPathValidationTest {
                 .expressionAttributeValues(Map.of(":status", value("open")))));
     }
 
+    @Test
+    void queryAndScanRejectWrongExclusiveStartKeyTypes() {
+        Map<String, AttributeValue> invalidStartKey = Map.of(
+                "pk", AttributeValue.builder().n("1").build(),
+                "sk", value("s1"));
+
+        assertValidationException(() -> ddb.query(request -> request
+                .tableName(TABLE)
+                .keyConditionExpression("pk = :pk")
+                .expressionAttributeValues(Map.of(":pk", value("p1")))
+                .exclusiveStartKey(invalidStartKey)));
+
+        assertValidationException(() -> ddb.scan(request -> request
+                .tableName(TABLE)
+                .exclusiveStartKey(invalidStartKey)));
+    }
+
     private static void assertValidationException(org.assertj.core.api.ThrowableAssert.ThrowingCallable call) {
         assertThatThrownBy(call)
                 .isInstanceOf(DynamoDbException.class)
@@ -204,6 +231,10 @@ class DynamoDbAccessPathValidationTest {
 
     private static AttributeValue value(String value) {
         return AttributeValue.builder().s(value).build();
+    }
+
+    private static AttributeValue numberValue(String value) {
+        return AttributeValue.builder().n(value).build();
     }
 
     private static Condition condition(ComparisonOperator operator, String attributeValue) {

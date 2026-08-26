@@ -143,11 +143,7 @@ public class SecretsManagerService implements ResourceProvider {
 
     public SecretVersion getSecretValue(String secretId, String versionId, String versionStage, String region) {
         Secret secret = resolveSecret(secretId, region);
-
-        if (secret.getDeletedDate() != null) {
-            throw new AwsException("ResourceNotFoundException",
-                    "Secrets Manager can't find the specified secret.", 400);
-        }
+        throwIfPendingDeletion(secret);
 
         SecretVersion version;
         if (versionId != null && !versionId.isEmpty()) {
@@ -183,11 +179,7 @@ public class SecretsManagerService implements ResourceProvider {
                                         String secretBinary, String clientRequestToken, String region,
                                         List<String> versionStages) {
         Secret secret = resolveSecret(secretId, region);
-
-        if (secret.getDeletedDate() != null) {
-            throw new AwsException("ResourceNotFoundException",
-                    "Secrets Manager can't find the specified secret.", 400);
-        }
+        throwIfPendingDeletion(secret);
 
         if (clientRequestToken != null && (clientRequestToken.length() < 32 || clientRequestToken.length() > 64)) {
             throw new AwsException("InvalidParameterException", "ClientRequestToken must be between 32 and 64 characters long.", 400);
@@ -290,11 +282,7 @@ public class SecretsManagerService implements ResourceProvider {
 
     public Secret updateSecret(String secretId, String description, String kmsKeyId, String region) {
         Secret secret = resolveSecret(secretId, region);
-
-        if (secret.getDeletedDate() != null) {
-            throw new AwsException("ResourceNotFoundException",
-                    "Secrets Manager can't find the specified secret.", 400);
-        }
+        throwIfPendingDeletion(secret);
 
         if (description != null) {
             secret.setDescription(description);
@@ -375,10 +363,7 @@ public class SecretsManagerService implements ResourceProvider {
         Secret resolved = resolveSecret(secretId, region);
         synchronized (lockFor(resolved.getArn())) {
             Secret secret = resolveSecret(resolved.getArn(), region);
-            if (secret.getDeletedDate() != null) {
-                throw new AwsException("ResourceNotFoundException",
-                        "Secrets Manager can't find the specified secret.", 400);
-            }
+            throwIfPendingDeletion(secret);
 
             String existingOwner = secret.getTargetAttachmentOwner();
             if (existingOwner != null && !existingOwner.equals(attachmentOwner)) {
@@ -590,11 +575,7 @@ public class SecretsManagerService implements ResourceProvider {
     public Secret rotateSecret(String secretId, String clientRequestToken, String rotationLambdaArn, Secret.RotationRules rotationRules,
                                boolean rotateImmediately, String region) {
         Secret secret = resolveSecret(secretId, region);
-
-        if (secret.getDeletedDate() != null) {
-            throw new AwsException("ResourceNotFoundException",
-                    "Secrets Manager can't find the specified secret.", 400);
-        }
+        throwIfPendingDeletion(secret);
 
         if (clientRequestToken != null && (clientRequestToken.length() < 32 || clientRequestToken.length() > 64)) {
             throw new AwsException("InvalidParameterException", "ClientRequestToken must be between 32 and 64 characters long.", 400);
@@ -843,9 +824,7 @@ public class SecretsManagerService implements ResourceProvider {
         }
 
         Secret secret = resolveSecret(secretId, region);
-        if (secret.getDeletedDate() != null) {
-            throw new AwsException("ResourceNotFoundException", "Secrets Manager can't find the specified secret.", 400);
-        }
+        throwIfPendingDeletion(secret);
 
         SecretVersion versionByStage = findVersionByStage(secret, versionStage);
         String currentVersionId = versionByStage != null
@@ -936,6 +915,22 @@ public class SecretsManagerService implements ResourceProvider {
     ) {
         public static BatchGetSecretValueResult empty() {
             return new BatchGetSecretValueResult(Collections.emptyList(), Collections.emptyList());
+        }
+    }
+
+    /**
+     * A secret found by {@link #resolveSecret} with {@code deletedDate} set is on the
+     * recovery-window path (still in {@code store}, still restorable) - {@link
+     * #deleteSecret} force-deletes by removing the entry from {@code store} outright, so a
+     * fully, permanently gone secret never reaches this check; {@code resolveSecret} throws
+     * ResourceNotFoundException for that case on its own. Real AWS's error for the
+     * recoverable case is InvalidRequestException, matching what {@code batchGetSecretValue}
+     * already does correctly - the other call sites threw ResourceNotFoundException instead.
+     */
+    private void throwIfPendingDeletion(Secret secret) {
+        if (secret.getDeletedDate() != null) {
+            throw new AwsException("InvalidRequestException",
+                    "You can't perform this operation on the secret because it was marked for deletion.", 400);
         }
     }
 

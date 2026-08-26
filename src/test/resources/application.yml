@@ -329,6 +329,8 @@ floci:
       enabled: true
     cloudhsmv2:
       enabled: true
+    efs:
+      enabled: true
     organizations:
       enabled: true
     rum:

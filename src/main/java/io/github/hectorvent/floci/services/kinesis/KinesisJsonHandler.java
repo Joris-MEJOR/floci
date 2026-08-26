@@ -116,6 +116,14 @@ public class KinesisJsonHandler {
         }
         service.createStream(streamName, shardCount, streamMode,
                 optionalMaxRecordSize(request), region);
+        // CreateStream's optional Tags member was being dropped. That is invisible to a
+        // hand-written script but not to Terraform: aws_kinesis_stream sets tags at create
+        // time and then reads them back with ListTagsForStream, so an empty read produces a
+        // permanent "tags will be updated in-place" diff on an unchanged configuration.
+        Map<String, String> tags = parseTags(request);
+        if (!tags.isEmpty()) {
+            service.addTagsToStream(streamName, tags, region);
+        }
         return Response.ok(objectMapper.createObjectNode()).build();
     }
 
@@ -388,9 +396,7 @@ public class KinesisJsonHandler {
 
     private Response handleAddTagsToStream(JsonNode request, String region) {
         String streamName = resolveStreamName(request);
-        Map<String, String> tags = new HashMap<>();
-        request.path("Tags").fields().forEachRemaining(entry -> tags.put(entry.getKey(), entry.getValue().asText()));
-        service.addTagsToStream(streamName, tags, region);
+        service.addTagsToStream(streamName, parseTags(request), region);
         return Response.ok(objectMapper.createObjectNode()).build();
     }
 
@@ -414,6 +420,17 @@ public class KinesisJsonHandler {
         });
         response.put("HasMoreTags", false);
         return Response.ok(response).build();
+    }
+
+    // Shared by CreateStream and AddTagsToStream so the two paths cannot drift: the same
+    // request shape has to produce the same stored tags whichever operation carries it.
+    // A missing or non-object Tags member yields an empty map rather than an error, which
+    // is what AddTagsToStream already did before CreateStream started calling this.
+    private Map<String, String> parseTags(JsonNode request) {
+        Map<String, String> tags = new HashMap<>();
+        request.path("Tags").fields()
+                .forEachRemaining(entry -> tags.put(entry.getKey(), entry.getValue().asText()));
+        return tags;
     }
 
     private Response handleStartStreamEncryption(JsonNode request, String region) {

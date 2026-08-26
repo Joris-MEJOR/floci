@@ -274,6 +274,15 @@ public class DynamoDbService implements ResourceProvider {
         if (lsis != null) {
             lsis.forEach(l -> l.getKeySchema().forEach(k -> referencedAttrs.add(k.getAttributeName())));
         }
+        Set<String> definedAttrs = attributeDefinitions == null
+                ? Set.of()
+                : attributeDefinitions.stream()
+                        .map(AttributeDefinition::getAttributeName)
+                        .collect(java.util.stream.Collectors.toSet());
+        if (!definedAttrs.containsAll(referencedAttrs)) {
+            throw new AwsException("ValidationException",
+                    "Invalid KeySchema: Some index key attribute have no definition", 400);
+        }
         if (attributeDefinitions != null) {
             for (AttributeDefinition ad : attributeDefinitions) {
                 if (!referencedAttrs.contains(ad.getAttributeName())) {
@@ -758,7 +767,8 @@ public class DynamoDbService implements ResourceProvider {
 
         DynamoDbAccessPath accessPath = DynamoDbAccessPath.resolve(table, indexName);
         String partitionKeyValuePlaceholder = DynamoDbAccessPathValidator.validateQuery(
-                accessPath, keyConditions, keyConditionExpression, filterExpression, null, exprAttrNames);
+                table, accessPath, keyConditions, keyConditionExpression, filterExpression,
+                null, exprAttrNames, expressionAttrValues);
         String pkName = accessPath.partitionKeyName();
         List<String> pkNames = accessPath.partitionKeyNames();
         String skName = accessPath.sortKeyName();

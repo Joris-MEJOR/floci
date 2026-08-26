@@ -13,6 +13,7 @@ import org.junit.jupiter.api.Test;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.Base64;
+import java.util.Map;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.is;
@@ -875,5 +876,50 @@ class KinesisJsonHandlerTest {
         AwsException ex = assertThrows(AwsException.class,
                 () -> handler.handle("UpdateMaxRecordSize", update, REGION));
         assertEquals("ResourceNotFoundException", ex.getErrorCode());
+    }
+
+    @Test
+    void createStreamAppliesTagsFromTheRequest() {
+        ObjectNode create = MAPPER.createObjectNode();
+        create.put("StreamName", "tagged-stream");
+        create.put("ShardCount", 1);
+        create.putObject("Tags").put("Foo", "Bar").put("gw:example", "kinesis");
+        assertThat(handler.handle("CreateStream", create, REGION).getStatus(), is(200));
+
+        assertEquals(Map.of("Foo", "Bar", "gw:example", "kinesis"),
+                service.listTagsForStream("tagged-stream", REGION));
+    }
+
+    @Test
+    void createStreamWithoutTagsLeavesTheStreamUntagged() {
+        createStream("test-stream");
+
+        assertTrue(service.listTagsForStream("test-stream", REGION).isEmpty());
+    }
+
+    /** An empty Tags object is not an error; it simply leaves the stream untagged. */
+    @Test
+    void createStreamWithAnEmptyTagsObjectLeavesTheStreamUntagged() {
+        ObjectNode create = MAPPER.createObjectNode();
+        create.put("StreamName", "empty-tags-stream");
+        create.put("ShardCount", 1);
+        create.putObject("Tags");
+        assertThat(handler.handle("CreateStream", create, REGION).getStatus(), is(200));
+
+        assertTrue(service.listTagsForStream("empty-tags-stream", REGION).isEmpty());
+    }
+
+    /** CreateStream and AddTagsToStream share one parser, so the same map has to land either way. */
+    @Test
+    void addTagsToStreamAppliesTheSameTagsCreateStreamWould() {
+        createStream("test-stream");
+
+        ObjectNode add = MAPPER.createObjectNode();
+        add.put("StreamName", "test-stream");
+        add.putObject("Tags").put("Foo", "Bar").put("gw:example", "kinesis");
+        assertThat(handler.handle("AddTagsToStream", add, REGION).getStatus(), is(200));
+
+        assertEquals(Map.of("Foo", "Bar", "gw:example", "kinesis"),
+                service.listTagsForStream("test-stream", REGION));
     }
 }
