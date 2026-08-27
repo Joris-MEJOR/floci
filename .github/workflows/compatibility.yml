@@ -92,8 +92,27 @@ jobs:
         with:
           java-version: '25'
           distribution: 'mandrel'
-          cache: maven
+          # no `cache: maven` — it keys on setup-graalvm-Linux-maven-<hash>, which
+          # only this pull_request-only workflow ever writes. Actions caches are
+          # ref-scoped, so those writes land in refs/pull/N/merge and no run can
+          # read another's: it logged "maven cache is not found" on 6 of 6 sampled
+          # runs while dutifully saving 211 MB each time. Restore ci.yml's cache
+          # below instead, which push-to-main genuinely populates.
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Restore-only, and deliberately keyed identically to ci.yml:54-59 so this
+      # reads the ~/.m2 that ci.yml's shard 1 saves on every push to main. ci.yml
+      # stays the single owner of the save; a second writer would just race it.
+      # Two known partial-hit caveats, both cheap: `runner.os` is Linux for both
+      # but ci.yml runs x64 while this runs arm64 (Maven artifacts are
+      # arch-neutral, so only classifier-based natives re-download), and
+      # `-Dnative` pulls native-image plugins that ci.yml's `mvn test` never
+      # fetches. Expect most of the ~66s of cold resolution back, not all of it.
+      - uses: actions/cache/restore@v6.1.0
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('pom.xml') }}
+          restore-keys: maven-${{ runner.os }}-
 
       - name: Build native executable (quick build)
         run: mvn clean package -Dnative -DskipTests -B -Dquarkus.native.additional-build-args-append="-Ob"
