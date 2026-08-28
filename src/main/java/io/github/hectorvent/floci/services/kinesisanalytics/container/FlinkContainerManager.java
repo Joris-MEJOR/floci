@@ -273,7 +273,8 @@ public class FlinkContainerManager {
      *  directly. */
     byte[] msfStyleLog4j2Config(FlinkApplication app) {
         String pattern = "{"
-                + "\"applicationARN\":\"%enc{" + literalForLog4j2Pattern(app.getApplicationArn()) + "}{JSON}\","
+                + "\"applicationARN\":\"%enc{"
+                + literalForLog4j2Pattern(String.valueOf(app.getApplicationArn())) + "}{JSON}\","
                 + "\"applicationVersionId\":\"%enc{"
                 + literalForLog4j2Pattern(String.valueOf(app.getApplicationVersionId())) + "}{JSON}\","
                 + "\"locationInformation\":\"%C.%M(%F:%L)\","
@@ -293,14 +294,21 @@ public class FlinkContainerManager {
         return properties.getBytes(StandardCharsets.UTF_8);
     }
 
-    /** Escapes an application-supplied value (e.g. the ARN, built from the caller's ApplicationName)
-     *  so it can be embedded as literal text inside a log4j2 {@code PatternLayout} pattern written to
-     *  a {@code .properties} file: doubles {@code %} so log4j2's pattern parser can't interpret it as
-     *  the start of a conversion specifier (or lookup), then backslash-escapes control characters so
-     *  the value survives {@code java.util.Properties}-style parsing of the config file intact. The
-     *  surrounding {@code %enc{...}{JSON}} wrapper (already used for %message/%thread/%ex above) then
-     *  JSON-escapes the resulting literal at log time, so quotes/backslashes in the original value
-     *  can't break the emitted JSON. */
+    /** Escapes an application-supplied value (e.g. the ARN, built from the caller's ApplicationName --
+     *  {@link io.github.hectorvent.floci.services.kinesisanalytics.KinesisAnalyticsV2Service} restricts
+     *  that to AWS's own {@code [a-zA-Z0-9_.-]} charset, but this stays defensive in case some other
+     *  caller ever feeds it something else) so it can be embedded as literal text inside a log4j2
+     *  {@code PatternLayout} pattern written to a {@code .properties} file: doubles {@code %} so
+     *  log4j2's pattern parser can't interpret it as the start of a conversion specifier, drops
+     *  {@code $} so it can't start a {@code ${...}} Lookup (log4j2 resolves those against config
+     *  values -- including this pattern -- at config-load time, so an unescaped one could leak an
+     *  environment variable or system property into every log line; doubling it like {@code %} only
+     *  defers the lookup to render time rather than neutralizing it, so it isn't a safe escape here),
+     *  then backslash-escapes control characters so the value survives
+     *  {@code java.util.Properties}-style parsing of the config file intact. The surrounding
+     *  {@code %enc{...}{JSON}} wrapper (already used for %message/%thread/%ex above) then JSON-escapes
+     *  the resulting literal at log time, so quotes/backslashes in the original value can't break the
+     *  emitted JSON. */
     private static String literalForLog4j2Pattern(String value) {
         String percentEscaped = value.replace("%", "%%");
         StringBuilder escaped = new StringBuilder(percentEscaped.length());
@@ -308,6 +316,7 @@ public class FlinkContainerManager {
             char c = percentEscaped.charAt(i);
             switch (c) {
                 case '\\' -> escaped.append("\\\\");
+                case '$' -> { /* dropped: see method Javadoc -- can't be escaped to a safe literal */ }
                 case '\n' -> escaped.append("\\n");
                 case '\r' -> escaped.append("\\r");
                 case '\t' -> escaped.append("\\t");

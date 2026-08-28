@@ -27,6 +27,7 @@ import java.util.Objects;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 
 /**
  * Control plane for Managed Service for Apache Flink (Kinesis Analytics V2). Holds the
@@ -42,6 +43,9 @@ import java.util.concurrent.TimeUnit;
 public class KinesisAnalyticsV2Service {
 
     private static final Logger LOG = Logger.getLogger(KinesisAnalyticsV2Service.class);
+
+    // AWS: ApplicationName Length Constraints: 1-128, Pattern: [a-zA-Z0-9_.-]+
+    private static final Pattern APPLICATION_NAME = Pattern.compile("[a-zA-Z0-9_.-]{1,128}");
 
     // AWS: "the maximum number of user-defined application tags is 50" (the stated 200-tag ceiling
     // on the Tags/TagKeys shapes includes AWS-managed system tags, which floci does not model).
@@ -136,6 +140,11 @@ public class KinesisAnalyticsV2Service {
                                               Boolean snapshotsEnabled) {
         if (applicationName == null || applicationName.isBlank()) {
             throw new AwsException("InvalidArgumentException", "ApplicationName is required", 400);
+        }
+        if (!APPLICATION_NAME.matcher(applicationName).matches()) {
+            throw new AwsException("InvalidArgumentException",
+                    "ApplicationName '" + applicationName
+                            + "' does not match the required pattern [a-zA-Z0-9_.-]{1,128}", 400);
         }
         if (runtimeEnvironment == null || runtimeEnvironment.isBlank()) {
             throw new AwsException("InvalidArgumentException", "RuntimeEnvironment is required", 400);

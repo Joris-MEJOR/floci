@@ -29,6 +29,7 @@ import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -234,26 +235,29 @@ class FlinkContainerManagerTest {
 
     @Test
     void msfStyleLog4j2ConfigEscapesLog4jAndPropertiesSyntaxInTheApplicationName() throws Exception {
-        // ApplicationName flows straight into the ARN with no character-set validation today, so a
-        // name containing '%' (a log4j2 conversion-specifier marker) or '\' (a java.util.Properties
-        // escape character, since Flink loads this file with Properties-style parsing) must not reach
-        // the pattern unescaped -- otherwise it either breaks log4j2's config parser or lets the value
-        // corrupt/collide with the surrounding pattern syntax before %enc{}{JSON} ever sees it.
-        FlinkApplication app = new FlinkApplication("100%-\\-owned",
-                "arn:aws:kinesisanalytics:us-east-1:000000000000:application/100%-\\-owned",
+        // KinesisAnalyticsV2Service now rejects an ApplicationName outside AWS's own
+        // [a-zA-Z0-9_.-] charset, but this stays defensive in case some other caller ever builds a
+        // FlinkApplication directly: '%' would be a log4j2 conversion-specifier marker, '\' is a
+        // java.util.Properties escape character (Flink loads this file with Properties-style
+        // parsing), and '$' could start a log4j2 '${...}' Lookup that leaks an env var/system
+        // property into every log line -- none of that may reach the pattern unescaped.
+        FlinkApplication app = new FlinkApplication("100%-\\-${env:PATH}-owned",
+                "arn:aws:kinesisanalytics:us-east-1:000000000000:application/100%-\\-${env:PATH}-owned",
                 "FLINK-2_3", "arn:aws:iam::000000000000:role/x", "STREAMING");
         app.setApplicationVersionId(1L);
 
         String config = new String(manager.msfStyleLog4j2Config(app), java.nio.charset.StandardCharsets.UTF_8);
 
         assertTrue(config.contains(
-                "\"applicationARN\":\"%enc{arn:aws:kinesisanalytics:us-east-1:000000000000:application/100%%-\\\\-owned}{JSON}\""));
+                "\"applicationARN\":\"%enc{arn:aws:kinesisanalytics:us-east-1:000000000000:application/100%%-\\\\-{env:PATH}-owned}{JSON}\""));
 
         java.util.Properties parsed = new java.util.Properties();
         parsed.load(new java.io.ByteArrayInputStream(config.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
         String loadedPattern = parsed.getProperty("appender.console.layout.pattern");
         assertTrue(loadedPattern.contains(
-                "\"applicationARN\":\"%enc{arn:aws:kinesisanalytics:us-east-1:000000000000:application/100%%-\\-owned}{JSON}\""));
+                "\"applicationARN\":\"%enc{arn:aws:kinesisanalytics:us-east-1:000000000000:application/100%%-\\-{env:PATH}-owned}{JSON}\""));
+        assertFalse(loadedPattern.contains("${env:PATH}"), "the $ must not survive, or log4j2 would treat "
+                + "this as a Lookup and resolve it against the environment at config-load time");
     }
 
     @Test

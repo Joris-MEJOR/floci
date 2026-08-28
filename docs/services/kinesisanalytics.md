@@ -179,6 +179,11 @@ an in-place code update, since the JobManager/TaskManager JVMs (and therefore lo
 restarted for that, matching how real MSF also keeps the same processes running across an
 `UpdateApplication`.
 
+`applicationARN` and `applicationVersionId` are baked into the generated config as literal text, so
+`CreateApplication` validates `ApplicationName` against AWS's own constraints (`[a-zA-Z0-9_.-]+`,
+1-128 characters) rather than only requiring it non-blank — matching real AWS, and also keeping a
+name containing `%`, `"`, `\`, or `$` out of the log4j2 pattern in the first place.
+
 ### Flink Dashboard access
 
 `CreateApplicationPresignedUrl` (with `UrlType: FLINK_DASHBOARD_URL`) returns a URL to the running

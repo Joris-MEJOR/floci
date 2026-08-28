@@ -58,6 +58,21 @@ class KinesisAnalyticsV2ServiceTest {
     }
 
     @Test
+    void createApplicationRejectsNamesOutsideAwsCharsetAndLength() {
+        // AWS ApplicationName Pattern: [a-zA-Z0-9_.-]+, 1-128 chars. Rejecting this at the API
+        // boundary (matching real AWS) is also what keeps a name containing '%', '"', '\', or '$'
+        // from ever reaching FlinkContainerManager's generated log4j2 CloudWatch-log-format pattern,
+        // where those characters would otherwise be a log4j2 conversion-specifier/Lookup or JSON
+        // injection risk.
+        for (String badName : List.of("has spaces", "quote\"here", "percent%here", "dollar${x}",
+                "back\\slash", "a".repeat(129))) {
+            AwsException ex = assertThrows(AwsException.class,
+                    () -> service.createApplication(badName, "FLINK-1_18", ROLE, null, null));
+            assertEquals("InvalidArgumentException", ex.getErrorCode());
+        }
+    }
+
+    @Test
     void createApplicationRequiresRuntimeEnvironment() {
         assertThrows(AwsException.class,
                 () -> service.createApplication("demo", null, ROLE, null, null));
