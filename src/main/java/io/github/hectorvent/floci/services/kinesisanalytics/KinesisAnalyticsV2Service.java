@@ -206,6 +206,20 @@ public class KinesisAnalyticsV2Service {
 
     public FlinkApplication startApplication(String applicationName) {
         FlinkApplication app = describeApplication(applicationName);
+        // Defends state persisted by a floci build older than the ApplicationName check in
+        // createApplication: applicationARN is baked as literal text into the CloudWatch-log-format
+        // config FlinkContainerManager writes on startup, and a name outside AWS's charset (most
+        // notably '$', which can't be escaped to a safe literal there -- see
+        // FlinkContainerManager#literalForLog4j2Pattern) either gets dropped from every emitted
+        // applicationARN (breaking correlation with the real ApplicationARN) or, if ever un-dropped,
+        // risks leaking an environment variable/system property via a log4j2 Lookup. Failing loudly
+        // here beats either outcome, and real AWS could never have had this state to begin with.
+        if (!APPLICATION_NAME.matcher(applicationName).matches()) {
+            throw new AwsException("InvalidArgumentException",
+                    "ApplicationName '" + applicationName + "' does not match the required pattern "
+                            + "[a-zA-Z0-9_.-]{1,128}; this application predates that validation and "
+                            + "must be deleted and recreated with a valid name", 400);
+        }
         if (app.getApplicationStatus() != ApplicationStatus.READY) {
             throw new AwsException("ResourceInUseException",
                     "Application " + applicationName + " cannot be started while in state "

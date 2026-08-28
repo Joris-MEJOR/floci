@@ -73,6 +73,39 @@ class KinesisAnalyticsV2ServiceTest {
     }
 
     @Test
+    void startApplicationRejectsLegacyStatePersistedBeforeNameValidationExisted() {
+        // Simulates an application created by a floci build older than
+        // createApplicationRejectsNamesOutsideAwsCharsetAndLength's check, by writing directly to
+        // storage (bypassing createApplication). startApplication must still reject it rather than
+        // silently generating a CloudWatch-log applicationARN that either drops the '$' (mismatching
+        // the real ApplicationARN) or, if some future change stopped dropping it, resolves it as a
+        // log4j2 Lookup.
+        AccountAwareStorageBackend<FlinkApplication> store =
+                AccountAwareStorageBackend.inMemory("000000000000");
+        StorageFactory storageFactory = Mockito.mock(StorageFactory.class);
+        when(storageFactory.create(Mockito.anyString(), Mockito.anyString(), Mockito.any())).thenReturn(store);
+
+        EmulatorConfig config = Mockito.mock(EmulatorConfig.class);
+        var servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
+        var kaConfig = Mockito.mock(EmulatorConfig.KinesisAnalyticsServiceConfig.class);
+        when(config.services()).thenReturn(servicesConfig);
+        when(servicesConfig.kinesisAnalytics()).thenReturn(kaConfig);
+        when(kaConfig.mock()).thenReturn(true);
+        when(config.defaultRegion()).thenReturn("us-east-1");
+        RegionResolver regionResolver = new RegionResolver("us-east-1", "000000000000");
+
+        KinesisAnalyticsV2Service legacyState = new KinesisAnalyticsV2Service(
+                storageFactory, config, regionResolver, Mockito.mock(FlinkContainerManager.class));
+        FlinkApplication legacyApp = new FlinkApplication("dollar${x}",
+                "arn:aws:kinesisanalytics:us-east-1:000000000000:application/dollar${x}",
+                "FLINK-1_18", ROLE, "STREAMING");
+        store.putForAccount("000000000000", "dollar${x}", legacyApp);
+
+        AwsException ex = assertThrows(AwsException.class, () -> legacyState.startApplication("dollar${x}"));
+        assertEquals("InvalidArgumentException", ex.getErrorCode());
+    }
+
+    @Test
     void createApplicationRequiresRuntimeEnvironment() {
         assertThrows(AwsException.class,
                 () -> service.createApplication("demo", null, ROLE, null, null));
