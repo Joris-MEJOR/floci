@@ -170,9 +170,17 @@ public class FlinkContainerManager {
             jmSpec.withExposedPort(JOBMANAGER_REST_PORT);
         }
 
+        ContainerSpec jmBuiltSpec = jmSpec.build();
         ContainerInfo jm;
         try {
-            jm = lifecycleManager.createAndStart(jmSpec.build());
+            String jmContainerId = lifecycleManager.create(jmBuiltSpec);
+            // Written before start (not via the post-start copyFileIntoContainer used for
+            // application_properties.json below) because log4j2 reads its config file at JVM
+            // startup -- copying it in after the process is already running would be too late for
+            // anything the JobManager logs from its own boot onward.
+            copyFileIntoContainer(jmContainerId, "/opt/flink/conf", "log4j-console.properties",
+                    msfStyleLog4j2Config(app));
+            jm = lifecycleManager.startCreated(jmContainerId, jmBuiltSpec);
         } catch (RuntimeException e) {
             lifecycleManager.removeIfExists(jmName);
             throw e;
@@ -202,7 +210,10 @@ public class FlinkContainerManager {
                             regionResolver.getDefaultRegion()))
                     .build();
             try {
-                ContainerInfo tm = lifecycleManager.createAndStart(tmSpec);
+                String tmContainerId = lifecycleManager.create(tmSpec);
+                copyFileIntoContainer(tmContainerId, "/opt/flink/conf", "log4j-console.properties",
+                        msfStyleLog4j2Config(app));
+                ContainerInfo tm = lifecycleManager.startCreated(tmContainerId, tmSpec);
                 app.setTaskManagerContainerId(tm.containerId());
                 taskManagerIds.put(app.getApplicationName(), tm.containerId());
             } catch (RuntimeException e) {
@@ -247,6 +258,38 @@ public class FlinkContainerManager {
         } catch (IOException e) {
             throw new IllegalStateException("Could not serialize application_properties.json", e);
         }
+    }
+
+    /** Builds a log4j2 {@code log4j-console.properties} that makes the JobManager/TaskManager emit
+     *  one JSON object per log line, matching the schema real Managed Service for Apache Flink
+     *  writes to CloudWatch Logs (applicationARN/applicationVersionId/locationInformation/logger/
+     *  message/messageSchemaVersion/messageType/threadName/throwableInformation) -- so a JAR relying
+     *  on that shape for its own log-based tests sees the same thing here as on real MSF. Overwrites
+     *  the stock image's default (non-JSON) config entirely; not re-applied on {@link #redeployCode},
+     *  so applicationVersionId in already-emitted log lines does not advance across an in-place code
+     *  update (the JobManager/TaskManager JVMs, and therefore log4j2, are not restarted for that --
+     *  matching real MSF, which also keeps the same processes running across an UpdateApplication).
+     *  Package-private (not private) so FlinkContainerManagerTest can assert on the pattern shape
+     *  directly. */
+    byte[] msfStyleLog4j2Config(FlinkApplication app) {
+        String pattern = "{"
+                + "\"applicationARN\":\"" + app.getApplicationArn() + "\","
+                + "\"applicationVersionId\":\"" + app.getApplicationVersionId() + "\","
+                + "\"locationInformation\":\"%C.%M(%F:%L)\","
+                + "\"logger\":\"%logger\","
+                + "\"message\":\"%enc{%message}{JSON}\","
+                + "\"messageSchemaVersion\":\"1\","
+                + "\"messageType\":\"%level\","
+                + "\"threadName\":\"%enc{%thread}{JSON}\","
+                + "\"throwableInformation\":\"%enc{%ex}{JSON}\""
+                + "}%n";
+        String properties = "rootLogger.level = INFO\n"
+                + "rootLogger.appenderRef.console.ref = ConsoleAppender\n"
+                + "appender.console.type = Console\n"
+                + "appender.console.name = ConsoleAppender\n"
+                + "appender.console.layout.type = PatternLayout\n"
+                + "appender.console.layout.pattern = " + pattern + "\n";
+        return properties.getBytes(StandardCharsets.UTF_8);
     }
 
     private void copyFileIntoContainer(String containerId, String remoteDir, String relativePath, byte[] content) {

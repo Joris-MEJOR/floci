@@ -142,7 +142,8 @@ class FlinkContainerManagerTest {
         when(storage.hostPersistentPath()).thenReturn("floci-data");
 
         ContainerLifecycleManager lifecycleManager = Mockito.mock(ContainerLifecycleManager.class);
-        when(lifecycleManager.createAndStart(any())).thenReturn(
+        when(lifecycleManager.create(any())).thenReturn("jm-container-id");
+        when(lifecycleManager.startCreated(any(), any())).thenReturn(
                 new ContainerLifecycleManager.ContainerInfo("jm-container-id", Map.of(8081,
                         new ContainerLifecycleManager.EndpointInfo("localhost", 8081))));
 
@@ -208,9 +209,26 @@ class FlinkContainerManagerTest {
     }
 
     @Test
+    void msfStyleLog4j2ConfigBakesInTheApplicationArnAndVersion() throws Exception {
+        FlinkApplication app = new FlinkApplication("demo",
+                "arn:aws:kinesisanalytics:us-east-1:000000000000:application/demo",
+                "FLINK-2_3", "arn:aws:iam::000000000000:role/x", "STREAMING");
+        app.setApplicationVersionId(2L);
+
+        String config = new String(manager.msfStyleLog4j2Config(app), java.nio.charset.StandardCharsets.UTF_8);
+
+        assertTrue(config.contains(
+                "\"applicationARN\":\"arn:aws:kinesisanalytics:us-east-1:000000000000:application/demo\""));
+        assertTrue(config.contains("\"applicationVersionId\":\"2\""));
+        assertTrue(config.contains("\"messageSchemaVersion\":\"1\""));
+        assertTrue(config.contains("appender.console.layout.type = PatternLayout"));
+    }
+
+    @Test
     void bareClusterInjectsAwsSdkEnvironmentAndContainerReachability() {
         FlinkApplication app = application("bare");
-        when(lifecycleManager.createAndStart(any())).thenReturn(new ContainerInfo(
+        when(lifecycleManager.create(any())).thenReturn("jm-id");
+        when(lifecycleManager.startCreated(any(), any())).thenReturn(new ContainerInfo(
                 "jm-id", Map.of(8081, new EndpointInfo("localhost", 49152))));
 
         manager.startCluster(app);
@@ -234,7 +252,8 @@ class FlinkContainerManagerTest {
         app.setParallelism(3);
         when(s3Service.getObject("code-bucket", "jobs/demo.jar", null))
                 .thenReturn(new S3Object("code-bucket", "jobs/demo.jar", new byte[]{1}, "application/java-archive"));
-        when(lifecycleManager.createAndStart(any()))
+        when(lifecycleManager.create(any())).thenReturn("jm-id").thenReturn("tm-id");
+        when(lifecycleManager.startCreated(any(), any()))
                 .thenReturn(new ContainerInfo("jm-id", Map.of(8081, new EndpointInfo("localhost", 49152))))
                 .thenReturn(new ContainerInfo("tm-id", Map.of()));
 
@@ -257,7 +276,7 @@ class FlinkContainerManagerTest {
     @Test
     void jobManagerStartFailureRemovesThePartialCluster() {
         FlinkApplication app = application("jm-failure");
-        when(lifecycleManager.createAndStart(any())).thenThrow(new RuntimeException("jobmanager failed"));
+        when(lifecycleManager.create(any())).thenThrow(new RuntimeException("jobmanager failed"));
 
         assertThrows(RuntimeException.class, () -> manager.startCluster(app));
 
@@ -274,9 +293,10 @@ class FlinkContainerManagerTest {
         app.setCodeS3Key("jobs/demo.jar");
         when(s3Service.getObject("code-bucket", "jobs/demo.jar", null))
                 .thenReturn(new S3Object("code-bucket", "jobs/demo.jar", new byte[]{1}, "application/java-archive"));
-        when(lifecycleManager.createAndStart(any()))
-                .thenReturn(new ContainerInfo("jm-id", Map.of(8081, new EndpointInfo("localhost", 49152))))
+        when(lifecycleManager.create(any())).thenReturn("jm-id")
                 .thenThrow(new RuntimeException("taskmanager failed"));
+        when(lifecycleManager.startCreated(any(), any()))
+                .thenReturn(new ContainerInfo("jm-id", Map.of(8081, new EndpointInfo("localhost", 49152))));
 
         assertThrows(RuntimeException.class, () -> manager.startCluster(app));
 
@@ -289,7 +309,7 @@ class FlinkContainerManagerTest {
 
     private List<ContainerSpec> captureCreatedSpecs() {
         ArgumentCaptor<ContainerSpec> captor = ArgumentCaptor.forClass(ContainerSpec.class);
-        verify(lifecycleManager, atLeastOnce()).createAndStart(captor.capture());
+        verify(lifecycleManager, atLeastOnce()).create(captor.capture());
         return captor.getAllValues();
     }
 }
