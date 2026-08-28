@@ -83,7 +83,8 @@ class KinesisAnalyticsV2ServiceTest {
         AccountAwareStorageBackend<FlinkApplication> store =
                 AccountAwareStorageBackend.inMemory("000000000000");
         StorageFactory storageFactory = Mockito.mock(StorageFactory.class);
-        when(storageFactory.create(Mockito.anyString(), Mockito.anyString(), Mockito.any())).thenReturn(store);
+        Mockito.doReturn(store).when(storageFactory)
+                .create(Mockito.anyString(), Mockito.anyString(), Mockito.any());
 
         EmulatorConfig config = Mockito.mock(EmulatorConfig.class);
         var servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
