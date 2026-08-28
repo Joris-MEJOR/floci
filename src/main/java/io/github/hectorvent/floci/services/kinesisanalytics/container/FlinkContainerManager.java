@@ -179,7 +179,7 @@ public class FlinkContainerManager {
             // startup -- copying it in after the process is already running would be too late for
             // anything the JobManager logs from its own boot onward.
             copyFileIntoContainer(jmContainerId, "/opt/flink/conf", "log4j-console.properties",
-                    msfStyleLog4j2Config(app));
+                    msfStyleLog4j2Config(app), true);
             jm = lifecycleManager.startCreated(jmContainerId, jmBuiltSpec);
         } catch (RuntimeException e) {
             lifecycleManager.removeIfExists(jmName);
@@ -212,7 +212,7 @@ public class FlinkContainerManager {
             try {
                 String tmContainerId = lifecycleManager.create(tmSpec);
                 copyFileIntoContainer(tmContainerId, "/opt/flink/conf", "log4j-console.properties",
-                        msfStyleLog4j2Config(app));
+                        msfStyleLog4j2Config(app), true);
                 ContainerInfo tm = lifecycleManager.startCreated(tmContainerId, tmSpec);
                 app.setTaskManagerContainerId(tm.containerId());
                 taskManagerIds.put(app.getApplicationName(), tm.containerId());
@@ -273,8 +273,9 @@ public class FlinkContainerManager {
      *  directly. */
     byte[] msfStyleLog4j2Config(FlinkApplication app) {
         String pattern = "{"
-                + "\"applicationARN\":\"" + app.getApplicationArn() + "\","
-                + "\"applicationVersionId\":\"" + app.getApplicationVersionId() + "\","
+                + "\"applicationARN\":\"%enc{" + literalForLog4j2Pattern(app.getApplicationArn()) + "}{JSON}\","
+                + "\"applicationVersionId\":\"%enc{"
+                + literalForLog4j2Pattern(String.valueOf(app.getApplicationVersionId())) + "}{JSON}\","
                 + "\"locationInformation\":\"%C.%M(%F:%L)\","
                 + "\"logger\":\"%logger\","
                 + "\"message\":\"%enc{%message}{JSON}\","
@@ -292,7 +293,46 @@ public class FlinkContainerManager {
         return properties.getBytes(StandardCharsets.UTF_8);
     }
 
+    /** Escapes an application-supplied value (e.g. the ARN, built from the caller's ApplicationName)
+     *  so it can be embedded as literal text inside a log4j2 {@code PatternLayout} pattern written to
+     *  a {@code .properties} file: doubles {@code %} so log4j2's pattern parser can't interpret it as
+     *  the start of a conversion specifier (or lookup), then backslash-escapes control characters so
+     *  the value survives {@code java.util.Properties}-style parsing of the config file intact. The
+     *  surrounding {@code %enc{...}{JSON}} wrapper (already used for %message/%thread/%ex above) then
+     *  JSON-escapes the resulting literal at log time, so quotes/backslashes in the original value
+     *  can't break the emitted JSON. */
+    private static String literalForLog4j2Pattern(String value) {
+        String percentEscaped = value.replace("%", "%%");
+        StringBuilder escaped = new StringBuilder(percentEscaped.length());
+        for (int i = 0; i < percentEscaped.length(); i++) {
+            char c = percentEscaped.charAt(i);
+            switch (c) {
+                case '\\' -> escaped.append("\\\\");
+                case '\n' -> escaped.append("\\n");
+                case '\r' -> escaped.append("\\r");
+                case '\t' -> escaped.append("\\t");
+                default -> {
+                    if (c < 0x20) {
+                        escaped.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        escaped.append(c);
+                    }
+                }
+            }
+        }
+        return escaped.toString();
+    }
+
     private void copyFileIntoContainer(String containerId, String remoteDir, String relativePath, byte[] content) {
+        copyFileIntoContainer(containerId, remoteDir, relativePath, content, false);
+    }
+
+    /** @param required when {@code true}, a failed copy is rethrown instead of only logged, so a
+     *  caller for whom the file is not optional (e.g. the log4j2 config that this cluster's whole
+     *  CloudWatch-log-shape guarantee depends on) fails the start instead of silently running with
+     *  the stock config. */
+    private void copyFileIntoContainer(String containerId, String remoteDir, String relativePath, byte[] content,
+            boolean required) {
         if (containerId == null) {
             return;
         }
@@ -303,6 +343,10 @@ public class FlinkContainerManager {
                     .withRemotePath(remoteDir)
                     .exec();
         } catch (Exception e) {
+            if (required) {
+                throw new IllegalStateException(
+                        "Could not copy " + relativePath + " into Flink container " + containerId, e);
+            }
             LOG.warnv("Could not copy {0} into Flink container {1}: {2}", relativePath, containerId, e.getMessage());
         }
     }

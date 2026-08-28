@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.kinesisanalytics.container;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.dockerjava.api.DockerClient;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
@@ -34,6 +35,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
@@ -97,6 +99,11 @@ class FlinkContainerManagerTest {
         ContainerBuilder containerBuilder = new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer);
 
         lifecycleManager = mock(ContainerLifecycleManager.class);
+        // The log4j-console.properties copy is now required (a failure fails cluster startup, see
+        // log4jConfigCopyFailureRollsBackTheClusterInsteadOfStartingWithTheStockLogFormat below), so
+        // every test that gets as far as create() succeeding needs a working docker client for that
+        // copy to land on by default.
+        when(lifecycleManager.getDockerClient()).thenReturn(mock(DockerClient.class, RETURNS_DEEP_STUBS));
         ContainerLogStreamer logStreamer = mock(ContainerLogStreamer.class);
         ContainerDetector containerDetector = mock(ContainerDetector.class);
         RegionResolver regionResolver = mock(RegionResolver.class);
@@ -143,6 +150,7 @@ class FlinkContainerManagerTest {
 
         ContainerLifecycleManager lifecycleManager = Mockito.mock(ContainerLifecycleManager.class);
         when(lifecycleManager.create(any())).thenReturn("jm-container-id");
+        when(lifecycleManager.getDockerClient()).thenReturn(mock(DockerClient.class, RETURNS_DEEP_STUBS));
         when(lifecycleManager.startCreated(any(), any())).thenReturn(
                 new ContainerLifecycleManager.ContainerInfo("jm-container-id", Map.of(8081,
                         new ContainerLifecycleManager.EndpointInfo("localhost", 8081))));
@@ -218,10 +226,34 @@ class FlinkContainerManagerTest {
         String config = new String(manager.msfStyleLog4j2Config(app), java.nio.charset.StandardCharsets.UTF_8);
 
         assertTrue(config.contains(
-                "\"applicationARN\":\"arn:aws:kinesisanalytics:us-east-1:000000000000:application/demo\""));
-        assertTrue(config.contains("\"applicationVersionId\":\"2\""));
+                "\"applicationARN\":\"%enc{arn:aws:kinesisanalytics:us-east-1:000000000000:application/demo}{JSON}\""));
+        assertTrue(config.contains("\"applicationVersionId\":\"%enc{2}{JSON}\""));
         assertTrue(config.contains("\"messageSchemaVersion\":\"1\""));
         assertTrue(config.contains("appender.console.layout.type = PatternLayout"));
+    }
+
+    @Test
+    void msfStyleLog4j2ConfigEscapesLog4jAndPropertiesSyntaxInTheApplicationName() throws Exception {
+        // ApplicationName flows straight into the ARN with no character-set validation today, so a
+        // name containing '%' (a log4j2 conversion-specifier marker) or '\' (a java.util.Properties
+        // escape character, since Flink loads this file with Properties-style parsing) must not reach
+        // the pattern unescaped -- otherwise it either breaks log4j2's config parser or lets the value
+        // corrupt/collide with the surrounding pattern syntax before %enc{}{JSON} ever sees it.
+        FlinkApplication app = new FlinkApplication("100%-\\-owned",
+                "arn:aws:kinesisanalytics:us-east-1:000000000000:application/100%-\\-owned",
+                "FLINK-2_3", "arn:aws:iam::000000000000:role/x", "STREAMING");
+        app.setApplicationVersionId(1L);
+
+        String config = new String(manager.msfStyleLog4j2Config(app), java.nio.charset.StandardCharsets.UTF_8);
+
+        assertTrue(config.contains(
+                "\"applicationARN\":\"%enc{arn:aws:kinesisanalytics:us-east-1:000000000000:application/100%%-\\\\-owned}{JSON}\""));
+
+        java.util.Properties parsed = new java.util.Properties();
+        parsed.load(new java.io.ByteArrayInputStream(config.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        String loadedPattern = parsed.getProperty("appender.console.layout.pattern");
+        assertTrue(loadedPattern.contains(
+                "\"applicationARN\":\"%enc{arn:aws:kinesisanalytics:us-east-1:000000000000:application/100%%-\\-owned}{JSON}\""));
     }
 
     @Test
@@ -305,6 +337,25 @@ class FlinkContainerManagerTest {
         assertNull(app.getContainerId());
         assertNull(app.getRestEndpoint());
         assertNull(app.getTaskManagerContainerId());
+    }
+
+    @Test
+    void log4jConfigCopyFailureRollsBackTheClusterInsteadOfStartingWithTheStockLogFormat() {
+        // Before this test, a failed copy of log4j-console.properties was only logged: startCreated()
+        // still ran and startCluster() reported success, so the cluster silently kept the stock
+        // (non-JSON) log format instead of the MSF-style CloudWatch schema this whole feature exists
+        // to provide. copyFileIntoContainer(..., required=true) now rethrows instead, so this failure
+        // takes the same create()-failure rollback path already covered above.
+        FlinkApplication app = application("log4j-copy-failure");
+        when(lifecycleManager.create(any())).thenReturn("jm-id");
+        when(lifecycleManager.getDockerClient()).thenThrow(new RuntimeException("docker copy unavailable"));
+
+        assertThrows(RuntimeException.class, () -> manager.startCluster(app));
+
+        verify(lifecycleManager, times(2)).removeIfExists("floci-kinesisanalytics-log4j-copy-failure");
+        verify(lifecycleManager, atLeastOnce()).removeIfExists("floci-kinesisanalytics-log4j-copy-failure-tm");
+        verify(lifecycleManager, Mockito.never()).startCreated(any(), any());
+        assertNull(app.getContainerId());
     }
 
     private List<ContainerSpec> captureCreatedSpecs() {
