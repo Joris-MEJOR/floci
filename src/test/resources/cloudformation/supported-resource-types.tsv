@@ -17,7 +17,7 @@ AWS::AutoScaling::LifecycleHook	AutoScalingLifecycleHookCfnProvisioner
 AWS::Batch::ComputeEnvironment	LEGACY_SWITCH
 AWS::Batch::JobDefinition	LEGACY_SWITCH
 AWS::Batch::JobQueue	LEGACY_SWITCH
-AWS::CDK::Metadata	LEGACY_SWITCH
+AWS::CDK::Metadata	CdkMetadataCfnProvisioner
 AWS::CloudFormation::CustomResource	LEGACY_SWITCH
 AWS::CloudFront::Distribution	LEGACY_SWITCH
 AWS::CloudWatch::Alarm	LEGACY_SWITCH
@@ -49,7 +49,7 @@ AWS::EC2::SubnetRouteTableAssociation	LEGACY_SWITCH
 AWS::EC2::VPC	Ec2VpcCfnProvisioner
 AWS::EC2::VPCEndpoint	Ec2VpcEndpointCfnProvisioner
 AWS::EC2::VPCGatewayAttachment	Ec2VpcGatewayAttachmentCfnProvisioner
-AWS::ECR::Repository	LEGACY_SWITCH
+AWS::ECR::Repository	EcrCfnProvisioner
 AWS::ECS::CapacityProvider	EcsCapacityCfnProvisioner
 AWS::ECS::Cluster	LEGACY_SWITCH
 AWS::ECS::ClusterCapacityProviderAssociations	EcsCapacityCfnProvisioner
@@ -70,10 +70,10 @@ AWS::IAM::ManagedPolicy	LEGACY_SWITCH
 AWS::IAM::Policy	LEGACY_SWITCH
 AWS::IAM::Role	IamRoleCfnProvisioner
 AWS::IAM::User	LEGACY_SWITCH
-AWS::KMS::Alias	LEGACY_SWITCH
-AWS::KMS::Key	LEGACY_SWITCH
+AWS::KMS::Alias	KmsCfnProvisioner
+AWS::KMS::Key	KmsCfnProvisioner
 AWS::Kinesis::Stream	LEGACY_SWITCH
-AWS::KinesisFirehose::DeliveryStream	LEGACY_SWITCH
+AWS::KinesisFirehose::DeliveryStream	FirehoseCfnProvisioner
 AWS::Lambda::Alias	LambdaVersionAliasCfnProvisioner
 AWS::Lambda::EventSourceMapping	LEGACY_SWITCH
 AWS::Lambda::Function	LEGACY_SWITCH
@@ -88,7 +88,7 @@ AWS::Organizations::Organization	OrganizationsCfnProvisioner
 AWS::Organizations::OrganizationalUnit	OrganizationsCfnProvisioner
 AWS::Organizations::Policy	OrganizationsCfnProvisioner
 AWS::Organizations::ResourcePolicy	OrganizationsCfnProvisioner
-AWS::Pipes::Pipe	LEGACY_SWITCH
+AWS::Pipes::Pipe	PipesCfnProvisioner
 AWS::RDS::DBCluster	LEGACY_SWITCH
 AWS::RDS::DBClusterParameterGroup	LEGACY_SWITCH
 AWS::RDS::DBInstance	LEGACY_SWITCH
@@ -104,7 +104,7 @@ AWS::SNS::Subscription	LEGACY_SWITCH
 AWS::SNS::Topic	LEGACY_SWITCH
 AWS::SQS::Queue	SqsCfnProvisioner
 AWS::SQS::QueuePolicy	SqsCfnProvisioner
-AWS::SSM::Parameter	LEGACY_SWITCH
+AWS::SSM::Parameter	SsmCfnProvisioner
 AWS::SecretsManager::Secret	LEGACY_SWITCH
 AWS::SecretsManager::SecretTargetAttachment	LEGACY_SWITCH
 AWS::StepFunctions::StateMachine	LEGACY_SWITCH

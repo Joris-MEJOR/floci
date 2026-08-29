@@ -224,7 +224,6 @@ public class CloudFormationResourceProvisioner {
             "AWS::Batch::ComputeEnvironment",
             "AWS::Batch::JobDefinition",
             "AWS::Batch::JobQueue",
-            "AWS::CDK::Metadata",
             "AWS::CloudFormation::CustomResource",
             "AWS::CloudFront::Distribution",
             "AWS::CloudWatch::Alarm",
@@ -241,7 +240,6 @@ public class CloudFormationResourceProvisioner {
             "AWS::EC2::SecurityGroup",
             "AWS::EC2::Subnet",
             "AWS::EC2::SubnetRouteTableAssociation",
-            "AWS::ECR::Repository",
             "AWS::ECS::Cluster",
             "AWS::ECS::Service",
             "AWS::ECS::TaskDefinition",
@@ -259,15 +257,11 @@ public class CloudFormationResourceProvisioner {
             "AWS::IAM::ManagedPolicy",
             "AWS::IAM::Policy",
             "AWS::IAM::User",
-            "AWS::KMS::Alias",
-            "AWS::KMS::Key",
             "AWS::Kinesis::Stream",
-            "AWS::KinesisFirehose::DeliveryStream",
             "AWS::Lambda::EventSourceMapping",
             "AWS::Lambda::Function",
             "AWS::Lambda::LayerVersion",
             "AWS::Logs::LogGroup",
-            "AWS::Pipes::Pipe",
             "AWS::RDS::DBCluster",
             "AWS::RDS::DBClusterParameterGroup",
             "AWS::RDS::DBInstance",
@@ -281,7 +275,6 @@ public class CloudFormationResourceProvisioner {
             "AWS::S3::BucketPolicy",
             "AWS::SNS::Subscription",
             "AWS::SNS::Topic",
-            "AWS::SSM::Parameter",
             "AWS::SecretsManager::Secret",
             "AWS::SecretsManager::SecretTargetAttachment",
             "AWS::StepFunctions::StateMachine",
@@ -302,14 +295,10 @@ public class CloudFormationResourceProvisioner {
     private final DynamoDbService dynamoDbService;
     private final LambdaService lambdaService;
     private final IamService iamService;
-    private final SsmService ssmService;
-    private final KmsService kmsService;
     private final SecretsManagerService secretsManagerService;
     private final EventBridgeService eventBridgeService;
     private final ApiGatewayService apiGatewayService;
     private final ApiGatewayV2Service apiGatewayV2Service;
-    private final EcrService ecrService;
-    private final PipesService pipesService;
     private final CognitoService cognitoService;
     private final LambdaLayerService lambdaLayerService;
     private final ObjectMapper objectMapper;
@@ -326,7 +315,6 @@ public class CloudFormationResourceProvisioner {
     private final KinesisService kinesisService;
     private final CloudWatchMetricsService cloudWatchMetricsService;
     private final AutoScalingService autoScalingService;
-    private final FirehoseService firehoseService;
     private final DocDbService docDbService;
     private final CloudFrontService cloudFrontService;
     // Item 15 decomposition: extracted per-service provisioners are consulted before the switch
@@ -375,14 +363,10 @@ public class CloudFormationResourceProvisioner {
         this.dynamoDbService = dynamoDbService;
         this.lambdaService = lambdaService;
         this.iamService = iamService;
-        this.ssmService = ssmService;
-        this.kmsService = kmsService;
         this.secretsManagerService = secretsManagerService;
         this.eventBridgeService = eventBridgeService;
         this.apiGatewayService = apiGatewayService;
         this.apiGatewayV2Service = apiGatewayV2Service;
-        this.ecrService = ecrService;
-        this.pipesService = pipesService;
         this.cognitoService = cognitoService;
         this.lambdaLayerService = lambdaLayerService;
         this.objectMapper = objectMapper;
@@ -399,7 +383,6 @@ public class CloudFormationResourceProvisioner {
         this.kinesisService = kinesisService;
         this.cloudWatchMetricsService = cloudWatchMetricsService;
         this.autoScalingService = autoScalingService;
-        this.firehoseService = firehoseService;
         this.docDbService = docDbService;
         this.cloudFrontService = cloudFrontService;
         this.resourceRegistry = resourceRegistry;
@@ -456,15 +439,10 @@ public class CloudFormationResourceProvisioner {
                 case "AWS::IAM::ManagedPolicy" ->
                         provisionIamManagedPolicy(resource, properties, engine, accountId, stackName);
                 case "AWS::IAM::InstanceProfile" -> provisionInstanceProfile(resource, properties, engine, accountId, stackName);
-                case "AWS::SSM::Parameter" -> provisionSsmParameter(resource, properties, engine, region, stackName);
-                case "AWS::KMS::Key" -> provisionKmsKey(resource, properties, engine, region, accountId);
-                case "AWS::KMS::Alias" -> provisionKmsAlias(resource, properties, engine, region);
                 case "AWS::SecretsManager::Secret" -> provisionSecret(resource, properties, engine, region, accountId, stackName);
                 case "AWS::SecretsManager::SecretTargetAttachment" ->
                         provisionSecretTargetAttachment(resource, properties, engine, region, stackName);
-                case "AWS::CDK::Metadata" -> provisionCdkMetadata(resource);
                 case "AWS::S3::BucketPolicy" -> provisionS3BucketPolicy(resource, properties, engine);
-                case "AWS::ECR::Repository" -> provisionEcrRepository(resource, properties, engine, stackName, region);
                 case "AWS::Route53::HostedZone" -> provisionRoute53HostedZone(resource, properties, engine);
                 case "AWS::Route53::RecordSet" -> provisionRoute53RecordSet(resource, properties, engine);
                 case "AWS::Events::Rule" -> provisionEventBridgeRule(resource, properties, engine, region, stackName);
@@ -482,7 +460,6 @@ public class CloudFormationResourceProvisioner {
                 case "AWS::ApiGatewayV2::Integration" -> provisionApiGatewayV2Integration(resource, properties, engine, region);
                 case "AWS::ApiGatewayV2::Stage" -> provisionApiGatewayV2Stage(resource, properties, engine, region);
                 case "AWS::ApiGatewayV2::Deployment" -> provisionApiGatewayV2Deployment(resource, properties, engine, region);
-                case "AWS::Pipes::Pipe" -> provisionPipe(resource, properties, engine, region, stackName);
                 case "AWS::StepFunctions::StateMachine" ->
                         provisionStepFunctionsStateMachine(
                                 resource,
@@ -529,8 +506,6 @@ public class CloudFormationResourceProvisioner {
                 case "AWS::EC2::Route" -> provisionRoute(resource, properties, engine, region);
                 case "AWS::EC2::NatGateway" -> provisionNatGateway(resource, properties, engine, region);
                 case "AWS::EC2::EIP" -> provisionEip(resource, region);
-                case "AWS::KinesisFirehose::DeliveryStream" ->
-                        provisionFirehoseDeliveryStream(resource, properties, engine, stackName);
                 case "AWS::EC2::Instance" -> provisionEc2Instance(resource, properties, engine, region);
                 // RDS. DBInstance/DBCluster start real RDS containers (same as the direct API).
                 case "AWS::RDS::DBSubnetGroup" -> provisionDbSubnetGroup(resource, properties, engine, stackName, region);
@@ -749,10 +724,6 @@ public class CloudFormationResourceProvisioner {
             case "AWS::IAM::Policy" -> { }
             case "AWS::IAM::ManagedPolicy" -> deletePolicySafe(physicalId);
             case "AWS::IAM::InstanceProfile" -> iamService.deleteInstanceProfile(physicalId);
-            case "AWS::SSM::Parameter" -> ssmService.deleteParameter(physicalId, region);
-            case "AWS::KMS::Key" -> {
-            } // KMS keys can't be immediately deleted; skip
-            case "AWS::KMS::Alias" -> kmsService.deleteAlias(physicalId, region);
             case "AWS::SecretsManager::Secret" -> deleteSecretSafe(physicalId, region);
             case "AWS::SecretsManager::SecretTargetAttachment" -> throw new AwsException(
                     "ValidationError",
@@ -764,9 +735,6 @@ public class CloudFormationResourceProvisioner {
             case "AWS::Events::EventBusPolicy" -> removeEventBusPolicySafe(physicalId, region);
             case "AWS::ApiGateway::RestApi" -> apiGatewayService.deleteRestApi(region, physicalId);
             case "AWS::ApiGatewayV2::Api" -> apiGatewayV2Service.deleteApi(region, physicalId);
-            case "AWS::ECR::Repository" ->
-                    ecrService.deleteRepository(physicalId, null, true, region);
-            case "AWS::Pipes::Pipe" -> pipesService.deletePipe(physicalId, region);
             case "AWS::StepFunctions::StateMachine" -> stepFunctionsService.deleteStateMachine(physicalId);
             case "AWS::Lambda::EventSourceMapping" -> lambdaService.deleteEventSourceMapping(physicalId);
             case "AWS::Lambda::LayerVersion" -> deleteLambdaLayerVersion(physicalId, region);
@@ -779,7 +747,6 @@ public class CloudFormationResourceProvisioner {
             case "AWS::ElasticLoadBalancingV2::TargetGroup" -> elbV2Service.deleteTargetGroup(region, physicalId);
             case "AWS::ElasticLoadBalancingV2::Listener" -> elbV2Service.deleteListener(region, physicalId);
             case "AWS::ElasticLoadBalancingV2::ListenerRule" -> elbV2Service.deleteRule(region, physicalId);
-            case "AWS::KinesisFirehose::DeliveryStream" -> firehoseService.deleteDeliveryStream(physicalId);
             case "AWS::EC2::SecurityGroup" -> ec2Service.deleteSecurityGroup(region, physicalId);
             case "AWS::EC2::Instance" -> ec2Service.terminateInstances(region, List.of(physicalId));
             case "AWS::RDS::DBInstance" -> rdsService.deleteDbInstance(physicalId, region);
@@ -2184,50 +2151,6 @@ public class CloudFormationResourceProvisioner {
 
     // ── Kinesis Data Firehose ───────────────────────────────────────────────────
 
-    private void provisionFirehoseDeliveryStream(StackResource r, JsonNode props,
-                                                 CloudFormationTemplateEngine engine, String stackName) {
-        String name = resolveOptional(props, "DeliveryStreamName", engine);
-        if (name == null || name.isBlank()) {
-            name = generatePhysicalName(stackName, r.getLogicalId(), 64, false);
-        }
-
-        DeliveryStreamDescription.S3Destination s3 = null;
-        JsonNode s3Node = props != null && props.has("ExtendedS3DestinationConfiguration")
-                ? props.get("ExtendedS3DestinationConfiguration")
-                : (props != null ? props.get("S3DestinationConfiguration") : null);
-        if (s3Node != null && !s3Node.isNull()) {
-            s3 = new DeliveryStreamDescription.S3Destination();
-
-            s3.setCompressionFormat(
-                blankToNull(engine.resolve(s3Node.path("CompressionFormat")))
-            );
-            s3.setBucketArn(blankToNull(engine.resolve(s3Node.path("BucketARN"))));
-            s3.setPrefix(blankToNull(engine.resolve(s3Node.path("Prefix"))));
-            if (s3Node.has("BufferingHints")) {
-                JsonNode hints = s3Node.get("BufferingHints");
-                var bufferingHints = new DeliveryStreamDescription.BufferingHints();
-                bufferingHints.setSizeInMBs(parseIntProp(hints, "SizeInMBs", engine, 5));
-                bufferingHints.setIntervalInSeconds(parseIntProp(hints, "IntervalInSeconds", engine, 300));
-                s3.setBufferingHints(bufferingHints);
-            }
-        }
-
-        List<DeliveryStreamDescription.Tag> tags = new ArrayList<>();
-        if (props != null && props.has("Tags") && props.get("Tags").isArray()) {
-            for (JsonNode tag : props.get("Tags")) {
-                String key = engine.resolve(tag.path("Key"));
-                if (!key.isEmpty()) {
-                    tags.add(new DeliveryStreamDescription.Tag(key, engine.resolve(tag.path("Value"))));
-                }
-            }
-        }
-
-        String arn = firehoseService.createDeliveryStream(name, s3, tags);
-        // Ref returns the delivery stream name; Fn::GetAtt Arn returns the stream ARN.
-        r.setPhysicalId(name);
-        r.getAttributes().put("Arn", arn);
-    }
-
     // ── SNS ───────────────────────────────────────────────────────────────────
 
     private void provisionSnsTopic(StackResource r, JsonNode props, CloudFormationTemplateEngine engine,
@@ -3275,48 +3198,7 @@ public class CloudFormationResourceProvisioner {
 
     // ── SSM Parameter ─────────────────────────────────────────────────────────
 
-    private void provisionSsmParameter(StackResource r, JsonNode props, CloudFormationTemplateEngine engine,
-                                       String region, String stackName) {
-        String name = resolveOptional(props, "Name", engine);
-        if (name == null || name.isBlank()) {
-            name = generatePhysicalName(stackName, r.getLogicalId(), 2048, false);
-        }
-        String value = resolveOptional(props, "Value", engine);
-        if (value == null) {
-            value = "";
-        }
-        String type = resolveOptional(props, "Type", engine);
-        if (type == null) {
-            type = "String";
-        }
-        ssmService.putParameter(name, value, type, null, true, region);
-        r.setPhysicalId(name);
-        r.getAttributes().put("Name", name);
-        r.getAttributes().put("Type", type);
-        r.getAttributes().put("Value", value);
-    }
-
     // ── KMS ───────────────────────────────────────────────────────────────────
-
-    private void provisionKmsKey(StackResource r, JsonNode props, CloudFormationTemplateEngine engine,
-                                 String region, String accountId) {
-        String description = resolveOptional(props, "Description", engine);
-        Map<String, String> tags = parseCfnTags(props != null ? props.get("Tags") : null, engine);
-        var key = kmsService.createKey(description, null, tags, region);
-        r.setPhysicalId(key.getKeyId());
-        r.getAttributes().put("Arn", key.getArn());
-        r.getAttributes().put("KeyId", key.getKeyId());
-    }
-
-    private void provisionKmsAlias(StackResource r, JsonNode props, CloudFormationTemplateEngine engine,
-                                   String region) {
-        String aliasName = resolveOptional(props, "AliasName", engine);
-        String targetKeyId = resolveOptional(props, "TargetKeyId", engine);
-        if (aliasName != null && targetKeyId != null) {
-            kmsService.createAlias(aliasName, targetKeyId, region);
-        }
-        r.setPhysicalId(aliasName != null ? aliasName : "alias/cfn-" + UUID.randomUUID().toString().substring(0, 8));
-    }
 
     // ── Secrets Manager ───────────────────────────────────────────────────────
 
@@ -4473,46 +4355,6 @@ public class CloudFormationResourceProvisioner {
 
     // ── Pipes ──────────────────────────────────────────────────────────────────
 
-    private void provisionPipe(StackResource r, JsonNode props, CloudFormationTemplateEngine engine,
-                               String region, String stackName) {
-        String name = resolveOptional(props, "Name", engine);
-        if (name == null || name.isBlank()) {
-            name = generatePhysicalName(stackName, r.getLogicalId(), 64, false);
-        }
-
-        String source = resolveOptional(props, "Source", engine);
-        String target = resolveOptional(props, "Target", engine);
-        String roleArn = resolveOptional(props, "RoleArn", engine);
-        String description = resolveOptional(props, "Description", engine);
-        String enrichment = resolveOptional(props, "Enrichment", engine);
-
-        String stateStr = resolveOptional(props, "DesiredState", engine);
-        DesiredState desiredState = "STOPPED".equals(stateStr) ? DesiredState.STOPPED : DesiredState.RUNNING;
-
-        JsonNode sourceParameters = null;
-        if (props != null && props.has("SourceParameters") && !props.get("SourceParameters").isNull()) {
-            sourceParameters = engine.resolveNode(props.get("SourceParameters"));
-        }
-
-        JsonNode targetParameters = null;
-        if (props != null && props.has("TargetParameters") && !props.get("TargetParameters").isNull()) {
-            targetParameters = engine.resolveNode(props.get("TargetParameters"));
-        }
-
-        JsonNode enrichmentParameters = null;
-        if (props != null && props.has("EnrichmentParameters") && !props.get("EnrichmentParameters").isNull()) {
-            enrichmentParameters = engine.resolveNode(props.get("EnrichmentParameters"));
-        }
-
-        Map<String, String> tags = parseCfnTags(props != null ? props.get("Tags") : null, engine);
-
-        var pipe = pipesService.createPipe(name, source, target, roleArn, description, desiredState,
-                enrichment, sourceParameters, targetParameters, enrichmentParameters, tags, region);
-
-        r.setPhysicalId(name);
-        r.getAttributes().put("Arn", pipe.getArn());
-    }
-
     private void provisionStepFunctionsStateMachine(StackResource r, JsonNode props,
                                                     CloudFormationTemplateEngine engine,
                                                     String region, String accountId,
@@ -5117,10 +4959,6 @@ public class CloudFormationResourceProvisioner {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private void provisionCdkMetadata(StackResource r) {
-        r.setPhysicalId("cdk-metadata-" + UUID.randomUUID().toString().substring(0, 8));
-    }
-
     private void provisionS3BucketPolicy(StackResource r, JsonNode props, CloudFormationTemplateEngine engine) {
         r.setPhysicalId("bucket-policy-" + UUID.randomUUID().toString().substring(0, 8));
     }
@@ -5144,51 +4982,6 @@ public class CloudFormationResourceProvisioner {
             r.setPhysicalId(key.getAccessKeyId());
             r.getAttributes().put("SecretAccessKey", key.getSecretAccessKey());
         }
-    }
-
-    private void provisionEcrRepository(StackResource r, JsonNode props, CloudFormationTemplateEngine engine,
-                                        String stackName, String region) {
-        String repoName = resolveOptional(props, "RepositoryName", engine);
-        if (repoName == null || repoName.isBlank()) {
-            repoName = generatePhysicalName(stackName, r.getLogicalId(), 256, true);
-        }
-        // CDK bootstrap requires lower-case repository names; CFN-generated suffixes can include
-        // upper-case characters. Normalize to satisfy the AWS ECR repository name pattern.
-        repoName = repoName.toLowerCase();
-
-        String mutability = resolveOptional(props, "ImageTagMutability", engine);
-        Map<String, String> tags = parseCfnTags(props != null ? props.get("Tags") : null, engine);
-
-        Repository repo;
-        try {
-            repo = ecrService.createRepository(repoName, null, mutability, null, null, null, tags, region);
-        } catch (AwsException e) {
-            if ("RepositoryAlreadyExistsException".equals(e.getErrorCode())) {
-                repo = ecrService.describeRepositories(List.of(repoName), null, region).get(0);
-            } else {
-                throw e;
-            }
-        }
-
-        // Lifecycle policy can be inlined as `LifecyclePolicy.LifecyclePolicyText`
-        if (props != null && props.has("LifecyclePolicy")) {
-            JsonNode lp = engine.resolveNode(props.get("LifecyclePolicy"));
-            String policyText = lp.path("LifecyclePolicyText").asText(null);
-            if (policyText != null && !policyText.isEmpty()) {
-                ecrService.putLifecyclePolicy(repoName, null, policyText, region);
-            }
-        }
-        if (props != null && props.has("RepositoryPolicyText")) {
-            JsonNode pol = engine.resolveNode(props.get("RepositoryPolicyText"));
-            String policyText = pol.isTextual() ? pol.asText() : pol.toString();
-            if (policyText != null && !policyText.isEmpty()) {
-                ecrService.setRepositoryPolicy(repoName, null, policyText, region);
-            }
-        }
-
-        r.setPhysicalId(repoName);
-        r.getAttributes().put("Arn", repo.getRepositoryArn());
-        r.getAttributes().put("RepositoryUri", repo.getRepositoryUri());
     }
 
     private Map<String, String> parseCfnTags(JsonNode tagsNode, CloudFormationTemplateEngine engine) {
