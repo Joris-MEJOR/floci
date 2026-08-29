@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.cloudformation;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
@@ -51,12 +52,13 @@ class CustomResourceProviderFrameworkTest {
         ContainerReachableEndpoint endpoint = mock(ContainerReachableEndpoint.class);
         when(endpoint.baseUrl()).thenReturn("http://floci:4566");
 
-        provisioner = new CloudFormationResourceProvisioner(
-                null, null, null, null, lambdaService, null, null, null, null, null,
-                null, null, null, null, null, null, mapper, store, endpoint, null, null, null, null, null, null, null, null, null, null, null, null,
-                null, null,
-                new io.github.hectorvent.floci.services.cloudformation.provisioners.CloudFormationResourceRegistry(java.util.List.of()),
-                mock(io.github.hectorvent.floci.config.EmulatorConfig.class));
+        provisioner = CfnProvisionerFixture.builder()
+                .lambda(lambdaService)
+                .objectMapper(mapper)
+                .customResourceResponseStore(store)
+                .reachableEndpoint(endpoint)
+                .config(mock(EmulatorConfig.class))
+                .build();
     }
 
     private CloudFormationTemplateEngine engine() {
