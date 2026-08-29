@@ -49,31 +49,32 @@ the backing service and sets a real physical ID plus the `Ref` / `Fn::GetAtt` at
 cross-resource references.
 
 > Adding a type? See [Adding a CloudFormation Resource Type](../../CONTRIBUTING.md#adding-a-cloudformation-resource-type).
-> Types live in per-service provisioners under `services/cloudformation/provisioners/`; keep this
-> table in step with them.
+> Types live in per-service provisioners under `services/cloudformation/provisioners/`. This table
+> is generated from the provisioner inventory by `make docs-sync`; edit that, not the table.
 
+<!-- floci:cfn-types:start -->
 | Service | Resource types |
 |---|---|
 | S3 | `Bucket`, `BucketPolicy` (accepted; policy not enforced) |
 | SQS | `Queue`, `QueuePolicy` (accepted; policy not enforced) |
 | SNS | `Topic`, `Subscription` |
 | DynamoDB | `Table`, `GlobalTable` |
-| Lambda | `Function` (Zip via S3/inline `ZipFile`, and Image), `LayerVersion`, `EventSourceMapping` (SQS, Kinesis, DynamoDB Streams), `Version`, `Alias` (also what SAM's `AutoPublishAlias` expands into). Inline `ZipFile` packages include the `cfn-response` (Node.js) / `cfnresponse` (Python) module AWS injects for that code path, so Solutions-style custom-resource handlers work |
+| Lambda | `Function` (Zip via S3/inline `ZipFile`, and Image), `LayerVersion`, `EventSourceMapping` (SQS, Kinesis, DynamoDB Streams), `Version`, `Alias` (also what SAM's `AutoPublishAlias` expands into), `Permission`, `MicrovmImage`, `NetworkConnector`. Inline `ZipFile` packages include the `cfn-response` (Node.js) / `cfnresponse` (Python) module AWS injects for that code path, so Solutions-style custom-resource handlers work. |
 | IAM | `Role`, `User`, `AccessKey`, `Policy`, `ManagedPolicy`, `InstanceProfile` |
 | Organizations | `Organization`, `OrganizationalUnit`, `Account`, `Policy`, `ResourcePolicy` |
 | SSM | `Parameter` |
 | KMS | `Key`, `Alias` |
 | Secrets Manager | `Secret`, `SecretTargetAttachment` |
 | ECR | `Repository` |
-| ECS | `Cluster`, `TaskDefinition`, `Service` |
+| ECS | `Cluster`, `TaskDefinition`, `Service`, `CapacityProvider`, `ClusterCapacityProviderAssociations` |
 | EKS | `Cluster`, `Nodegroup` |
-| RDS | `DBInstance`, `DBCluster`, `DBSubnetGroup`, `DBParameterGroup`, `DBClusterParameterGroup` (DBInstance/DBCluster start real containers) |
-| EC2 | `VPC`, `Subnet`, `SecurityGroup` (including inline `SecurityGroupIngress`/`SecurityGroupEgress`), `SecurityGroupIngress`, `SecurityGroupEgress`, `InternetGateway`, `RouteTable`, `SubnetRouteTableAssociation`, `Route`, `NatGateway`, `EIP`, `Instance`, `LaunchTemplate`, `VPCGatewayAttachment`, `NetworkAcl`, `NetworkAclEntry`, `SubnetNetworkAclAssociation`, `FlowLog` |
+| RDS | `DBInstance` (starts a real container), `DBCluster` (starts a real container), `DBSubnetGroup`, `DBParameterGroup`, `DBClusterParameterGroup`, `DBProxy`, `DBProxyTargetGroup` |
+| EC2 | `VPC`, `Subnet`, `SecurityGroup` (inline `SecurityGroupIngress`/`SecurityGroupEgress` supported), `SecurityGroupIngress`, `SecurityGroupEgress`, `InternetGateway`, `RouteTable`, `SubnetRouteTableAssociation`, `Route`, `NatGateway`, `EIP`, `Instance`, `LaunchTemplate`, `VPCGatewayAttachment`, `VPCEndpoint`, `NetworkAcl`, `NetworkAclEntry`, `SubnetNetworkAclAssociation`, `FlowLog` |
 | Elastic Load Balancing v2 | `LoadBalancer`, `TargetGroup`, `Listener`, `ListenerRule` |
 | Auto Scaling | `LaunchConfiguration`, `AutoScalingGroup`, `LifecycleHook` |
 | Route 53 | `HostedZone`, `RecordSet` |
 | API Gateway (v1) | `RestApi`, `Resource`, `Authorizer`, `Method`, `Deployment`, `Stage`, `Account` |
-| API Gateway v2 | `Api`, `Route`, `Integration`, `Stage`, `Deployment` |
+| API Gateway v2 | `Api`, `Authorizer`, `Route`, `Integration`, `Stage`, `Deployment` |
 | Step Functions | `StateMachine` |
 | CodePipeline | `Pipeline`, `CustomActionType`, `Webhook` |
 | CodeBuild | `Project` |
@@ -83,12 +84,14 @@ cross-resource references.
 | Pipes | `Pipe` |
 | Kinesis | `Stream` |
 | Kinesis Data Firehose | `DeliveryStream` |
+| CloudFront | `Distribution` |
 | CloudWatch | `Alarm` |
 | CloudWatch Logs | `LogGroup` |
 | WAFv2 | `WebACL` |
 | Config | `ConfigRule` |
-| CloudFormation | `Stack` (nested stacks), `CustomResource` and `Custom::*` (Lambda-backed) |
+| CloudFormation | `CustomResource`, `Custom::DynamoDBReplica` (applied natively against DynamoDB, not via a provider Lambda), `Stack` (nested stacks), `Custom::*` (Lambda-backed) |
 | CDK | `CDK::Metadata` (accepted; no-op) |
+<!-- floci:cfn-types:end -->
 
 All other resource types are accepted without error and assigned a synthetic physical ID (with an
 `arn:aws:stub:::<logicalId>` ARN attribute), so templates with unsupported types still reach
