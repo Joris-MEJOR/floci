@@ -271,8 +271,6 @@ public class CloudFormationResourceProvisioner {
             "AWS::RDS::DBSubnetGroup",
             "AWS::Route53::HostedZone",
             "AWS::Route53::RecordSet",
-            "AWS::S3::Bucket",
-            "AWS::S3::BucketPolicy",
             "AWS::SNS::Subscription",
             "AWS::SNS::Topic",
             "AWS::SecretsManager::Secret",
@@ -425,7 +423,6 @@ public class CloudFormationResourceProvisioner {
                 return resource;
             }
             switch (resourceType) {
-                case "AWS::S3::Bucket" -> provisionS3Bucket(resource, properties, engine, region, accountId, stackName);
                 case "AWS::SNS::Topic" -> provisionSnsTopic(resource, properties, engine, region, accountId, stackName);
                 case "AWS::SNS::Subscription" -> provisionSnsSubscription(resource, properties, engine, region);
                 case "AWS::DynamoDB::Table", "AWS::DynamoDB::GlobalTable" ->
@@ -442,7 +439,6 @@ public class CloudFormationResourceProvisioner {
                 case "AWS::SecretsManager::Secret" -> provisionSecret(resource, properties, engine, region, accountId, stackName);
                 case "AWS::SecretsManager::SecretTargetAttachment" ->
                         provisionSecretTargetAttachment(resource, properties, engine, region, stackName);
-                case "AWS::S3::BucketPolicy" -> provisionS3BucketPolicy(resource, properties, engine);
                 case "AWS::Route53::HostedZone" -> provisionRoute53HostedZone(resource, properties, engine);
                 case "AWS::Route53::RecordSet" -> provisionRoute53RecordSet(resource, properties, engine);
                 case "AWS::Events::Rule" -> provisionEventBridgeRule(resource, properties, engine, region, stackName);
@@ -713,7 +709,6 @@ public class CloudFormationResourceProvisioner {
             return;
         }
         switch (resourceType) {
-            case "AWS::S3::Bucket" -> s3Service.deleteBucket(physicalId);
             case "AWS::SNS::Topic" -> snsService.deleteTopic(physicalId, region);
             case "AWS::SNS::Subscription" -> snsService.unsubscribe(physicalId, region);
             case "AWS::DynamoDB::Table" -> deleteDynamoTableSafe(physicalId, region);
@@ -775,23 +770,6 @@ public class CloudFormationResourceProvisioner {
 
     // ── S3 ────────────────────────────────────────────────────────────────────
 
-    private void provisionS3Bucket(StackResource r, JsonNode props, CloudFormationTemplateEngine engine,
-                                   String region, String accountId, String stackName) {
-        String bucketName = resolveOptional(props, "BucketName", engine);
-        if (bucketName == null || bucketName.isBlank()) {
-            bucketName = generatePhysicalName(stackName, r.getLogicalId(), 63, true);
-        }
-        s3Service.createBucket(bucketName, region);
-        applyBucketCorsConfiguration(bucketName, props, engine);
-        applyBucketVersioningConfiguration(bucketName, props, engine);
-        r.setPhysicalId(bucketName);
-        r.getAttributes().put("Arn", AwsArnUtils.Arn.of("s3", "", "", bucketName).toString());
-        r.getAttributes().put("DomainName", bucketName + ".s3.amazonaws.com");
-        r.getAttributes().put("RegionalDomainName", bucketName + ".s3." + region + ".amazonaws.com");
-        r.getAttributes().put("WebsiteURL", "http://" + bucketName + ".s3-website." + region + ".amazonaws.com");
-        r.getAttributes().put("BucketName", bucketName);
-    }
-
     /**
      * Applies the optional {@code CorsConfiguration} property of {@code AWS::S3::Bucket} by translating
      * the CloudFormation {@code CorsRules} list into the S3 CORS XML document the bucket stores and
@@ -801,61 +779,6 @@ public class CloudFormationResourceProvisioner {
      * absent or has no rules, any existing CORS configuration is cleared so the bucket matches the
      * template. Clearing is a harmless no-op on create since a freshly created bucket has none.
      */
-    private void applyBucketCorsConfiguration(String bucketName, JsonNode props,
-                                              CloudFormationTemplateEngine engine) {
-        JsonNode corsRules = null;
-        if (props != null && props.has("CorsConfiguration") && !props.get("CorsConfiguration").isNull()) {
-            corsRules = props.get("CorsConfiguration").get("CorsRules");
-        }
-        if (corsRules == null || !corsRules.isArray() || corsRules.isEmpty()) {
-            s3Service.deleteBucketCors(bucketName);
-            return;
-        }
-        XmlBuilder xml = new XmlBuilder().start("CORSConfiguration", AwsNamespaces.S3);
-        for (JsonNode rule : corsRules) {
-            xml.start("CORSRule");
-            xml.elem("ID", resolveOptional(rule, "Id", engine));
-            appendCorsRuleElements(xml, rule.get("AllowedHeaders"), "AllowedHeader", engine);
-            appendCorsRuleElements(xml, rule.get("AllowedMethods"), "AllowedMethod", engine);
-            appendCorsRuleElements(xml, rule.get("AllowedOrigins"), "AllowedOrigin", engine);
-            appendCorsRuleElements(xml, rule.get("ExposedHeaders"), "ExposeHeader", engine);
-            String maxAge = resolveOptional(rule, "MaxAge", engine);
-            if (maxAge != null && !maxAge.isBlank()) {
-                xml.elem("MaxAgeSeconds", maxAge);
-            }
-            xml.end("CORSRule");
-        }
-        xml.end("CORSConfiguration");
-        s3Service.putBucketCors(bucketName, xml.build());
-    }
-
-    private void applyBucketVersioningConfiguration(String bucketName, JsonNode props,
-                                                     CloudFormationTemplateEngine engine) {
-        if (props == null || !props.has("VersioningConfiguration")
-                || props.get("VersioningConfiguration").isNull()) {
-            return;
-        }
-        String status = resolveOptional(props.get("VersioningConfiguration"), "Status", engine);
-        if (status != null && !status.isBlank()) {
-            s3Service.putBucketVersioning(bucketName, status);
-        }
-    }
-
-    private void appendCorsRuleElements(XmlBuilder xml, JsonNode values, String elementName,
-                                        CloudFormationTemplateEngine engine) {
-        if (values == null || !values.isArray()) {
-            return;
-        }
-        for (JsonNode value : values) {
-            if (value != null && !value.isNull()) {
-                String resolved = engine.resolve(value);
-                if (resolved != null && !resolved.isBlank()) {
-                    xml.elem(elementName, resolved);
-                }
-            }
-        }
-    }
-
 
     // ── EC2 networking ─────────────────────────────────────────────────────────
     // Each method delegates to Ec2Service so the resource really exists (describe-subnets,
@@ -5128,10 +5051,6 @@ public class CloudFormationResourceProvisioner {
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
-
-    private void provisionS3BucketPolicy(StackResource r, JsonNode props, CloudFormationTemplateEngine engine) {
-        r.setPhysicalId("bucket-policy-" + UUID.randomUUID().toString().substring(0, 8));
-    }
 
 
     private void provisionIamUser(StackResource r, JsonNode props, CloudFormationTemplateEngine engine,
