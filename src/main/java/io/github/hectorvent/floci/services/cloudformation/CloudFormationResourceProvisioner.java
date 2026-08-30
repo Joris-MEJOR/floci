@@ -267,8 +267,6 @@ public class CloudFormationResourceProvisioner {
             "AWS::RDS::DBSubnetGroup",
             "AWS::Route53::HostedZone",
             "AWS::Route53::RecordSet",
-            "AWS::SNS::Subscription",
-            "AWS::SNS::Topic",
             "AWS::SecretsManager::Secret",
             "AWS::SecretsManager::SecretTargetAttachment",
             "AWS::StepFunctions::StateMachine",
@@ -285,7 +283,6 @@ public class CloudFormationResourceProvisioner {
     private static final Duration CR_RESPONSE_TIMEOUT = Duration.ofSeconds(10);
 
     private final S3Service s3Service;
-    private final SnsService snsService;
     private final DynamoDbService dynamoDbService;
     private final LambdaService lambdaService;
     private final IamService iamService;
@@ -350,7 +347,6 @@ public class CloudFormationResourceProvisioner {
                                              EmulatorConfig config) {
         this.config = config;
         this.s3Service = s3Service;
-        this.snsService = snsService;
         this.dynamoDbService = dynamoDbService;
         this.lambdaService = lambdaService;
         this.iamService = iamService;
@@ -413,8 +409,6 @@ public class CloudFormationResourceProvisioner {
                 return resource;
             }
             switch (resourceType) {
-                case "AWS::SNS::Topic" -> provisionSnsTopic(resource, properties, engine, region, accountId, stackName);
-                case "AWS::SNS::Subscription" -> provisionSnsSubscription(resource, properties, engine, region);
                 case "AWS::DynamoDB::Table", "AWS::DynamoDB::GlobalTable" ->
                         provisionDynamoTable(resource, properties, engine, region, accountId, stackName);
                 case "AWS::Lambda::Function" -> provisionLambda(resource, properties, engine, region, accountId, stackName);
@@ -694,8 +688,6 @@ public class CloudFormationResourceProvisioner {
             return;
         }
         switch (resourceType) {
-            case "AWS::SNS::Topic" -> snsService.deleteTopic(physicalId, region);
-            case "AWS::SNS::Subscription" -> snsService.unsubscribe(physicalId, region);
             case "AWS::DynamoDB::Table" -> deleteDynamoTableSafe(physicalId, region);
             case "AWS::Lambda::Function" -> deleteLambdaFunctionSafe(physicalId, region);
             // AWS::IAM::Policy is inline: it is removed together with its owning principal (see
@@ -1803,50 +1795,6 @@ public class CloudFormationResourceProvisioner {
     // ── Kinesis Data Firehose ───────────────────────────────────────────────────
 
     // ── SNS ───────────────────────────────────────────────────────────────────
-
-    private void provisionSnsTopic(StackResource r, JsonNode props, CloudFormationTemplateEngine engine,
-                                   String region, String accountId, String stackName) {
-        String topicName = resolveOptional(props, "TopicName", engine);
-        String contentBasedDedupFlag = resolveOptional(props, "ContentBasedDeduplication", engine);
-        if (topicName == null || topicName.isBlank()) {
-            topicName = generatePhysicalName(stackName, r.getLogicalId(), 256, false);
-        }
-
-        Map<String, String> attributes = new HashMap<>();
-
-        if (contentBasedDedupFlag != null && !contentBasedDedupFlag.isBlank()) {
-            attributes.put("ContentBasedDeduplication", contentBasedDedupFlag);
-        }
-
-        var topic = snsService.createTopic(topicName, attributes, Map.of(), region);
-        r.setPhysicalId(topic.getTopicArn());
-        r.getAttributes().put("Arn", topic.getTopicArn());
-        r.getAttributes().put("TopicName", topicName);
-    }
-
-    private void provisionSnsSubscription(StackResource r, JsonNode props, CloudFormationTemplateEngine engine, String region) {
-        String topicArn = engine.resolve(props.path("TopicArn"));
-        String protocol = engine.resolve(props.path("Protocol"));
-        String endpoint = engine.resolve(props.path("Endpoint"));
-
-        Map<String, String> attributes = new HashMap<>();
-        if (props.has("FilterPolicy") && !props.path("FilterPolicy").isNull()) {
-            attributes.put("FilterPolicy", engine.resolveJsonAttribute(props.path("FilterPolicy")));
-        }
-        if (props.has("FilterPolicyScope")) {
-            attributes.put("FilterPolicyScope", engine.resolve(props.path("FilterPolicyScope")));
-        }
-        if (props.has("RawMessageDelivery")) {
-            attributes.put("RawMessageDelivery", engine.resolve(props.path("RawMessageDelivery")));
-        }
-        if (props.has("RedrivePolicy") && !props.path("RedrivePolicy").isNull()) {
-            attributes.put("RedrivePolicy", engine.resolveJsonAttribute(props.path("RedrivePolicy")));
-        }
-
-        var sub = snsService.subscribe(topicArn, protocol, endpoint, region, attributes);
-        r.setPhysicalId(sub.getSubscriptionArn());
-        r.getAttributes().put("Arn", sub.getSubscriptionArn());
-    }
 
     // ── DynamoDB ──────────────────────────────────────────────────────────────
 
