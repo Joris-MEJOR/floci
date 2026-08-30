@@ -20,7 +20,7 @@ AWS::Batch::JobQueue	LEGACY_SWITCH
 AWS::CDK::Metadata	CdkMetadataCfnProvisioner
 AWS::CloudFormation::CustomResource	LEGACY_SWITCH
 AWS::CloudFront::Distribution	LEGACY_SWITCH
-AWS::CloudWatch::Alarm	LEGACY_SWITCH
+AWS::CloudWatch::Alarm	CloudWatchCfnProvisioner
 AWS::CodeBuild::Project	CodeBuildCfnProvisioner
 AWS::CodePipeline::CustomActionType	CodePipelineCfnProvisioner
 AWS::CodePipeline::Pipeline	CodePipelineCfnProvisioner
@@ -72,7 +72,7 @@ AWS::IAM::Role	IamRoleCfnProvisioner
 AWS::IAM::User	LEGACY_SWITCH
 AWS::KMS::Alias	KmsCfnProvisioner
 AWS::KMS::Key	KmsCfnProvisioner
-AWS::Kinesis::Stream	LEGACY_SWITCH
+AWS::Kinesis::Stream	KinesisCfnProvisioner
 AWS::KinesisFirehose::DeliveryStream	FirehoseCfnProvisioner
 AWS::Lambda::Alias	LambdaVersionAliasCfnProvisioner
 AWS::Lambda::EventSourceMapping	LEGACY_SWITCH

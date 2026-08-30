@@ -225,7 +225,6 @@ public class CloudFormationResourceProvisioner {
             "AWS::Batch::JobQueue",
             "AWS::CloudFormation::CustomResource",
             "AWS::CloudFront::Distribution",
-            "AWS::CloudWatch::Alarm",
             "AWS::Cognito::UserPool",
             "AWS::Cognito::UserPoolClient",
             "AWS::DynamoDB::GlobalTable",
@@ -256,7 +255,6 @@ public class CloudFormationResourceProvisioner {
             "AWS::IAM::ManagedPolicy",
             "AWS::IAM::Policy",
             "AWS::IAM::User",
-            "AWS::Kinesis::Stream",
             "AWS::Lambda::EventSourceMapping",
             "AWS::Lambda::Function",
             "AWS::Lambda::LayerVersion",
@@ -307,8 +305,6 @@ public class CloudFormationResourceProvisioner {
     private final Ec2Service ec2Service;
     private final RdsService rdsService;
     private final EksService eksService;
-    private final KinesisService kinesisService;
-    private final CloudWatchMetricsService cloudWatchMetricsService;
     private final AutoScalingService autoScalingService;
     private final DocDbService docDbService;
     private final CloudFrontService cloudFrontService;
@@ -374,8 +370,6 @@ public class CloudFormationResourceProvisioner {
         this.ec2Service = ec2Service;
         this.rdsService = rdsService;
         this.eksService = eksService;
-        this.kinesisService = kinesisService;
-        this.cloudWatchMetricsService = cloudWatchMetricsService;
         this.autoScalingService = autoScalingService;
         this.docDbService = docDbService;
         this.cloudFrontService = cloudFrontService;
@@ -513,10 +507,6 @@ public class CloudFormationResourceProvisioner {
                         provisionDbProxyTargetGroup(resource, properties, engine, region);
                 case "AWS::EKS::Cluster" -> provisionEksCluster(resource, properties, engine, stackName);
                 case "AWS::EKS::Nodegroup" -> provisionEksNodegroup(resource, properties, engine, stackName);
-                case "AWS::Kinesis::Stream" ->
-                        provisionKinesisStream(resource, properties, engine, region, stackName);
-                case "AWS::CloudWatch::Alarm" ->
-                        provisionCloudWatchAlarm(resource, properties, engine, region, stackName);
                 case "AWS::AutoScaling::LaunchConfiguration" ->
                         provisionLaunchConfiguration(resource, properties, engine, region, stackName);
                 case "AWS::AutoScaling::AutoScalingGroup" ->
@@ -750,9 +740,6 @@ public class CloudFormationResourceProvisioner {
             case "AWS::RDS::DBClusterParameterGroup" ->
                     rdsService.deleteDbClusterParameterGroup(physicalId, region);
             case "AWS::EKS::Cluster" -> eksService.deleteCluster(physicalId);
-            case "AWS::Kinesis::Stream" -> kinesisService.deleteStream(physicalId, region);
-            case "AWS::CloudWatch::Alarm" ->
-                    cloudWatchMetricsService.deleteAlarms(List.of(physicalId), region);
             case "AWS::AutoScaling::LaunchConfiguration" ->
                     autoScalingService.deleteLaunchConfiguration(region, physicalId);
             case "AWS::AutoScaling::AutoScalingGroup" ->
@@ -930,159 +917,7 @@ public class CloudFormationResourceProvisioner {
 
     // ── Kinesis ─────────────────────────────────────────────────────────────────
 
-    private void provisionKinesisStream(StackResource r, JsonNode props, CloudFormationTemplateEngine engine,
-                                        String region, String stackName) {
-        String explicitName = resolveOptional(props, "Name", engine);
-        String priorPhysicalId = r.getPhysicalId();
-        String name;
-        if (explicitName != null && !explicitName.isBlank()) {
-            name = explicitName;
-        } else if (priorPhysicalId != null) {
-            name = priorPhysicalId;
-        } else {
-            name = generatePhysicalName(stackName, r.getLogicalId(), 128, false);
-        }
-        String streamMode = null;
-        if (props != null && props.has("StreamModeDetails")) {
-            streamMode = engine.resolve(props.get("StreamModeDetails").path("StreamMode"));
-            if (streamMode != null && streamMode.isBlank()) {
-                streamMode = null;
-            }
-        }
-        // ShardCount is required for PROVISIONED streams; default to 1 when unset (ON_DEMAND ignores it).
-        int shardCount = 1;
-        String shards = resolveOptional(props, "ShardCount", engine);
-        if (shards != null && !shards.isBlank()) {
-            try {
-                shardCount = Integer.parseInt(shards.trim());
-            } catch (NumberFormatException ignored) {
-                // keep default
-            }
-        }
-        Integer retention = null;
-        String retentionProp = resolveOptional(props, "RetentionPeriodHours", engine);
-        if (retentionProp != null && !retentionProp.isBlank()) {
-            try {
-                retention = Integer.parseInt(retentionProp.trim());
-            } catch (NumberFormatException ignored) {
-                // leave default
-            }
-        }
-        Map<String, String> tags = new LinkedHashMap<>();
-        if (props != null && props.has("Tags") && props.get("Tags").isArray()) {
-            for (JsonNode tag : props.get("Tags")) {
-                String key = engine.resolve(tag.path("Key"));
-                if (!key.isEmpty()) {
-                    tags.put(key, engine.resolve(tag.path("Value")));
-                }
-            }
-        }
-
-        // provision() re-runs on every UpdateStack, so a same-named stream already on file must be
-        // reconciled instead of re-created (createStream throws ResourceInUseException). ShardCount
-        // changes aren't reconciled here: KinesisService has no UpdateShardCount support to call into.
-        KinesisStream stream =
-                sameNameExistingResource(priorPhysicalId, name, n -> kinesisService.describeStream(n, region));
-        if (stream != null) {
-            kinesisService.updateStreamMode(name, streamMode != null ? streamMode : "PROVISIONED", region);
-            if (retention != null) {
-                if (retention > stream.getRetentionPeriodHours()) {
-                    kinesisService.increaseStreamRetentionPeriod(name, retention, region);
-                } else if (retention < stream.getRetentionPeriodHours()) {
-                    kinesisService.decreaseStreamRetentionPeriod(name, retention, region);
-                }
-            }
-            Map<String, String> existingTags = kinesisService.listTagsForStream(name, region);
-            List<String> tagsToRemove = existingTags.keySet().stream()
-                    .filter(key -> !tags.containsKey(key))
-                    .toList();
-            if (!tagsToRemove.isEmpty()) {
-                kinesisService.removeTagsFromStream(name, tagsToRemove, region);
-            }
-            if (!tags.isEmpty()) {
-                kinesisService.addTagsToStream(name, tags, region);
-            }
-            stream = kinesisService.describeStream(name, region);
-        } else {
-            stream = kinesisService.createStream(name, shardCount, streamMode, region);
-            if (retention != null) {
-                stream.setRetentionPeriodHours(retention);
-            }
-            if (!tags.isEmpty()) {
-                stream.getTags().putAll(tags);
-            }
-            deleteRenamedResource(priorPhysicalId, name, id -> kinesisService.deleteStream(id, region),
-                    "Kinesis stream");
-        }
-
-        // Ref returns the stream name; Fn::GetAtt Arn returns the stream ARN.
-        r.setPhysicalId(name);
-        r.getAttributes().put("Arn", stream.getStreamArn());
-    }
-
     // ── CloudWatch ──────────────────────────────────────────────────────────────
-
-    private void provisionCloudWatchAlarm(StackResource r, JsonNode props, CloudFormationTemplateEngine engine,
-                                          String region, String stackName) {
-        String name = resolveOptional(props, "AlarmName", engine);
-        if (name == null || name.isBlank()) {
-            name = generatePhysicalName(stackName, r.getLogicalId(), 255, false);
-        }
-
-        MetricAlarm alarm = new MetricAlarm();
-        alarm.setAlarmName(name);
-        alarm.setAlarmDescription(resolveOptional(props, "AlarmDescription", engine));
-        alarm.setMetricName(resolveOptional(props, "MetricName", engine));
-        alarm.setNamespace(resolveOptional(props, "Namespace", engine));
-        alarm.setStatistic(resolveOptional(props, "Statistic", engine));
-        alarm.setUnit(resolveOptional(props, "Unit", engine));
-        alarm.setComparisonOperator(resolveOptional(props, "ComparisonOperator", engine));
-        alarm.setPeriod(parseIntProp(props, "Period", engine, 60));
-        alarm.setEvaluationPeriods(parseIntProp(props, "EvaluationPeriods", engine, 1));
-        alarm.setDatapointsToAlarm(parseIntProp(props, "DatapointsToAlarm", engine, alarm.getEvaluationPeriods()));
-        String threshold = resolveOptional(props, "Threshold", engine);
-        if (threshold != null && !threshold.isBlank()) {
-            try {
-                alarm.setThreshold(Double.parseDouble(threshold.trim()));
-            } catch (NumberFormatException ignored) {
-                // leave default
-            }
-        }
-        String treatMissing = resolveOptional(props, "TreatMissingData", engine);
-        if (treatMissing != null && !treatMissing.isBlank()) {
-            alarm.setTreatMissingData(treatMissing);
-        }
-        String actionsEnabled = resolveOptional(props, "ActionsEnabled", engine);
-        alarm.setActionsEnabled(actionsEnabled == null || Boolean.parseBoolean(actionsEnabled));
-
-        if (props != null && props.has("Dimensions") && props.get("Dimensions").isArray()) {
-            List<Dimension> dimensions = new ArrayList<>();
-            for (JsonNode dim : props.get("Dimensions")) {
-                dimensions.add(new Dimension(engine.resolve(dim.path("Name")), engine.resolve(dim.path("Value"))));
-            }
-            alarm.setDimensions(dimensions);
-        }
-        addAlarmActions(props, "AlarmActions", engine, alarm.getAlarmActions());
-        addAlarmActions(props, "OKActions", engine, alarm.getOkActions());
-        addAlarmActions(props, "InsufficientDataActions", engine, alarm.getInsufficientDataActions());
-
-        cloudWatchMetricsService.putMetricAlarm(alarm, region);
-        // Ref returns the alarm name; Fn::GetAtt Arn returns the alarm ARN.
-        r.setPhysicalId(name);
-        r.getAttributes().put("Arn", alarm.getAlarmArn());
-    }
-
-    private void addAlarmActions(JsonNode props, String field, CloudFormationTemplateEngine engine,
-                                 List<String> target) {
-        if (props != null && props.has(field) && props.get(field).isArray()) {
-            for (JsonNode action : props.get(field)) {
-                String resolved = engine.resolve(action);
-                if (resolved != null && !resolved.isBlank()) {
-                    target.add(resolved);
-                }
-            }
-        }
-    }
 
     // ── Auto Scaling ────────────────────────────────────────────────────────────
 
