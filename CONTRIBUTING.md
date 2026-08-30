@@ -168,19 +168,44 @@ otherwise create one.
      `"LogicalId.Attr"`. Take the attribute names from the resource's registry schema under
      `local/aws/cfn-resource-schemas/us-east-1/` (`readOnlyProperties`).
 4. **`provision` is also the update path.** On `UpdateStack` it is called again with the previous
-   physical id and attributes already set on the resource. Check for an existing physical id and
-   update in place rather than creating unconditionally, which would otherwise throw
-   `AlreadyExists` or orphan the old resource.
+   physical id and attributes already set on the resource. Use `ctx.isUpdate()` and
+   `ctx.priorPhysicalId()` rather than reading the id back off the resource: `provision` assigns the
+   new id as it works, so a resource-derived check changes meaning mid-method. Update in place
+   rather than creating unconditionally, which would otherwise throw `AlreadyExists` or orphan the
+   old resource.
 5. Override `delete(...)` if the type has a backing delete. Deleting a resource that is already gone
-   should be tolerated.
-6. Add a focused unit test (mock only your service, see `SqsCfnProvisionerTest`) and an integration
-   test. Assert the **specific `Fn::GetAtt` attribute keys**, not just `CREATE_COMPLETE`: an
-   unmapped type is stubbed out as a successful no-op, so a status-only assertion passes even when
-   nothing was provisioned.
-7. Add the type to the table in `docs/services/cloudformation.md`.
+   should be tolerated: `CfnDeletes.safeDelete` does this, taking the specific error codes that
+   mean "already gone" (never a catch-all: a real failure such as `BucketNotEmpty` must propagate so
+   the stack reports `DELETE_FAILED`).
+   If the delete needs more than the physical id (a create-time attribute such as a rule's event
+   bus), override `delete(StackResource, String)` instead, which receives the whole resource.
+6. **Register the type in `src/test/resources/cloudformation/supported-resource-types.tsv`**
+   (`type<TAB>YourCfnProvisioner`). `CfnResourceInventoryTest` compares that file against the
+   CDI-resolved registry, so it fails if you forget, which is also what catches a missing
+   `@ApplicationScoped`.
+7. **Make your provisioner reachable from `CfnProvisionerFixture`** if it takes a single service.
+   That is three edits, not one: a `private <Svc>Service` field on `Builder`, a
+   `public Builder <svc>(<Svc>Service v)` setter for it, and a construction arm in
+   `inferredProvisioners()`. Tests name a service and the fixture wires the matching provisioner;
+   without all three, a test exercising your type silently falls through to the stub arm instead.
+   The setter is the step that gets missed: a field nothing can assign stays null, so its
+   construction arm never runs. `CfnProvisionerFixtureTest` fails if the provisioner cannot be
+   reached through the public builder.
+8. Add a focused unit test (mock only your service, see `SqsCfnProvisioner`'s test) and an
+   integration test. Assert the **specific `Fn::GetAtt` attribute keys**, not just
+   `CREATE_COMPLETE`: an unmapped type is stubbed out as a successful no-op, so a status-only
+   assertion passes even when nothing was provisioned.
+9. Run `make docs-sync` to regenerate the resource-type table in `docs/services/cloudformation.md`,
+   and commit the result. **Do not hand-edit that table**: it is generated from the inventory in
+   step 6. Presentation (service label, ordering, notes) lives in `tools/docs/cfn_resource_types.yaml`.
+10. If your type has a schema `readOnlyProperties` entry you cannot set, add a row to
+    `src/test/resources/cloudformation/getatt-attribute-gaps.tsv` with the reason.
+    `CfnSchemaCoverageTest` requires every unset attribute to be either fixed or recorded, so
+    "not emulated" stays distinguishable from "forgotten".
 
 `SqsCfnProvisioner` is the smallest reference implementation; `Ec2LaunchTemplateCfnProvisioner`
-shows update-in-place and replacement handling.
+shows update-in-place and replacement handling; `LogsCfnProvisioner` shows a full reconcile-vs-replace
+update path.
 
 ## Pull Request Guidelines
 
