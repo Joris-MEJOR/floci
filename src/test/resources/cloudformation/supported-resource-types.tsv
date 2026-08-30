@@ -98,8 +98,8 @@ AWS::RDS::DBProxyTargetGroup	LEGACY_SWITCH
 AWS::RDS::DBSubnetGroup	LEGACY_SWITCH
 AWS::Route53::HostedZone	LEGACY_SWITCH
 AWS::Route53::RecordSet	LEGACY_SWITCH
-AWS::S3::Bucket	LEGACY_SWITCH
-AWS::S3::BucketPolicy	LEGACY_SWITCH
+AWS::S3::Bucket	S3CfnProvisioner
+AWS::S3::BucketPolicy	S3CfnProvisioner
 AWS::SNS::Subscription	LEGACY_SWITCH
 AWS::SNS::Topic	LEGACY_SWITCH
 AWS::SQS::Queue	SqsCfnProvisioner
