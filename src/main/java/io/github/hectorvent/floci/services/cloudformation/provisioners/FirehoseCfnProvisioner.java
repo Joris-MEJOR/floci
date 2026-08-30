@@ -31,10 +31,8 @@ public class FirehoseCfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public void provision(StackResource r, JsonNode props, ProvisionContext ctx) {
-        String name = ctx.resolveOptional(props, "DeliveryStreamName");
-        if (name == null || name.isBlank()) {
-            name = ctx.generatePhysicalName(r.getLogicalId(), DELIVERY_STREAM_NAME_MAX_LENGTH, false);
-        }
+        String name = ctx.stablePhysicalName(ctx.resolveOptional(props, "DeliveryStreamName"),
+                r.getLogicalId(), DELIVERY_STREAM_NAME_MAX_LENGTH, false);
 
         DeliveryStreamDescription.S3Destination s3 = null;
         JsonNode s3Node = props != null && props.has("ExtendedS3DestinationConfiguration")

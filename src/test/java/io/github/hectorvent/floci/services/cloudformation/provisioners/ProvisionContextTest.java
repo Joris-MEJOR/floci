@@ -68,6 +68,34 @@ class ProvisionContextTest {
     }
 
     @Test
+    void stablePhysicalNamePrefersTheTemplatesName() {
+        assertEquals("chosen",
+                context("prior").stablePhysicalName("chosen", "Bucket", 63, true));
+    }
+
+    /**
+     * The reason this helper exists: provision runs again on every UpdateStack, so generating
+     * unconditionally would give an unnamed resource a new name each time, creating a second
+     * resource and orphaning the first. These names are createOnly in the schemas, so an unchanged
+     * template must keep its physical id.
+     */
+    @Test
+    void stablePhysicalNameKeepsThePriorNameWhenTheTemplateGivesNone() {
+        assertEquals("my-stack-Bucket-abc123def456",
+                context("my-stack-Bucket-abc123def456").stablePhysicalName(null, "Bucket", 63, true));
+        assertEquals("my-stack-Bucket-abc123def456",
+                context("my-stack-Bucket-abc123def456").stablePhysicalName("  ", "Bucket", 63, true));
+    }
+
+    @Test
+    void stablePhysicalNameGeneratesOnlyForAFirstCreate() {
+        String generated = context(null).stablePhysicalName(null, "Bucket", 63, true);
+
+        assertTrue(generated.startsWith("my-stack-bucket-"), generated);
+        assertEquals(generated.toLowerCase(), generated, "lowercase was requested");
+    }
+
+    @Test
     void resolveTagsKeepsTemplateOrderAndDefaultsAMissingValue() {
         Map<String, String> tags = context(null).resolveTags(
                 props("""

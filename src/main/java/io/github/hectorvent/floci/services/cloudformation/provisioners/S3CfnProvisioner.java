@@ -39,18 +39,33 @@ public class S3CfnProvisioner implements CfnResourceProvisioner {
     public void provision(StackResource r, JsonNode props, ProvisionContext ctx) {
         switch (r.getResourceType()) {
             case BUCKET -> provisionBucket(r, props, ctx);
-            case BUCKET_POLICY ->
-                    r.setPhysicalId("bucket-policy-" + UUID.randomUUID().toString().substring(0, 8));
+            case BUCKET_POLICY -> r.setPhysicalId(bucketPolicyId(ctx));
             default -> throw new IllegalStateException(
                     "S3CfnProvisioner cannot provision " + r.getResourceType());
         }
     }
 
+    /**
+     * The policy's physical id, kept across updates rather than regenerated.
+     *
+     * <p>{@code provision} runs again on every UpdateStack, so minting a fresh id each time made an
+     * unchanged policy look like a replaced resource and changed what {@code Ref} returned.
+     *
+     * <p>The generated value itself is left alone deliberately. The sources disagree on what it
+     * should be: the current registry schema gives {@code primaryIdentifier} as
+     * {@code /properties/Bucket}, while the older schema localstack embeds gives
+     * {@code /properties/Id} as an md5 of the policy document. Changing what Ref resolves to on that
+     * evidence would be guessing; keeping the id stable fixes the defect either way.
+     */
+    private String bucketPolicyId(ProvisionContext ctx) {
+        return ctx.isUpdate()
+                ? ctx.priorPhysicalId()
+                : "bucket-policy-" + UUID.randomUUID().toString().substring(0, 8);
+    }
+
     private void provisionBucket(StackResource r, JsonNode props, ProvisionContext ctx) {
-        String bucketName = ctx.resolveOptional(props, "BucketName");
-        if (bucketName == null || bucketName.isBlank()) {
-            bucketName = ctx.generatePhysicalName(r.getLogicalId(), BUCKET_NAME_MAX_LENGTH, true);
-        }
+        String bucketName = ctx.stablePhysicalName(ctx.resolveOptional(props, "BucketName"),
+                r.getLogicalId(), BUCKET_NAME_MAX_LENGTH, true);
         s3Service.createBucket(bucketName, ctx.region());
         applyBucketCorsConfiguration(bucketName, props, ctx);
         applyBucketVersioningConfiguration(bucketName, props, ctx);

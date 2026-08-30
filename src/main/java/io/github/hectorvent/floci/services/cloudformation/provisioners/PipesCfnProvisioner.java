@@ -29,10 +29,8 @@ public class PipesCfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public void provision(StackResource r, JsonNode props, ProvisionContext ctx) {
-        String name = ctx.resolveOptional(props, "Name");
-        if (name == null || name.isBlank()) {
-            name = ctx.generatePhysicalName(r.getLogicalId(), PIPE_NAME_MAX_LENGTH, false);
-        }
+        String name = ctx.stablePhysicalName(ctx.resolveOptional(props, "Name"),
+                r.getLogicalId(), PIPE_NAME_MAX_LENGTH, false);
 
         String source = ctx.resolveOptional(props, "Source");
         String target = ctx.resolveOptional(props, "Target");

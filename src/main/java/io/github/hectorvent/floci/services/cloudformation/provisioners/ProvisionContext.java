@@ -94,6 +94,31 @@ public record ProvisionContext(CloudFormationTemplateEngine engine, String regio
         return values;
     }
 
+    /**
+     * The physical name for a resource whose name is create-only: the template's name when it gives
+     * one, otherwise the name this resource already had, and only failing both a freshly generated
+     * one.
+     *
+     * <p>Keeping the prior name is the part that matters. {@code provision} runs again on every
+     * {@code UpdateStack}, so generating unconditionally gives an unnamed resource a new random name
+     * each time, creating a second resource and orphaning the first with its data. The schemas make
+     * this explicit: for these types the name is a {@code createOnlyProperty}, so an unchanged
+     * template must keep the same physical id.
+     *
+     * <p>Only for types whose physical id <em>is</em> the name. Where it is something derived, such
+     * as an SNS topic's ARN, the prior name has to come from the stored attribute instead.
+     */
+    public String stablePhysicalName(String explicitName, String logicalId, int maxLength,
+                                     boolean lowercase) {
+        if (explicitName != null && !explicitName.isBlank()) {
+            return explicitName;
+        }
+        if (priorPhysicalId != null && !priorPhysicalId.isBlank()) {
+            return priorPhysicalId;
+        }
+        return generatePhysicalName(logicalId, maxLength, lowercase);
+    }
+
     /** Generates a CloudFormation-style physical name: {@code <stack>-<logicalId>-<suffix>}. */
     public String generatePhysicalName(String logicalId, int maxLength, boolean lowercase) {
         String suffix = UUID.randomUUID().toString().replace("-", "").substring(0, 12);
