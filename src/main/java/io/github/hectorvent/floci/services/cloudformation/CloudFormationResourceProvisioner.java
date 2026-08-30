@@ -139,7 +139,7 @@ public class CloudFormationResourceProvisioner {
     private static final String LAMBDA_CODE_IDENTITY_ATTR = "FlociLambdaCodeIdentity";
     private static final String LAMBDA_NAME_MODE_ATTR = "FlociLambdaFunctionNameMode";
     private static final String LAMBDA_PACKAGE_TYPE_ATTR = "FlociLambdaPackageType";
-    static final String UPDATE_ROLLBACK_RESTORED_ATTR = "__FlociUpdateRollbackRestored";
+    static final String UPDATE_ROLLBACK_RESTORED_ATTR = CfnRollback.UPDATE_ROLLBACK_RESTORED_ATTR;
     static final String UPDATE_ROLLBACK_FAILURE_ATTR = "__FlociUpdateRollbackFailure";
     private static final String INLINE_CLEANUP_POLICY_NAME_ATTR = "__FlociInlineCleanupPolicyName";
     private static final String INLINE_CLEANUP_ROLE_TARGETS_ATTR = "__FlociInlineCleanupRoleTargets";
@@ -158,7 +158,6 @@ public class CloudFormationResourceProvisioner {
     private static final String NAME_MODE_GENERATED = "generated";
     private static final int GENERATED_NAME_SUFFIX_LENGTH = 12;
     private static final int STEP_FUNCTIONS_NAME_MAX_LENGTH = 80;
-    private static final String LOG_GROUP_NAME_MODE_ATTR = "FlociLogGroupNameMode";
     private static final String SECRET_TARGET_MANAGED_KEYS_ATTR = "__FlociSecretTargetManagedKeys";
     private static final String SECRET_TARGET_OWNER_ATTR = "__FlociSecretTargetOwner";
     private static final String DDB_REPLICA_TABLE_NAME_ATTR = "TableName";
@@ -261,7 +260,6 @@ public class CloudFormationResourceProvisioner {
             "AWS::Lambda::EventSourceMapping",
             "AWS::Lambda::Function",
             "AWS::Lambda::LayerVersion",
-            "AWS::Logs::LogGroup",
             "AWS::RDS::DBCluster",
             "AWS::RDS::DBClusterParameterGroup",
             "AWS::RDS::DBInstance",
@@ -309,7 +307,6 @@ public class CloudFormationResourceProvisioner {
     private final Ec2Service ec2Service;
     private final RdsService rdsService;
     private final EksService eksService;
-    private final CloudWatchLogsService logsService;
     private final KinesisService kinesisService;
     private final CloudWatchMetricsService cloudWatchMetricsService;
     private final AutoScalingService autoScalingService;
@@ -377,7 +374,6 @@ public class CloudFormationResourceProvisioner {
         this.ec2Service = ec2Service;
         this.rdsService = rdsService;
         this.eksService = eksService;
-        this.logsService = logsService;
         this.kinesisService = kinesisService;
         this.cloudWatchMetricsService = cloudWatchMetricsService;
         this.autoScalingService = autoScalingService;
@@ -517,7 +513,6 @@ public class CloudFormationResourceProvisioner {
                         provisionDbProxyTargetGroup(resource, properties, engine, region);
                 case "AWS::EKS::Cluster" -> provisionEksCluster(resource, properties, engine, stackName);
                 case "AWS::EKS::Nodegroup" -> provisionEksNodegroup(resource, properties, engine, stackName);
-                case "AWS::Logs::LogGroup" -> provisionLogGroup(resource, properties, engine, region, accountId, stackName);
                 case "AWS::Kinesis::Stream" ->
                         provisionKinesisStream(resource, properties, engine, region, stackName);
                 case "AWS::CloudWatch::Alarm" ->
@@ -755,7 +750,6 @@ public class CloudFormationResourceProvisioner {
             case "AWS::RDS::DBClusterParameterGroup" ->
                     rdsService.deleteDbClusterParameterGroup(physicalId, region);
             case "AWS::EKS::Cluster" -> eksService.deleteCluster(physicalId);
-            case "AWS::Logs::LogGroup" -> logsService.deleteLogGroup(physicalId, region);
             case "AWS::Kinesis::Stream" -> kinesisService.deleteStream(physicalId, region);
             case "AWS::CloudWatch::Alarm" ->
                     cloudWatchMetricsService.deleteAlarms(List.of(physicalId), region);
@@ -890,89 +884,6 @@ public class CloudFormationResourceProvisioner {
 
     // ── CloudWatch Logs ─────────────────────────────────────────────────────────
 
-    private void provisionLogGroup(StackResource r, JsonNode props, CloudFormationTemplateEngine engine,
-                                   String region, String accountId, String stackName) {
-        String explicitName = resolveOptional(props, "LogGroupName", engine);
-        boolean hasExplicitName = explicitName != null && !explicitName.isBlank();
-        String previousNameMode = r.getAttributes().get(LOG_GROUP_NAME_MODE_ATTR);
-        if (previousNameMode == null && r.getPhysicalId() != null) {
-            // Stacks persisted before FlociLogGroupNameMode existed have no recorded mode, but an
-            // auto-generated name always has the deterministic shape generatePhysicalName produces,
-            // so anything else must have been explicit.
-            previousNameMode = isGeneratedName(r.getPhysicalId(), stackName, r.getLogicalId(), 512)
-                    ? NAME_MODE_GENERATED
-                    : NAME_MODE_EXPLICIT;
-        }
-        // Going from an explicit name to none is itself a replacement-worthy change on real AWS, not
-        // something to silently keep reconciling under the old explicit name (mirrors the same check
-        // for Lambda's FunctionName above).
-        boolean explicitNameRemoved = r.getPhysicalId() != null && !hasExplicitName
-                && NAME_MODE_EXPLICIT.equals(previousNameMode);
-
-        String name;
-        if (hasExplicitName) {
-            name = explicitName;
-        } else if (r.getPhysicalId() != null && !explicitNameRemoved) {
-            // No explicit name and the prior name was itself auto-generated: keep it across updates
-            // instead of generating a fresh random one each time, so the log group is reconciled in
-            // place rather than replaced on every no-op update.
-            name = r.getPhysicalId();
-        } else {
-            name = generatePhysicalName(stackName, r.getLogicalId(), 512, false);
-        }
-        Integer retentionInDays = null;
-        String retention = resolveOptional(props, "RetentionInDays", engine);
-        if (retention != null && !retention.isBlank()) {
-            try {
-                retentionInDays = Integer.valueOf(retention.trim());
-            } catch (NumberFormatException ignored) {
-                // leave unset
-            }
-        }
-        Map<String, String> tags = new HashMap<>();
-        if (props != null && props.has("Tags") && props.get("Tags").isArray()) {
-            for (JsonNode tag : props.get("Tags")) {
-                String key = engine.resolve(tag.path("Key"));
-                if (!key.isEmpty()) {
-                    tags.put(key, engine.resolve(tag.path("Value")));
-                }
-            }
-        }
-
-        // LogGroupName isn't updatable in place on real AWS (a change replaces the resource), so only
-        // reconcile in place when the name is unchanged and the group is still there; otherwise this is
-        // either a first create or a rename, both of which need a fresh createLogGroup call. On a rename,
-        // create the new group before deleting the old one: if the new name collides with something else
-        // and createLogGroup throws, the update rolls back without touching the old group, since rollback
-        // does not restore a resource this method already deleted.
-        String priorPhysicalId = r.getPhysicalId();
-        if (priorPhysicalId != null && priorPhysicalId.equals(name) && logsService.logGroupExists(name, region)) {
-            reconcileLogGroup(name, retentionInDays, tags, region);
-        } else {
-            boolean preservedPriorGroup = priorPhysicalId != null
-                    && !priorPhysicalId.equals(name)
-                    && logsService.logGroupExists(priorPhysicalId, region);
-            try {
-                logsService.createLogGroup(name, retentionInDays, tags, region);
-            } catch (RuntimeException failure) {
-                if (preservedPriorGroup) {
-                    r.getAttributes().put(UPDATE_ROLLBACK_RESTORED_ATTR, "true");
-                }
-                throw failure;
-            }
-            if (preservedPriorGroup) {
-                logsService.deleteLogGroup(priorPhysicalId, region);
-            }
-        }
-
-        // Ref returns the log group name; GetAtt Arn is arn:aws:logs:<region>:<account>:log-group:<name>:*
-        r.setPhysicalId(name);
-        r.getAttributes().put("Arn",
-                AwsArnUtils.Arn.of("logs", region, accountId, "log-group:" + name + ":*").toString());
-        r.getAttributes().put(LOG_GROUP_NAME_MODE_ATTR,
-                hasExplicitName ? NAME_MODE_EXPLICIT : NAME_MODE_GENERATED);
-    }
-
     /**
      * Whether {@code physicalId} matches the exact shape {@link #generatePhysicalName} produces for
      * this stack/logical id/maxLength: its base-and-truncation logic (minus the random suffix itself)
@@ -1015,24 +926,6 @@ public class CloudFormationResourceProvisioner {
             prefix = prefix.substring(0, prefix.length() - 1);
         }
         return prefix;
-    }
-
-    private void reconcileLogGroup(String name, Integer retentionInDays, Map<String, String> tags, String region) {
-        if (retentionInDays != null) {
-            logsService.putRetentionPolicy(name, retentionInDays, region);
-        } else {
-            logsService.deleteRetentionPolicy(name, region);
-        }
-        Map<String, String> existingTags = logsService.listTagsLogGroup(name, region);
-        List<String> tagsToRemove = existingTags.keySet().stream()
-                .filter(key -> !tags.containsKey(key))
-                .toList();
-        if (!tagsToRemove.isEmpty()) {
-            logsService.untagLogGroup(name, tagsToRemove, region);
-        }
-        if (!tags.isEmpty()) {
-            logsService.tagLogGroup(name, tags, region);
-        }
     }
 
     // ── Kinesis ─────────────────────────────────────────────────────────────────

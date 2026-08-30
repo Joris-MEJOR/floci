@@ -82,7 +82,7 @@ AWS::Lambda::MicrovmImage	LambdaMicrovmsCfnProvisioner
 AWS::Lambda::NetworkConnector	LambdaMicrovmsCfnProvisioner
 AWS::Lambda::Permission	LambdaAddressingCfnProvisioner
 AWS::Lambda::Version	LambdaVersionAliasCfnProvisioner
-AWS::Logs::LogGroup	LEGACY_SWITCH
+AWS::Logs::LogGroup	LogsCfnProvisioner
 AWS::Organizations::Account	OrganizationsCfnProvisioner
 AWS::Organizations::Organization	OrganizationsCfnProvisioner
 AWS::Organizations::OrganizationalUnit	OrganizationsCfnProvisioner
