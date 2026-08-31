@@ -309,6 +309,10 @@ References: `SqsCfnProvisioner` (smallest), `Ec2LaunchTemplateCfnProvisioner`
 
 ---
 
+## Documentation Style
+
+- No em-dashes anywhere, in any content. Use colons, commas, or periods.
+
 ## Logging
 
 - Use JBoss Logging
