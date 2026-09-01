@@ -271,11 +271,11 @@ monolith being dismantled; new types go in per-service provisioners under
 
 1. Add the type to the existing `<Service>CfnProvisioner`, or create one:
    `@ApplicationScoped`, injecting only the service it wraps. CDI discovery via
-   `CloudFormationResourceRegistry` handles registration — no manual wiring, but a
+   `CloudFormationResourceRegistry` handles registration: no manual wiring, but a
    missing `@ApplicationScoped` silently means the type is never provisioned.
 2. `resourceTypes()` lists the `AWS::*` types; `provision(resource, props, ctx)`
    does the work, switching on `resource.getResourceType()` when it serves several.
-3. Set **both** reference mechanisms — they are separate:
+3. Set **both** reference mechanisms. They are separate:
    - `resource.setPhysicalId(...)` backs `Ref`
    - `resource.getAttributes().put(...)` backs `Fn::GetAtt`, one entry per attribute
    Omitting an attribute does not fail; `Fn::GetAtt` resolves to the literal
