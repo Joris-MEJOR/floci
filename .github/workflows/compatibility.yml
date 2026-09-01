@@ -11,6 +11,9 @@ on:
       - 'docker/localstack-parity.sh'
       - 'compatibility-tests/**'
       - '.github/ci/compat-timing-report.py'
+      - '.github/ci/compat-opentofu-drift-check.py'
+      - '.github/ci/compat-opentofu-allowlist-tf-only.txt'
+      - '.github/ci/compat-opentofu-allowlist-otf-only.txt'
       - '.github/workflows/compatibility.yml'
 
 permissions:
@@ -84,6 +87,20 @@ jobs:
           echo "$out"
           echo "$out" | grep -q "other.example.com" \
             || { echo "::error::post-subcommand --endpoint-url flag was not honored over AWS_ENDPOINT_URL"; exit 1; }
+
+  compat-opentofu-drift-check:
+    name: compat / opentofu resource parity
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          sparse-checkout: |
+            compatibility-tests
+            .github/ci
+
+      - name: Compare compat-terraform and compat-opentofu resource lists
+        run: python3 .github/ci/compat-opentofu-drift-check.py
 
   build-native:
     name: Build native floci image
