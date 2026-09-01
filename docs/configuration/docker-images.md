@@ -17,7 +17,7 @@ The compat image is built on top of the standard image, so startup time and memo
 
 | Channel | Source | Published |
 |---|---|---|
-| **Release** | Tagged version (e.g. `1.7.0`) | 1st and 3rd Tuesday of each month |
+| **Release** | Tagged version (e.g. `x.y.z`) | 1st and 3rd Tuesday of each month |
 | **Nightly** | Tip of `main` | Every night at 23:00 CT |
 
 Release images are stable and recommended for most use cases. Between trains, `nightly` carries every merged fix from the following morning. Nightly images track active development and may include unreleased changes.
@@ -48,7 +48,7 @@ image: floci/floci:latest
 image: floci/floci:latest-compat
 
 # Pinned release : reproducible builds
-image: floci/floci:1.7.0
+image: floci/floci:x.y.z
 
 # Nightly : track main
 image: floci/floci:nightly

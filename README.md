@@ -763,7 +763,7 @@ image: floci/floci:latest
 image: floci/floci:latest-compat
 
 # Pinned release
-image: floci/floci:1.5.11
+image: floci/floci:x.y.z
 
 # Track main
 image: floci/floci:nightly
