@@ -48,7 +48,7 @@ image: floci/floci:latest
 image: floci/floci:latest-compat
 
 # Pinned release : reproducible builds
-image: floci/floci:1.5.11
+image: floci/floci:1.7.0
 
 # Nightly : track main
 image: floci/floci:nightly
