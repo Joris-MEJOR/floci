@@ -3,18 +3,19 @@ package io.github.hectorvent.floci.services.cloudformation;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnResourceProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudFormationResourceRegistry;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ProvisionContext;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.sns.SnsService;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Set;
 import java.util.TreeSet;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -39,6 +40,12 @@ class CfnProvisionerFixtureTest {
      */
     private static final Set<String> NOT_INFERABLE =
             Set.of("CodeBuildCfnProvisioner", "CodePipelineCfnProvisioner");
+
+    /**
+     * Builder setters that replace the inferred registry outright rather than naming a service.
+     * Driving them in the sweep below would discard everything inference produced.
+     */
+    private static final Set<String> REGISTRY_OVERRIDES = Set.of("registry", "provisioners");
 
     /** Reaches the registry the same way the dispatcher does. */
     private static boolean serves(CfnProvisionerFixture.Builder builder, String type) {
@@ -81,16 +88,21 @@ class CfnProvisionerFixtureTest {
     }
 
     /**
-     * Every provisioner is either wirable from a named service or listed as an exemption.
+     * Every provisioner on disk is reachable by driving the Builder's own public setters, or is
+     * explicitly exempt.
      *
-     * <p>Without this the fixture reproduces the very problem it exists to prevent. A provisioner
-     * added later and never wired here is silently absent from every fixture-based test, so those
-     * tests fall through to the dispatcher's stub arm and assert against a synthetic id. The other
-     * assertions in this class cannot catch it: they check the types that *are* wired, never that
-     * the set is complete, so a gap looks exactly like a passing suite.
+     * <p>Deliberately behavioural rather than textual. An earlier version of this gate matched
+     * {@code new XCfnProvisioner(} against the fixture's source, which scored a construction arm as
+     * wired even when its field had no setter and could never be non-null. That is the same silent
+     * gap this fixture exists to close, so the check has to run the wiring instead of reading it:
+     * everything below reaches the registry only through the public API a test has, which means a
+     * field no setter assigns cannot be satisfied and shows up here as unreachable.
+     *
+     * <p>Mirrors {@code CfnResourceInventoryTest}, which compares the CDI-resolved production
+     * registry for the same reason.
      */
     @Test
-    void everyProvisionerIsWirableOrExplicitlyExempt() throws Exception {
+    void everyProvisionerIsReachableThroughThePublicBuilderOrExplicitlyExempt() throws Exception {
         Path provisioners = Path.of(
                 "src/main/java/io/github/hectorvent/floci/services/cloudformation/provisioners");
         Set<String> onDisk;
@@ -101,24 +113,32 @@ class CfnProvisionerFixtureTest {
                     .collect(Collectors.toCollection(TreeSet::new));
         }
 
-        String source = Files.readString(
-                Path.of("src/test/java/io/github/hectorvent/floci/services/cloudformation/"
-                        + "CfnProvisionerFixture.java"));
-        Set<String> wired = new TreeSet<>();
-        Matcher matcher = Pattern.compile("new (\\w+CfnProvisioner)\\(").matcher(source);
-        while (matcher.find()) {
-            wired.add(matcher.group(1));
+        CfnProvisionerFixture.Builder builder = CfnProvisionerFixture.builder();
+        for (Method setter : CfnProvisionerFixture.Builder.class.getDeclaredMethods()) {
+            boolean namesOneCollaborator = Modifier.isPublic(setter.getModifiers())
+                    && setter.getReturnType() == CfnProvisionerFixture.Builder.class
+                    && setter.getParameterCount() == 1
+                    && !setter.isVarArgs()
+                    && !REGISTRY_OVERRIDES.contains(setter.getName());
+            if (namesOneCollaborator) {
+                setter.invoke(builder, mock(setter.getParameterTypes()[0]));
+            }
         }
 
-        Set<String> unaccounted = new TreeSet<>(onDisk);
-        unaccounted.removeAll(wired);
-        unaccounted.removeAll(NOT_INFERABLE);
+        CloudFormationResourceRegistry registry = builder.buildRegistry();
+        Set<String> reachable = registry.registeredTypes().stream()
+                .map(registry::ownerOf)
+                .collect(Collectors.toCollection(TreeSet::new));
 
-        assertTrue(unaccounted.isEmpty(),
-                "These provisioners are neither wired from a service nor exempt, so a fixture test "
-                        + "naming their service would silently hit the stub arm. Wire them in "
-                        + "inferredProvisioners(), or add them to NOT_INFERABLE with a reason: "
-                        + unaccounted);
+        Set<String> unreachable = new TreeSet<>(onDisk);
+        unreachable.removeAll(reachable);
+        unreachable.removeAll(NOT_INFERABLE);
+
+        assertTrue(unreachable.isEmpty(),
+                "These provisioners cannot be reached through any public Builder setter, so a "
+                        + "fixture test naming their service would silently hit the stub arm. Give "
+                        + "them a service field AND a setter in CfnProvisionerFixture, or add them "
+                        + "to NOT_INFERABLE with a reason: " + unreachable);
 
         Set<String> staleExemptions = new TreeSet<>(NOT_INFERABLE);
         staleExemptions.removeAll(onDisk);

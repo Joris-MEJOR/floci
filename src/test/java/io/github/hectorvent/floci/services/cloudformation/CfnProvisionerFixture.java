@@ -161,7 +161,8 @@ final class CfnProvisionerFixture {
         }
 
         /**
-         * The provisioners CDI would discover for the services this test named.
+         * The provisioners inferred from the services this test named, not everything CDI would
+         * discover: a service the test did not name contributes nothing here.
          *
          * <p>Inferring these is what keeps a test honest across a migration. A test that names a
          * service and provisions one of its types used to keep passing when that type moved to a
@@ -410,6 +411,36 @@ final class CfnProvisionerFixture {
 
         public Builder cloudFront(CloudFrontService v) {
             this.cloudFrontService = v;
+            return this;
+        }
+
+        public Builder flowLog(FlowLogService v) {
+            this.flowLogService = v;
+            return this;
+        }
+
+        public Builder lambdaMicrovms(LambdaMicrovmsService v) {
+            this.lambdaMicrovmsService = v;
+            return this;
+        }
+
+        public Builder awsConfig(AwsConfigService v) {
+            this.awsConfigService = v;
+            return this;
+        }
+
+        public Builder organizations(OrganizationsService v) {
+            this.organizationsService = v;
+            return this;
+        }
+
+        public Builder sqs(SqsService v) {
+            this.sqsService = v;
+            return this;
+        }
+
+        public Builder wafV2(WafV2Service v) {
+            this.wafV2Service = v;
             return this;
         }
 
