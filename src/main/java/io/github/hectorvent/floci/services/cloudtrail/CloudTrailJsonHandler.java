@@ -210,7 +210,12 @@ public class CloudTrailJsonHandler {
             ObjectNode entry = resourceTagList.addObject();
             entry.put("ResourceId", resourceId);
             ArrayNode tagsList = entry.putArray("TagsList");
-            tags.forEach((k, v) -> tagsList.addObject().put("Key", k).put("Value", v));
+            tags.forEach((k, v) -> {
+                ObjectNode tag = tagsList.addObject().put("Key", k);
+                if (v != null) {
+                    tag.put("Value", v);
+                }
+            });
         }
         return Response.ok(resp).build();
     }
@@ -220,7 +225,9 @@ public class CloudTrailJsonHandler {
     private Map<String, String> parseTagsList(JsonNode tagsNode) {
         Map<String, String> tags = new LinkedHashMap<>();
         if (tagsNode != null && tagsNode.isArray()) {
-            tagsNode.forEach(t -> tags.put(t.path("Key").asText(), t.path("Value").asText(null)));
+            tagsNode.forEach(t -> {
+                tags.put(t.path("Key").asText(), t.path("Value").asText(null));
+            });
         }
         return tags;
     }
