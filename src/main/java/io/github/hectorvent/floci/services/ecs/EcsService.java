@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.core.storage.StorageBackedMap;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ecs.container.EcsContainerManager;
 import io.github.hectorvent.floci.services.ecs.container.EcsTaskHandle;
+import io.github.hectorvent.floci.services.ecs.container.EcsTaskRoleCredentials;
 import io.github.hectorvent.floci.services.ecs.model.Attribute;
 import io.github.hectorvent.floci.services.ecs.model.CapacityProvider;
 import io.github.hectorvent.floci.services.ecs.model.ClusterSetting;
@@ -69,6 +70,8 @@ public class EcsService implements ContainerTeardown, ResourceProvider {
     private final EcsContainerManager containerManager;
     private final EcsLoadBalancerRegistrar lbRegistrar;
     private final StorageFactory storageFactory;
+    /** Optional process-local ECS task-role credential leases. */
+    private final EcsTaskRoleCredentials taskRoleCredentials;
     private final boolean dockerMode;
     private final String baseUrl;
     private final ScheduledExecutorService reconciler = Executors.newSingleThreadScheduledExecutor(
@@ -112,13 +115,21 @@ public class EcsService implements ContainerTeardown, ResourceProvider {
     @Inject
     public EcsService(RegionResolver regionResolver, EcsContainerManager containerManager,
                       EmulatorConfig config, EcsLoadBalancerRegistrar lbRegistrar,
-                      StorageFactory storageFactory) {
+                      StorageFactory storageFactory, EcsTaskRoleCredentials taskRoleCredentials) {
         this.regionResolver = regionResolver;
         this.containerManager = containerManager;
         this.dockerMode = !config.services().ecs().mock();
         this.baseUrl = config.effectiveBaseUrl();
         this.lbRegistrar = lbRegistrar;
         this.storageFactory = storageFactory;
+        this.taskRoleCredentials = taskRoleCredentials;
+    }
+
+    /** Compatibility constructor for callers that do not use ECS task-role credentials. */
+    public EcsService(RegionResolver regionResolver, EcsContainerManager containerManager,
+                      EmulatorConfig config, EcsLoadBalancerRegistrar lbRegistrar,
+                      StorageFactory storageFactory) {
+        this(regionResolver, containerManager, config, lbRegistrar, storageFactory, null);
     }
 
     @PostConstruct
@@ -203,6 +214,10 @@ public class EcsService implements ContainerTeardown, ResourceProvider {
                 continue;
             }
             try {
+                // Revoke before asking Docker to stop the container. This is deliberately kept
+                // at the service boundary as well as in the manager so shutdown remains safe if
+                // a custom/container-manager implementation does not know about task leases.
+                revokeTaskCredentials(taskArn);
                 containerManager.stopTask(claimed);
             } catch (Exception e) {
                 LOG.warnv("Failed to stop ECS task {0} on shutdown: {1}", taskArn, e.getMessage());
@@ -566,6 +581,10 @@ public class EcsService implements ContainerTeardown, ResourceProvider {
                     registerTaskWithLoadBalancers(task, cluster, region);
                 } catch (Exception e) {
                     LOG.errorv("Failed to start ECS task {0}: {1}", taskArn, e.getMessage());
+                    // The manager normally revokes a lease on its own failed-start path. Keep a
+                    // service-level fence for manager implementations that fail before returning
+                    // a handle (or for a custom manager used by an embedding application).
+                    revokeTaskCredentials(taskArn);
                     task.setLastStatus(TaskStatus.STOPPED.name());
                     task.setDesiredStatus(TaskStatus.STOPPED.name());
                     // A ResourceInitializationError is already AWS's exact stopped-reason wording
@@ -619,6 +638,10 @@ public class EcsService implements ContainerTeardown, ResourceProvider {
         if (dockerMode) {
             EcsTaskHandle handle = taskHandles.remove(task.getTaskArn());
             try {
+                // Make the endpoint unusable before a stop signal is sent. This covers a task
+                // whose Docker teardown is delayed or fails and keeps revocation keyed to the
+                // exact task ARN rather than to caller-controlled group/container names.
+                revokeTaskCredentials(task.getTaskArn());
                 exitCodes = containerManager.stopTaskAndCollectExitCodes(handle);
             } finally {
                 retainUnresolvedLogHandle(task.getTaskArn(), handle);
@@ -1578,6 +1601,10 @@ public class EcsService implements ContainerTeardown, ResourceProvider {
             return;
         }
 
+        // All containers have exited; revoke before removing them so no code in the final drain
+        // window can continue using the task's role credentials.
+        revokeTaskCredentials(taskArn);
+
         // Close log streams and remove the stopped Docker containers without re-inspecting.
         containerManager.cleanupStoppedTask(claimed);
 
@@ -1611,6 +1638,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider {
         }
 
         try {
+            revokeTaskCredentials(taskArn);
             containerManager.stopTaskAndCollectExitCodes(claimed);
         } finally {
             // A task can be reported STOPPED even if Docker rejected both teardown attempts.
@@ -1622,6 +1650,12 @@ public class EcsService implements ContainerTeardown, ResourceProvider {
     private void retainUnresolvedLogHandle(String taskArn, EcsTaskHandle handle) {
         if (handle != null && handle.hasOpenLogStreams()) {
             taskHandles.put(taskArn, handle);
+        }
+    }
+
+    private void revokeTaskCredentials(String taskArn) {
+        if (taskRoleCredentials != null) {
+            taskRoleCredentials.revokeTask(taskArn);
         }
     }
 

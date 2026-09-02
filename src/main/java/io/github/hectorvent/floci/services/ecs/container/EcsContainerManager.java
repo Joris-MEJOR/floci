@@ -51,6 +51,22 @@ import java.util.Set;
 public class EcsContainerManager {
 
     private static final Logger LOG = Logger.getLogger(EcsContainerManager.class);
+    /** Environment names that can select credentials other than the task-role endpoint. */
+    private static final Set<String> TASK_ROLE_CREDENTIAL_ENV_KEYS = Set.of(
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_SECURITY_TOKEN",
+            "AWS_PROFILE",
+            "AWS_DEFAULT_PROFILE",
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "AWS_CONFIG_FILE",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_ROLE_ARN",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_EC2_METADATA_DISABLED");
 
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
@@ -62,6 +78,8 @@ public class EcsContainerManager {
     private final SsmService ssmService;
     private final SecretsManagerService secretsManagerService;
     private final EcrRegistryManager ecrRegistryManager;
+    /** Optional ECS task-role credential issuer (kept nullable for legacy unit-test constructors). */
+    private final EcsTaskRoleCredentials taskRoleCredentials;
 
     @Inject
     public EcsContainerManager(ContainerBuilder containerBuilder,
@@ -73,7 +91,8 @@ public class EcsContainerManager {
                                LaunchedContainerAwsEnv awsEnv,
                                SsmService ssmService,
                                SecretsManagerService secretsManagerService,
-                               EcrRegistryManager ecrRegistryManager) {
+                               EcrRegistryManager ecrRegistryManager,
+                               EcsTaskRoleCredentials taskRoleCredentials) {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.logStreamer = logStreamer;
@@ -84,6 +103,26 @@ public class EcsContainerManager {
         this.ssmService = ssmService;
         this.secretsManagerService = secretsManagerService;
         this.ecrRegistryManager = ecrRegistryManager;
+        this.taskRoleCredentials = taskRoleCredentials;
+    }
+
+    /**
+     * Compatibility constructor for callers that predate the optional ECS task-role endpoint.
+     * CDI uses the full constructor above; tests and integrations that do not opt in retain the
+     * historical static credential behaviour exactly.
+     */
+    public EcsContainerManager(ContainerBuilder containerBuilder,
+                               ContainerLifecycleManager lifecycleManager,
+                               ContainerLogStreamer logStreamer,
+                               ContainerDetector containerDetector,
+                               EmulatorConfig config,
+                               RegionResolver regionResolver,
+                               LaunchedContainerAwsEnv awsEnv,
+                               SsmService ssmService,
+                               SecretsManagerService secretsManagerService,
+                               EcrRegistryManager ecrRegistryManager) {
+        this(containerBuilder, lifecycleManager, logStreamer, containerDetector, config,
+                regionResolver, awsEnv, ssmService, secretsManagerService, ecrRegistryManager, null);
     }
 
     /**
@@ -98,6 +137,13 @@ public class EcsContainerManager {
         Map<String, Closeable> logStreamsByContainerId = new LinkedHashMap<>();
         List<Container> runtimeContainers = new ArrayList<>();
 
+        // A task role is one task-level lease shared by all its containers. Mint it before any
+        // image/secret resolution or Docker create, then revoke it on every failed launch path so
+        // a pre-start error cannot leave a bearer credential behind.
+        Optional<EcsTaskRoleCredentials.IssuedCredentials> issuedTaskCredentials =
+                issueTaskCredentials(task, taskDef, region);
+
+        try {
         // Task-level volumes consumed by per-container mountPoints: host volumes map their
         // name -> absolute host source path; efsVolumeConfiguration volumes map their
         // name -> EFS configuration (materialised below as a shared local Docker volume).
@@ -121,7 +167,8 @@ public class EcsContainerManager {
         // Resolved before any container is created, so a registry-startup failure can't leak one already started.
         Map<ContainerDefinition, String> imagesByContainer = new LinkedHashMap<>();
         for (ContainerDefinition def : taskDef.getContainerDefinitions()) {
-            envVarsByContainer.put(def, buildEnvVars(def, overridesByName.get(def.getName()), region));
+            envVarsByContainer.put(def, buildEnvVars(def, overridesByName.get(def.getName()), region,
+                    issuedTaskCredentials.orElse(null)));
             imagesByContainer.put(def, ecrRegistryManager.rewriteImageUri(def.getImage()));
         }
 
@@ -146,6 +193,14 @@ public class EcsContainerManager {
                     .withLogRotation()
                     .withLabels(ContainerStorageHelper.resourceIdentityLabels(
                             "ecs", taskId, regionResolver.getAccountId(), region));
+
+            if (issuedTaskCredentials.isPresent()) {
+                String linkLocalIp = taskRoleCredentials.linkLocalIp(task.getTaskArn(), def.getName())
+                        .orElseThrow(() -> new IllegalStateException(
+                                "No link-local address available for ECS task-role credentials: "
+                                        + task.getTaskArn() + "/" + def.getName()));
+                specBuilder.withLinkLocalIp(linkLocalIp);
+            }
 
             // Add memory limit if specified
             if (def.getMemory() != null) {
@@ -270,6 +325,15 @@ public class EcsContainerManager {
         task.setStartedAt(Instant.now());
 
         return new EcsTaskHandle(task.getTaskArn(), containerIds, logStreamsByContainerId);
+        } catch (RuntimeException e) {
+            if (issuedTaskCredentials.isPresent()) {
+                // Credential revocation intentionally precedes container teardown: code in a
+                // still-running failed-start container must not retain IAM access while it drains.
+                revokeTaskCredentials(task.getTaskArn());
+            }
+            cleanupFailedStart(containerIds, logStreamsByContainerId);
+            throw e;
+        }
     }
 
     /**
@@ -287,6 +351,7 @@ public class EcsContainerManager {
         if (handle == null) {
             return;
         }
+        revokeTaskCredentials(handle.getTaskArn());
         for (String dockerId : handle.getContainerIds().values()) {
             lifecycleManager.stopAndRemove(dockerId, null);
         }
@@ -304,6 +369,10 @@ public class EcsContainerManager {
         if (handle == null) {
             return exitCodes;
         }
+
+        // Revoke before sending a stop signal. A task that is draining or whose stop fails must
+        // lose IAM access immediately, while the exact task ARN remains available on the handle.
+        revokeTaskCredentials(handle.getTaskArn());
 
         // Phase 1: stop all containers (no-op for those already exited).
         Set<String> terminatedContainerIds = new HashSet<>();
@@ -366,7 +435,54 @@ public class EcsContainerManager {
         }
     }
 
-    private List<String> buildEnvVars(ContainerDefinition def, ContainerOverride override, String region) {
+    private Optional<EcsTaskRoleCredentials.IssuedCredentials> issueTaskCredentials(EcsTask task,
+                                                                                       TaskDefinition taskDef,
+                                                                                       String region) {
+        if (taskRoleCredentials == null || taskDef == null
+                || taskDef.getTaskRoleArn() == null || taskDef.getTaskRoleArn().isBlank()
+                || !taskRoleCredentials.enabled()) {
+            return Optional.empty();
+        }
+        Optional<EcsTaskRoleCredentials.IssuedCredentials> issued = taskRoleCredentials.issue(
+                task.getTaskArn(), taskDef.getTaskRoleArn(), region);
+        if (issued.isEmpty()) {
+            throw new AwsException("AccessDeniedException",
+                    "ECS task role could not be resolved for task " + task.getTaskArn(), 400);
+        }
+        return issued;
+    }
+
+    private void revokeTaskCredentials(String taskArn) {
+        if (taskRoleCredentials != null) {
+            taskRoleCredentials.revokeTask(taskArn);
+        }
+    }
+
+    private void cleanupFailedStart(Map<String, String> containerIds,
+                                    Map<String, Closeable> logStreamsByContainerId) {
+        for (Map.Entry<String, String> entry : containerIds.entrySet()) {
+            Closeable stream = logStreamsByContainerId.remove(entry.getValue());
+            try {
+                lifecycleManager.stopAndRemove(entry.getValue(), stream);
+            } catch (Exception cleanupFailure) {
+                LOG.warnv("Error cleaning up ECS container {0} after failed launch: {1}",
+                        entry.getValue(), cleanupFailure.getMessage());
+            }
+        }
+        // If attaching a log stream failed after registering a handle, close any stream that did
+        // not have a corresponding container ID (best effort; the original launch error wins).
+        for (Closeable stream : logStreamsByContainerId.values()) {
+            lifecycleManager.closeLogStreamAfterContainerStop(stream);
+        }
+    }
+
+    private static boolean isTaskRoleCredentialEnv(String name,
+                                                    EcsTaskRoleCredentials.IssuedCredentials taskCredentials) {
+        return taskCredentials != null && TASK_ROLE_CREDENTIAL_ENV_KEYS.contains(name);
+    }
+
+    private List<String> buildEnvVars(ContainerDefinition def, ContainerOverride override, String region,
+                                      EcsTaskRoleCredentials.IssuedCredentials taskCredentials) {
         // AWS SDK baseline (endpoint + region + credentials) first so the task can reach the
         // emulator, then the task-def environment, then task-def secrets, then the override
         // environment. Later entries win on key conflict, so an explicit task-def value or
@@ -380,18 +496,35 @@ public class EcsContainerManager {
         }
         if (def.getEnvironment() != null) {
             for (var kv : def.getEnvironment()) {
-                envMap.put(kv.name(), kv.value());
+                if (!isTaskRoleCredentialEnv(kv.name(), taskCredentials)) {
+                    envMap.put(kv.name(), kv.value());
+                }
             }
         }
         if (def.getSecrets() != null) {
             for (Secret secret : def.getSecrets()) {
-                envMap.put(secret.name(), resolveSecretValue(secret.valueFrom(), region));
+                // A role task cannot supply static/profile credentials, including through a
+                // secret. Skip resolution entirely so an ignored credential attempt cannot make
+                // an otherwise valid task fail because the secret is missing.
+                if (!isTaskRoleCredentialEnv(secret.name(), taskCredentials)) {
+                    envMap.put(secret.name(), resolveSecretValue(secret.valueFrom(), region));
+                }
             }
         }
         if (override != null && override.getEnvironment() != null) {
             for (var kv : override.getEnvironment()) {
-                envMap.put(kv.name(), kv.value());
+                if (!isTaskRoleCredentialEnv(kv.name(), taskCredentials)) {
+                    envMap.put(kv.name(), kv.value());
+                }
             }
+        }
+        if (taskCredentials != null) {
+            // The relative URI is the only credential source exposed to a role task. Remove all
+            // static/profile/full-URI/token attempts from both the baseline and user input, then
+            // force the two AWS-managed values so task-def/override entries cannot overwrite them.
+            TASK_ROLE_CREDENTIAL_ENV_KEYS.forEach(envMap::remove);
+            envMap.put("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", taskCredentials.relativeUri());
+            envMap.put("AWS_EC2_METADATA_DISABLED", "true");
         }
         List<String> envVars = new ArrayList<>();
         for (var entry : envMap.entrySet()) {

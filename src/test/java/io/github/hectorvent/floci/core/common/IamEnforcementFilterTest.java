@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.services.iam.ScpProvider;
 import io.github.hectorvent.floci.services.iam.model.CallerContext;
 import jakarta.enterprise.inject.Instance;
 import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import org.junit.jupiter.api.BeforeEach;
@@ -145,6 +146,56 @@ class IamEnforcementFilterTest {
         verify(iamService, never()).resolveCallerContext(any());
         verify(evaluator, never()).evaluate(any(), any(), any(), any(), any());
         verify(containerRequest, never()).abortWith(any());
+    }
+
+    @Test
+    void reservedEcsKeyWithMalformedScopeFailsClosed() {
+        ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
+        String accessKey = "ASIAECS" + "A".repeat(13);
+        String auth = "AWS4-HMAC-SHA256 Credential=" + accessKey + ", Signature=abc";
+        when(containerRequest.getHeaderString("Authorization")).thenReturn(auth);
+        when(iamService.isEcsTaskRoleCredential(accessKey)).thenReturn(true);
+
+        newFilter().filter(containerRequest);
+
+        verify(containerRequest).abortWith(any(Response.class));
+    }
+
+    @Test
+    void presignedReservedEcsKeyWithoutSessionTokenFailsClosed() {
+        ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
+        jakarta.ws.rs.core.UriInfo uriInfo = mock(jakarta.ws.rs.core.UriInfo.class);
+        String accessKey = "ASIAECS" + "A".repeat(13);
+        String credential = accessKey + "/20260902/us-east-1/s3/aws4_request";
+        MultivaluedHashMap<String, String> query = new MultivaluedHashMap<>();
+        query.putSingle("X-Amz-Credential", credential);
+        when(containerRequest.getUriInfo()).thenReturn(uriInfo);
+        when(uriInfo.getQueryParameters()).thenReturn(query);
+        when(accountResolver.extractPresignedAccessKeyId(credential)).thenReturn(accessKey);
+        when(iamService.isEcsTaskRoleCredential(accessKey)).thenReturn(true);
+
+        newFilter().filter(containerRequest);
+
+        verify(containerRequest).abortWith(any(Response.class));
+    }
+
+    @Test
+    void malformedAuthorizationCannotHidePresignedReservedEcsKey() {
+        ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
+        jakarta.ws.rs.core.UriInfo uriInfo = mock(jakarta.ws.rs.core.UriInfo.class);
+        String accessKey = "ASIAECS" + "B".repeat(13);
+        String credential = accessKey + "/20260902/us-east-1/s3/aws4_request";
+        MultivaluedHashMap<String, String> query = new MultivaluedHashMap<>();
+        query.putSingle("X-Amz-Credential", credential);
+        when(containerRequest.getHeaderString("Authorization")).thenReturn("malformed");
+        when(containerRequest.getUriInfo()).thenReturn(uriInfo);
+        when(uriInfo.getQueryParameters()).thenReturn(query);
+        when(accountResolver.extractPresignedAccessKeyId(credential)).thenReturn(accessKey);
+        when(iamService.isEcsTaskRoleCredential(accessKey)).thenReturn(true);
+
+        newFilter().filter(containerRequest);
+
+        verify(containerRequest).abortWith(any(Response.class));
     }
 
     @Test

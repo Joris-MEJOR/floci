@@ -20,6 +20,7 @@ import org.junit.jupiter.api.Test;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -53,6 +54,44 @@ class IamServiceTest {
                 new RegionResolver("us-east-1", "000000000000"),
                 seedDeployerPrincipal
         );
+    }
+
+    @Test
+    void ecsTaskRoleSessionIsTokenBoundTransientAndFailClosedAfterRevocation() {
+        IamRole role = iamService.createRole("TaskRole", "/", "{}", null, 0, null);
+        String taskArn = "arn:aws:ecs:us-east-1:000000000000:task/default/task-a";
+        String roleArn = role.getArn();
+        String accessKey = "ASIAECS" + "A".repeat(13);
+        String secret = "s".repeat(40);
+        String token = "t".repeat(200);
+        String path = "/v2/credentials/" + "P".repeat(48);
+
+        assertFalse(iamService.isCredentialAccessKeyInUse(accessKey));
+        iamService.registerEcsTaskRoleSession(taskArn, "000000000000", accessKey, secret, token,
+                roleArn, Instant.now().plusSeconds(3600), path);
+
+        assertTrue(iamService.isCredentialAccessKeyInUse(accessKey));
+        assertEquals(Optional.of(secret), iamService.findSecretKey(accessKey));
+        assertEquals(Optional.of("000000000000"), iamService.resolveAccountId(accessKey));
+        assertTrue(iamService.validateEcsTaskRoleSessionToken(accessKey, token));
+        assertFalse(iamService.validateEcsTaskRoleSessionToken(accessKey, "wrong-token"));
+        assertTrue(iamService.resolveCallerArn(accessKey).orElseThrow().contains("ecs-task-task-a"));
+        assertThrows(IllegalArgumentException.class, () -> iamService.registerEcsTaskRoleSession(
+                "arn:aws:ecs:us-east-1:000000000000:task/default/task-b",
+                "000000000000", "ASIAECS" + "B".repeat(13), secret, token,
+                "arn:aws:iam::000000000000:role/other/TaskRole",
+                Instant.now().plusSeconds(3600), "/v2/credentials/" + "Q".repeat(48)));
+
+        iamService.revokeEcsTaskRoleSession(taskArn, accessKey);
+
+        assertTrue(iamService.isEcsTaskRoleCredential(accessKey));
+        assertFalse(iamService.isCredentialAccessKeyInUse(accessKey));
+        assertTrue(iamService.findSecretKey(accessKey).isEmpty());
+        assertTrue(iamService.resolveAccountId(accessKey).isEmpty());
+        assertFalse(iamService.validateEcsTaskRoleSessionToken(accessKey, token));
+        assertNotNull(iamService.resolveCallerContext(accessKey));
+        assertTrue(iamService.resolveCallerContext(accessKey).identityPolicies().isEmpty());
+        assertTrue(iamService.resolveCallerArn(accessKey).isEmpty());
     }
 
     // =========================================================================

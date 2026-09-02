@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.services.ecs.model.ContainerOverride;
 import io.github.hectorvent.floci.services.ecs.model.EcsTask;
 import io.github.hectorvent.floci.services.ecs.model.KeyValuePair;
 import io.github.hectorvent.floci.services.ecs.model.TaskDefinition;
+import io.github.hectorvent.floci.services.iam.model.SessionCreds;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import io.github.hectorvent.floci.services.ssm.SsmService;
 import org.junit.jupiter.api.BeforeEach;
@@ -22,6 +23,8 @@ import org.mockito.ArgumentCaptor;
 
 import java.util.List;
 import java.util.Map;
+import java.time.Instant;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -146,6 +149,58 @@ class EcsContainerManagerAwsBaselineTest {
                 "RunTask containerOverride should win over the baseline");
         assertFalse(env.contains("AWS_ENDPOINT_URL=http://localhost:4566"),
                 "overridden baseline endpoint should not remain");
+    }
+
+    @Test
+    void taskRoleUsesOnlyRelativeCredentialEndpointAndUniqueLinkLocalIp() {
+        EcsTaskRoleCredentials credentials = mock(EcsTaskRoleCredentials.class);
+        when(credentials.enabled()).thenReturn(true);
+        EcsTaskRoleCredentials.IssuedCredentials issued = new EcsTaskRoleCredentials.IssuedCredentials(
+                "arn:aws:ecs:us-east-1:000000000000:task/test-cluster/role-task",
+                "arn:aws:iam::000000000000:role/task-role", "/v2/credentials/ROLECREDENTIALTOKEN1234567890",
+                new SessionCreds("ASIAROLE", "role-secret", "role-token"),
+                Instant.parse("2030-01-01T00:00:00Z"), Instant.now());
+        when(credentials.issue(anyString(), anyString(), anyString())).thenReturn(Optional.of(issued));
+        when(credentials.linkLocalIp(anyString(), anyString())).thenReturn(Optional.of("169.254.170.3"));
+
+        ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
+        when(lifecycleManager.createAndStart(any())).thenReturn(new ContainerInfo("docker-id", Map.of()));
+        EcrRegistryManager ecr = mock(EcrRegistryManager.class);
+        when(ecr.rewriteImageUri(anyString())).thenAnswer(inv -> inv.getArgument(0));
+        manager = new EcsContainerManager(containerBuilder, lifecycleManager,
+                mock(ContainerLogStreamer.class), mock(ContainerDetector.class),
+                mock(EmulatorConfig.class, RETURNS_DEEP_STUBS), mock(RegionResolver.class), awsEnv,
+                mock(SsmService.class), mock(SecretsManagerService.class), ecr,
+                credentials);
+        ContainerDefinition app = containerDef("app", "app:latest", List.of(
+                new KeyValuePair("AWS_ACCESS_KEY_ID", "attacker"),
+                new KeyValuePair("AWS_PROFILE", "attacker-profile"),
+                new KeyValuePair("AWS_CONTAINER_CREDENTIALS_FULL_URI", "http://attacker"),
+                new KeyValuePair("AWS_CONTAINER_AUTHORIZATION_TOKEN", "attacker-token"),
+                new KeyValuePair("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/attacker"),
+                new KeyValuePair("AWS_EC2_METADATA_DISABLED", "false")));
+        TaskDefinition taskDef = new TaskDefinition();
+        taskDef.setFamily("role-family");
+        taskDef.setTaskRoleArn("arn:aws:iam::000000000000:role/task-role");
+        taskDef.setContainerDefinitions(List.of(app));
+        EcsTask task = new EcsTask();
+        task.setTaskArn(issued.taskArn());
+
+        manager.startTask(task, taskDef, null, "us-east-1");
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<String>> envCaptor = ArgumentCaptor.forClass(List.class);
+        verify(builder).withEnv(envCaptor.capture());
+        List<String> env = envCaptor.getValue();
+        assertTrue(env.contains("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=" + issued.relativeUri()));
+        assertTrue(env.contains("AWS_EC2_METADATA_DISABLED=true"));
+        assertTrue(env.stream().noneMatch(e -> e.startsWith("AWS_ACCESS_KEY_ID=")));
+        assertTrue(env.stream().noneMatch(e -> e.startsWith("AWS_SECRET_ACCESS_KEY=")));
+        assertTrue(env.stream().noneMatch(e -> e.startsWith("AWS_SESSION_TOKEN=")));
+        assertTrue(env.stream().noneMatch(e -> e.startsWith("AWS_PROFILE=")));
+        assertTrue(env.stream().noneMatch(e -> e.startsWith("AWS_CONTAINER_CREDENTIALS_FULL_URI=")));
+        assertTrue(env.stream().noneMatch(e -> e.startsWith("AWS_CONTAINER_AUTHORIZATION_TOKEN=")));
+        verify(builder).withLinkLocalIp("169.254.170.3");
     }
 
     private static ContainerDefinition containerDef(String name, String image, List<KeyValuePair> env) {
