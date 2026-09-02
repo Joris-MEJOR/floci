@@ -476,6 +476,50 @@ public class LambdaService implements ResourceProvider {
     }
 
     /**
+     * Reads a function, honouring a {@code Qualifier} that selects a published version or an alias.
+     *
+     * <p>The read paths used to ignore the qualifier entirely and answer with {@code $LATEST} for
+     * everything, including versions that were never published (issue #2821). That defeats the
+     * point of publishing: a caller pinning version 1 silently got whatever {@code $LATEST} held at
+     * the time of the call, and a typo or a stale alias read back as a live function instead of
+     * failing. Resolution is delegated to the same target resolver the invoke path uses, so a
+     * qualifier means the same thing whether you read it or run it.
+     *
+     * <p>A qualifier may also be carried on the name itself, as {@code fn:1} or a qualified ARN. An
+     * explicit {@code Qualifier} and one embedded in the name must agree; AWS rejects the
+     * combination when they do not.
+     */
+    public LambdaFunction getFunction(String region, String functionName, String qualifier) {
+        LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolve(functionName);
+        enforceRegion(region, ref);
+        String effective = resolveQualifier(ref.qualifier(), qualifier);
+        if (effective == null) {
+            return getFunction(region, functionName);
+        }
+        if (functionName.startsWith("arn:")) {
+            AwsArnUtils.Arn arn = AwsArnUtils.parse(functionName);
+            return resolveReadTargetForAccount(arn.accountId(), region, ref.name(), effective);
+        }
+        return resolveReadTarget(region, ref.name(), effective);
+    }
+
+    /**
+     * Reconciles a qualifier carried on the function name with an explicit {@code Qualifier}
+     * parameter. Either alone wins; both must agree.
+     */
+    private static String resolveQualifier(String onName, String explicit) {
+        if (explicit == null || explicit.isBlank()) {
+            return onName;
+        }
+        if (onName != null && !onName.equals(explicit)) {
+            throw new AwsException("InvalidParameterValueException",
+                    "Cannot provide both a qualified function name and a Qualifier: "
+                            + onName + " and " + explicit, 400);
+        }
+        return explicit;
+    }
+
+    /**
      * Resolves a {@code FunctionName} path parameter (bare name, partial ARN,
      * or full ARN, with optional {@code :qualifier}) to its canonical short
      * name, enforcing a region match when the input is a full ARN.
@@ -895,6 +939,22 @@ public class LambdaService implements ResourceProvider {
     }
 
     private LambdaFunction resolveInvokeTarget(String region, String name, String qualifier) {
+        return resolveTarget(region, name, qualifier, this::pickAliasVersion);
+    }
+
+    /**
+     * Resolves a qualifier for a <em>read</em>. Identical to the invoke path except for aliases:
+     * an alias with {@code AdditionalVersionWeights} shifts traffic, so {@link #pickAliasVersion}
+     * chooses randomly among the weighted versions, which is right for running the function and
+     * wrong for describing it. Two reads of one alias must not disagree, so a read follows the
+     * alias's primary {@code FunctionVersion}, which is what AWS reports.
+     */
+    private LambdaFunction resolveReadTarget(String region, String name, String qualifier) {
+        return resolveTarget(region, name, qualifier, LambdaAlias::getFunctionVersion);
+    }
+
+    private LambdaFunction resolveTarget(String region, String name, String qualifier,
+                                         java.util.function.Function<LambdaAlias, String> aliasVersion) {
         if (qualifier == null || qualifier.equals("$LATEST")) {
             return functionStore.get(region, name)
                     .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Function not found: " + name, 404));
@@ -906,7 +966,7 @@ public class LambdaService implements ResourceProvider {
         }
         // qualifier is an alias name
         LambdaAlias alias = getAlias(region, name, qualifier);
-        String version = pickAliasVersion(alias);
+        String version = aliasVersion.apply(alias);
         if (version == null || version.equals("$LATEST")) {
             return functionStore.get(region, name)
                     .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Function not found: " + name, 404));
@@ -918,6 +978,18 @@ public class LambdaService implements ResourceProvider {
 
     private LambdaFunction resolveInvokeTargetForAccount(
             String accountId, String region, String name, String qualifier) {
+        return resolveTargetForAccount(accountId, region, name, qualifier, this::pickAliasVersion);
+    }
+
+    /** The read counterpart of {@link #resolveInvokeTargetForAccount}; see {@link #resolveReadTarget}. */
+    private LambdaFunction resolveReadTargetForAccount(
+            String accountId, String region, String name, String qualifier) {
+        return resolveTargetForAccount(accountId, region, name, qualifier, LambdaAlias::getFunctionVersion);
+    }
+
+    private LambdaFunction resolveTargetForAccount(
+            String accountId, String region, String name, String qualifier,
+            java.util.function.Function<LambdaAlias, String> aliasVersion) {
         if (qualifier == null || qualifier.equals("$LATEST")) {
             return functionStore.getForAccount(accountId, region, name)
                     .orElseThrow(() -> new AwsException("ResourceNotFoundException",
@@ -936,7 +1008,7 @@ public class LambdaService implements ResourceProvider {
         if (alias == null) {
             throw new AwsException("ResourceNotFoundException", "Alias not found: " + qualifier, 404);
         }
-        String version = pickAliasVersion(alias);
+        String version = aliasVersion.apply(alias);
         if (version == null || version.equals("$LATEST")) {
             return functionStore.getForAccount(accountId, region, name)
                     .orElseThrow(() -> new AwsException("ResourceNotFoundException",
