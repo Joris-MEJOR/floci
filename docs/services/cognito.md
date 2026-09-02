@@ -56,6 +56,38 @@ Standalone `TagResource` rejects reserved `floci:*` keys. `ListTagsForResource` 
 | UpdateResourceServer | Updates a resource server's name and scopes. |
 | DeleteResourceServer | Deletes a resource server from a user pool. |
 
+### Identity Providers
+
+| Action | Description |
+|--------|-------------|
+| CreateIdentityProvider | Registers a federated identity provider on a user pool. |
+| DescribeIdentityProvider | Returns a registered identity provider. |
+| ListIdentityProviders | Lists a user pool's providers as name/type/date summaries. |
+| UpdateIdentityProvider | Updates a provider's details, attribute mapping or identifiers. |
+| DeleteIdentityProvider | Deletes an identity provider from a user pool. |
+
+Providers are stored configuration only. Floci does not perform the federated sign-in
+flow: there is no `/oauth2/authorize` or `/oauth2/idpresponse` endpoint, so a registered
+provider cannot be used to authenticate. This covers infrastructure tooling that creates
+and reads provider configuration, not federated login.
+
+Two deliberate divergences from AWS, both consequences of not calling out to a third
+party:
+
+- **No create-time validation of `ProviderDetails`.** AWS resolves an OIDC provider's
+  `oidc_issuer` discovery document while handling `CreateIdentityProvider`, and rejects
+  the call when it is unreachable. Floci stores `ProviderDetails` opaquely and makes no
+  outbound request, so it also does not enforce the per-provider-type required keys.
+- **No injected provider defaults.** AWS adds keys such as
+  `attributes_url_add_attributes` to an OIDC provider's stored details; Floci returns
+  only what was supplied.
+
+`AttributeMapping` and `IdpIdentifiers` follow AWS's update semantics: a member the
+request omits is left unchanged, and an explicitly empty map or list is what clears it.
+`IdpIdentifiers` is echoed by `CreateIdentityProvider` and `UpdateIdentityProvider` only
+when the request supplied it, whatever the stored value, while `DescribeIdentityProvider`
+always returns it.
+
 ### User Pool Domains
 
 | Action | Description |

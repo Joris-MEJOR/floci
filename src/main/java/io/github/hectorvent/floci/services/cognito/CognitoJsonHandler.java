@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cognito.model.CognitoGroup;
 import io.github.hectorvent.floci.services.cognito.model.CognitoUser;
+import io.github.hectorvent.floci.services.cognito.model.IdentityProvider;
 import io.github.hectorvent.floci.services.cognito.model.ResourceServer;
 import io.github.hectorvent.floci.services.cognito.model.ResourceServerScope;
 import io.github.hectorvent.floci.services.cognito.model.UserPool;
@@ -61,6 +62,11 @@ public class CognitoJsonHandler {
             case "ListResourceServers" -> handleListResourceServers(request);
             case "UpdateResourceServer" -> handleUpdateResourceServer(request);
             case "DeleteResourceServer" -> handleDeleteResourceServer(request);
+            case "CreateIdentityProvider" -> handleCreateIdentityProvider(request);
+            case "DescribeIdentityProvider" -> handleDescribeIdentityProvider(request);
+            case "ListIdentityProviders" -> handleListIdentityProviders(request);
+            case "UpdateIdentityProvider" -> handleUpdateIdentityProvider(request);
+            case "DeleteIdentityProvider" -> handleDeleteIdentityProvider(request);
             case "CreateUserPoolDomain" -> handleCreateUserPoolDomain(request);
             case "DescribeUserPoolDomain" -> handleDescribeUserPoolDomain(request);
             case "DeleteUserPoolDomain" -> handleDeleteUserPoolDomain(request);
@@ -351,6 +357,59 @@ public class CognitoJsonHandler {
         service.deleteResourceServer(
                 request.path("UserPoolId").asText(),
                 request.path("Identifier").asText()
+        );
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleCreateIdentityProvider(JsonNode request) {
+        IdentityProvider provider = service.createIdentityProvider(
+                request.path("UserPoolId").asText(),
+                request.path("ProviderName").asText(),
+                request.path("ProviderType").asText(null),
+                readStringMap(request, "ProviderDetails"),
+                readStringMap(request, "AttributeMapping"),
+                readStringList(request, "IdpIdentifiers")
+        );
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("IdentityProvider", identityProviderToNode(provider, request.has("IdpIdentifiers")));
+        return Response.ok(response).build();
+    }
+
+    private Response handleDescribeIdentityProvider(JsonNode request) {
+        IdentityProvider provider = service.describeIdentityProvider(
+                request.path("UserPoolId").asText(),
+                request.path("ProviderName").asText()
+        );
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("IdentityProvider", identityProviderToNode(provider, true));
+        return Response.ok(response).build();
+    }
+
+    private Response handleListIdentityProviders(JsonNode request) {
+        List<IdentityProvider> providers = service.listIdentityProviders(request.path("UserPoolId").asText());
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode items = response.putArray("Providers");
+        providers.forEach(provider -> items.add(providerDescriptionToNode(provider)));
+        return Response.ok(response).build();
+    }
+
+    private Response handleUpdateIdentityProvider(JsonNode request) {
+        IdentityProvider provider = service.updateIdentityProvider(
+                request.path("UserPoolId").asText(),
+                request.path("ProviderName").asText(),
+                readStringMap(request, "ProviderDetails"),
+                readStringMap(request, "AttributeMapping"),
+                readStringList(request, "IdpIdentifiers")
+        );
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("IdentityProvider", identityProviderToNode(provider, request.has("IdpIdentifiers")));
+        return Response.ok(response).build();
+    }
+
+    private Response handleDeleteIdentityProvider(JsonNode request) {
+        service.deleteIdentityProvider(
+                request.path("UserPoolId").asText(),
+                request.path("ProviderName").asText()
         );
         return Response.ok(objectMapper.createObjectNode()).build();
     }
@@ -1072,6 +1131,58 @@ public class CognitoJsonHandler {
             }
         }
         return node;
+    }
+
+    /**
+     * {@code IdpIdentifiers} is echoed only when the caller supplied the member: AWS omits it
+     * from CreateIdentityProvider and UpdateIdentityProvider responses otherwise, whatever the
+     * stored value, while DescribeIdentityProvider always returns it.
+     */
+    private ObjectNode identityProviderToNode(IdentityProvider provider, boolean includeIdpIdentifiers) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("UserPoolId", provider.getUserPoolId());
+        node.put("ProviderName", provider.getProviderName());
+        node.put("ProviderType", provider.getProviderType());
+        ObjectNode details = node.putObject("ProviderDetails");
+        provider.getProviderDetails().forEach(details::put);
+        ObjectNode mapping = node.putObject("AttributeMapping");
+        provider.getAttributeMapping().forEach(mapping::put);
+        if (includeIdpIdentifiers) {
+            ArrayNode identifiers = node.putArray("IdpIdentifiers");
+            provider.getIdpIdentifiers().forEach(identifiers::add);
+        }
+        node.put("CreationDate", provider.getCreationDate());
+        node.put("LastModifiedDate", provider.getLastModifiedDate());
+        return node;
+    }
+
+    private ObjectNode providerDescriptionToNode(IdentityProvider provider) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("ProviderName", provider.getProviderName());
+        node.put("ProviderType", provider.getProviderType());
+        node.put("LastModifiedDate", provider.getLastModifiedDate());
+        node.put("CreationDate", provider.getCreationDate());
+        return node;
+    }
+
+    private Map<String, String> readStringMap(JsonNode request, String member) {
+        JsonNode node = request.get(member);
+        if (node == null || !node.isObject()) {
+            return null;
+        }
+        Map<String, String> values = new LinkedHashMap<>();
+        node.fields().forEachRemaining(entry -> values.put(entry.getKey(), entry.getValue().asText()));
+        return values;
+    }
+
+    private List<String> readStringList(JsonNode request, String member) {
+        JsonNode node = request.get(member);
+        if (node == null || !node.isArray()) {
+            return null;
+        }
+        List<String> values = new ArrayList<>();
+        node.forEach(item -> values.add(item.asText()));
+        return values;
     }
 
     private List<ResourceServerScope> parseScopes(JsonNode scopesNode) {

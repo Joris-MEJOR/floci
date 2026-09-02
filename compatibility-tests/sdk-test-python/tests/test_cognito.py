@@ -360,3 +360,132 @@ class TestCognitoDescribeUserPoolStandardAttributes:
             assert sub["Mutable"] is False
         finally:
             cognito_client.delete_user_pool(UserPoolId=pool_id)
+
+
+class TestCognitoIdentityProvider:
+    """Test Cognito identity provider configuration operations.
+
+    The response shapes asserted here were measured against the live Cognito API.
+    ``IdpIdentifiers`` is echoed by CreateIdentityProvider only when the request
+    supplied it, while DescribeIdentityProvider always returns it.
+    """
+
+    OIDC_DETAILS = {
+        "client_id": "pytest-client",
+        "client_secret": "pytest-secret",
+        "attributes_request_method": "GET",
+        "oidc_issuer": "https://issuer.example.com",
+        "authorize_scopes": "openid",
+    }
+
+    @pytest.fixture
+    def pool_id(self, cognito_client, unique_name):
+        response = cognito_client.create_user_pool(PoolName=f"pytest-idp-pool-{unique_name}")
+        pool_id = response["UserPool"]["Id"]
+        yield pool_id
+        cognito_client.delete_user_pool(UserPoolId=pool_id)
+
+    def test_create_defaults_attribute_mapping_and_omits_idp_identifiers(
+        self, cognito_client, pool_id
+    ):
+        """Create defaults AttributeMapping and omits IdpIdentifiers when not supplied."""
+        provider = cognito_client.create_identity_provider(
+            UserPoolId=pool_id,
+            ProviderName="PytestOidc",
+            ProviderType="OIDC",
+            ProviderDetails=dict(self.OIDC_DETAILS),
+        )["IdentityProvider"]
+
+        assert provider["ProviderType"] == "OIDC"
+        assert provider["AttributeMapping"] == {"username": "sub"}
+        assert "IdpIdentifiers" not in provider
+
+    def test_describe_always_returns_idp_identifiers(self, cognito_client, pool_id):
+        """Describe returns IdpIdentifiers even when the stored list is empty."""
+        cognito_client.create_identity_provider(
+            UserPoolId=pool_id,
+            ProviderName="PytestOidc",
+            ProviderType="OIDC",
+            ProviderDetails=dict(self.OIDC_DETAILS),
+        )
+
+        provider = cognito_client.describe_identity_provider(
+            UserPoolId=pool_id, ProviderName="PytestOidc"
+        )["IdentityProvider"]
+
+        assert provider["IdpIdentifiers"] == []
+        assert provider["ProviderDetails"]["client_id"] == "pytest-client"
+
+    def test_update_preserves_members_the_request_omits(self, cognito_client, pool_id):
+        """Omitting AttributeMapping/IdpIdentifiers on update leaves them unchanged."""
+        cognito_client.create_identity_provider(
+            UserPoolId=pool_id,
+            ProviderName="PytestOidc",
+            ProviderType="OIDC",
+            ProviderDetails=dict(self.OIDC_DETAILS),
+            AttributeMapping={"email": "email", "username": "sub"},
+            IdpIdentifiers=["pytest-alias"],
+        )
+
+        cognito_client.update_identity_provider(
+            UserPoolId=pool_id,
+            ProviderName="PytestOidc",
+            ProviderDetails=dict(self.OIDC_DETAILS),
+        )
+
+        provider = cognito_client.describe_identity_provider(
+            UserPoolId=pool_id, ProviderName="PytestOidc"
+        )["IdentityProvider"]
+
+        assert provider["IdpIdentifiers"] == ["pytest-alias"]
+        assert provider["AttributeMapping"] == {"email": "email", "username": "sub"}
+
+    def test_list_returns_summaries_without_provider_details(self, cognito_client, pool_id):
+        """ListIdentityProviders returns summaries, never provider credentials."""
+        cognito_client.create_identity_provider(
+            UserPoolId=pool_id,
+            ProviderName="PytestOidc",
+            ProviderType="OIDC",
+            ProviderDetails=dict(self.OIDC_DETAILS),
+        )
+
+        providers = cognito_client.list_identity_providers(UserPoolId=pool_id)["Providers"]
+
+        assert len(providers) == 1
+        assert providers[0]["ProviderName"] == "PytestOidc"
+        assert providers[0]["ProviderType"] == "OIDC"
+        assert "ProviderDetails" not in providers[0]
+
+    def test_create_rejects_duplicate_provider_name(self, cognito_client, pool_id):
+        """A second provider with the same name raises DuplicateProviderException."""
+        cognito_client.create_identity_provider(
+            UserPoolId=pool_id,
+            ProviderName="PytestOidc",
+            ProviderType="OIDC",
+            ProviderDetails=dict(self.OIDC_DETAILS),
+        )
+
+        with pytest.raises(cognito_client.exceptions.DuplicateProviderException):
+            cognito_client.create_identity_provider(
+                UserPoolId=pool_id,
+                ProviderName="PytestOidc",
+                ProviderType="OIDC",
+                ProviderDetails=dict(self.OIDC_DETAILS),
+            )
+
+    def test_delete_removes_the_provider(self, cognito_client, pool_id):
+        """Delete removes the provider and a second delete raises."""
+        cognito_client.create_identity_provider(
+            UserPoolId=pool_id,
+            ProviderName="PytestOidc",
+            ProviderType="OIDC",
+            ProviderDetails=dict(self.OIDC_DETAILS),
+        )
+
+        cognito_client.delete_identity_provider(UserPoolId=pool_id, ProviderName="PytestOidc")
+
+        assert cognito_client.list_identity_providers(UserPoolId=pool_id)["Providers"] == []
+        with pytest.raises(cognito_client.exceptions.ResourceNotFoundException):
+            cognito_client.delete_identity_provider(
+                UserPoolId=pool_id, ProviderName="PytestOidc"
+            )
