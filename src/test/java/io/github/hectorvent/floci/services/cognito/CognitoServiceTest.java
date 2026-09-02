@@ -3161,7 +3161,46 @@ class CognitoServiceTest {
         assertTrue(id.contains("\"email\":\"reader@example.com\""), "readable attribute present: " + id);
         assertFalse(id.contains("\"name\""), "non-readable attribute must be filtered out: " + id);
     }
+    @Test
+    void adminSetUserMFAPreferenceUpdatesEmailMfaSettings() {
+        UserPool pool = createPoolAndUser();
 
+        service.adminSetUserMFAPreference(pool.getId(), "alice", true, true);
+
+        CognitoUser user = service.adminGetUser(pool.getId(), "alice");
+
+        assertNotNull(user.getEmailMfaSettings());
+        assertTrue(user.getEmailMfaSettings().isEnabled());
+        assertTrue(user.getEmailMfaSettings().isPreferredMfa());
+    }
+
+    @Test
+    void adminSetUserMFAPreferenceDoesNotMutateOnInvalidUpdate() {
+        UserPool pool = createPoolAndUser();
+
+        service.adminSetUserMFAPreference(pool.getId(), "alice", true, true);
+
+        assertThrows(AwsException.class, () ->
+                service.adminSetUserMFAPreference(pool.getId(), "alice", false, true));
+
+        CognitoUser user = service.adminGetUser(pool.getId(), "alice");
+
+        assertTrue(user.getEmailMfaSettings().isEnabled());
+        assertTrue(user.getEmailMfaSettings().isPreferredMfa());
+    }
+    @Test
+    void adminSetUserMFAPreferenceDisablingEmailMfaClearsPreferredMfa() {
+        UserPool pool = createPoolAndUser();
+
+        service.adminSetUserMFAPreference(pool.getId(), "alice", true, true);
+
+        service.adminSetUserMFAPreference(pool.getId(), "alice", false, null);
+
+        CognitoUser user = service.adminGetUser(pool.getId(), "alice");
+
+        assertFalse(user.getEmailMfaSettings().isEnabled());
+        assertFalse(user.getEmailMfaSettings().isPreferredMfa());
+   }
     private static String jwtPayload(String token) {
         String segment = token.split("\\.")[1];
         int pad = (4 - segment.length() % 4) % 4;

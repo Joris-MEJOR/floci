@@ -119,6 +119,8 @@ public class CognitoJsonHandler {
             case "ListUserPoolClientSecrets" -> handleListUserPoolClientSecrets(request);
             case "AddUserPoolClientSecret" -> handleAddUserPoolClientSecret(request);
             case "DeleteUserPoolClientSecret" -> handleDeleteUserPoolClientSecret(request);
+            case "AdminSetUserMFAPreference" -> handleAdminSetUserMFAPreference(request);
+            case "SetUserMFAPreference" -> handleSetUserMFAPreference(request);
             default -> Response.status(400)
                     .entity(new AwsErrorResponse("UnsupportedOperation", "Operation " + action + " is not supported."))
                     .build();
@@ -1370,6 +1372,49 @@ public class CognitoJsonHandler {
         }
         node.put("ClientSecretCreateDate", cs.getClientSecretCreateDate());
         return node;
+    }
+    private Response handleAdminSetUserMFAPreference(JsonNode request) {
+        String userPoolId = request.path("UserPoolId").asText();
+        String username = request.path("Username").asText();
+
+        JsonNode emailSettings = request.path("EmailMfaSettings");
+
+        Boolean enabled = emailSettings.has("Enabled")
+                ? emailSettings.path("Enabled").asBoolean()
+                : null;
+
+        Boolean preferredMfa = emailSettings.has("PreferredMfa")
+                ? emailSettings.path("PreferredMfa").asBoolean()
+                : null;
+
+        service.adminSetUserMFAPreference(
+                userPoolId,
+                username,
+                enabled,
+                preferredMfa
+        );
+
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleSetUserMFAPreference(JsonNode request) {
+        JsonNode emailSettings = request.path("EmailMfaSettings");
+
+        Boolean enabled = emailSettings.has("Enabled")
+                ? emailSettings.path("Enabled").asBoolean()
+                : null;
+
+        Boolean preferredMfa = emailSettings.has("PreferredMfa")
+                ? emailSettings.path("PreferredMfa").asBoolean()
+                : null;
+
+        service.setUserMFAPreference(
+                request.path("AccessToken").asText(),
+                enabled,
+                preferredMfa
+        );
+
+        return Response.ok(objectMapper.createObjectNode()).build();
     }
 
 }

@@ -5,6 +5,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import io.github.hectorvent.floci.services.cognito.model.EmailMfaSettings;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
@@ -3774,7 +3775,98 @@ public class CognitoService implements ResourceProvider {
         }
         return value;
     }
+    public void adminSetUserMFAPreference(
+            String userPoolId,
+            String username,
+            Boolean emailEnabled,
+            Boolean emailPreferred) {
 
+        CognitoUser user = adminGetUser(userPoolId, username);
+
+        updateEmailMfaPreference(user, emailEnabled, emailPreferred);
+
+        user.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+
+        userStore.put(userKey(userPoolId, user.getUsername()), user);
+    }
+
+    public void setUserMFAPreference(
+            String accessToken,
+            Boolean emailEnabled,
+            Boolean emailPreferred) {
+
+        String username = extractUsernameFromToken(accessToken);
+        String poolId = extractPoolIdFromToken(accessToken);
+        String jti = extractJtiFromToken(accessToken);
+
+        if (username == null || poolId == null || jti == null) {
+            throw new AwsException(
+                    "NotAuthorizedException",
+                    "Invalid access token",
+                    400
+            );
+        }
+
+        validateTokenNotRevoked(jti, poolId, "access");
+        validateOriginJtiNotRevoked(accessToken, poolId);
+
+        Long iat = extractIatFromToken(accessToken);
+
+        validateUserNotGloballySignedOut(
+                username,
+                poolId,
+                "access",
+                iat != null ? iat : 0L
+        );
+
+        CognitoUser user = adminGetUser(poolId, username);
+
+        updateEmailMfaPreference(user, emailEnabled, emailPreferred);
+
+        user.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+
+        userStore.put(userKey(poolId, user.getUsername()), user);
+    }
+
+    private void updateEmailMfaPreference(
+            CognitoUser user,
+            Boolean enabled,
+            Boolean preferredMfa) {
+
+        if (enabled == null && preferredMfa == null) {
+            return;
+        }
+
+        EmailMfaSettings current = user.getEmailMfaSettings();
+
+        boolean newEnabled = enabled != null
+                ? enabled
+                : current != null && current.isEnabled();
+
+        boolean newPreferredMfa = preferredMfa != null
+                ? preferredMfa
+                : current != null && current.isPreferredMfa();
+        if (!newEnabled && Boolean.TRUE.equals(preferredMfa)) {
+            throw new AwsException(
+                    "InvalidParameterException",
+                    "Preferred MFA setting cannot be enabled when the MFA method is disabled.",
+                    400
+            );
+        }
+
+        if (!newEnabled) {
+            newPreferredMfa = false;
+        }
+
+        EmailMfaSettings settings = current != null
+                ? current
+                : new EmailMfaSettings();
+
+        settings.setEnabled(newEnabled);
+        settings.setPreferredMfa(newPreferredMfa);
+
+        user.setEmailMfaSettings(settings);
+    }
     private record DeliveryTarget(String attributeName, String deliveryMedium, String destination) {
     }
 }
