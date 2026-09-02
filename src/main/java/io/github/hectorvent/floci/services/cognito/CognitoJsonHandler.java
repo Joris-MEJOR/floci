@@ -15,12 +15,14 @@ import io.github.hectorvent.floci.services.cognito.model.UserPool;
 import io.github.hectorvent.floci.services.cognito.model.UserPoolClient;
 import io.github.hectorvent.floci.services.cognito.model.UserPoolClientSecret;
 import io.github.hectorvent.floci.services.cognito.model.UserPoolDomain;
+import io.github.hectorvent.floci.services.cognito.model.ManagedLoginBranding;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -75,6 +77,11 @@ public class CognitoJsonHandler {
             case "AdminEnableUser" -> handleAdminEnableUser(request);
             case "AdminDisableUser" -> handleAdminDisableUser(request);
             case "AdminLinkProviderForUser" -> handleAdminLinkProviderForUser(request);
+            case "CreateManagedLoginBranding" -> handleCreateManagedLoginBranding(request);
+            case "DescribeManagedLoginBranding" -> handleDescribeManagedLoginBranding(request);
+            case "DescribeManagedLoginBrandingByClient" -> handleDescribeManagedLoginBrandingByClient(request);
+            case "UpdateManagedLoginBranding" -> handleUpdateManagedLoginBranding(request);
+            case "DeleteManagedLoginBranding" -> handleDeleteManagedLoginBranding(request);
             case "ListUsers" -> handleListUsers(request);
             case "InitiateAuth" -> handleInitiateAuth(request);
             case "AdminInitiateAuth" -> handleAdminInitiateAuth(request);
@@ -553,6 +560,139 @@ public class CognitoJsonHandler {
     private Response handleAdminDisableUser(JsonNode request) {
         service.adminDisableUser(request.path("UserPoolId").asText(), request.path("Username").asText());
         return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    /**
+     * AWS coerces a JSON string in this member instead of rejecting it, and rejects every
+     * other non-boolean type. Measured against Cognito in ap-southeast-1:
+     *
+     * <pre>
+     * absent          accepted, stored false
+     * true / false    accepted as given
+     * "true", "yes"   accepted, stored true
+     * "false"         accepted, stored false
+     * 1, null, {}, [] SerializationException
+     * </pre>
+     *
+     * <p>Jackson would map all of those last four to false through {@code asBoolean()},
+     * which is how a malformed flag used to be accepted alongside valid settings and
+     * persisted as unintended branding state.
+     */
+    private static Boolean readUseCognitoProvidedValues(JsonNode request) {
+        if (!request.has("UseCognitoProvidedValues")) {
+            return null;
+        }
+        JsonNode node = request.path("UseCognitoProvidedValues");
+        if (node.isBoolean()) {
+            return node.booleanValue();
+        }
+        if (node.isTextual()) {
+            return !"false".equalsIgnoreCase(node.asText());
+        }
+        throw new AwsException("SerializationException", null, 400);
+    }
+
+    private Response handleCreateManagedLoginBranding(JsonNode request) {
+        ManagedLoginBranding branding = service.createManagedLoginBranding(
+                request.path("UserPoolId").asText(),
+                request.path("ClientId").asText(),
+                readUseCognitoProvidedValues(request),
+                readObjectMap(request, "Settings"),
+                readMapList(request, "Assets")
+        );
+        return brandingResponse(branding);
+    }
+
+    private Response handleDescribeManagedLoginBranding(JsonNode request) {
+        return brandingResponse(service.describeManagedLoginBranding(
+                request.path("UserPoolId").asText(),
+                request.path("ManagedLoginBrandingId").asText(null)));
+    }
+
+    private Response handleDescribeManagedLoginBrandingByClient(JsonNode request) {
+        return brandingResponse(service.describeManagedLoginBrandingByClient(
+                request.path("UserPoolId").asText(),
+                request.path("ClientId").asText()));
+    }
+
+    private Response handleUpdateManagedLoginBranding(JsonNode request) {
+        return brandingResponse(service.updateManagedLoginBranding(
+                request.path("UserPoolId").asText(),
+                request.path("ManagedLoginBrandingId").asText(null),
+                readUseCognitoProvidedValues(request),
+                readObjectMap(request, "Settings"),
+                readMapList(request, "Assets")));
+    }
+
+    private Response handleDeleteManagedLoginBranding(JsonNode request) {
+        service.deleteManagedLoginBranding(
+                request.path("UserPoolId").asText(),
+                request.path("ManagedLoginBrandingId").asText(null));
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response brandingResponse(ManagedLoginBranding branding) {
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("ManagedLoginBranding", managedLoginBrandingToNode(branding));
+        return Response.ok(response).build();
+    }
+
+    /** AWS omits Settings entirely when none was supplied, but always returns Assets. */
+    private ObjectNode managedLoginBrandingToNode(ManagedLoginBranding branding) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("ManagedLoginBrandingId", branding.getManagedLoginBrandingId());
+        node.put("UserPoolId", branding.getUserPoolId());
+        node.put("UseCognitoProvidedValues", branding.isUseCognitoProvidedValues());
+        if (branding.getSettings() != null) {
+            node.set("Settings", objectMapper.valueToTree(branding.getSettings()));
+        }
+        ArrayNode assets = node.putArray("Assets");
+        branding.getAssets().forEach(asset -> assets.add(objectMapper.valueToTree(asset)));
+        node.put("CreationDate", branding.getCreationDate());
+        node.put("LastModifiedDate", branding.getLastModifiedDate());
+        return node;
+    }
+
+    /** Absent or null yields null; a value of the wrong JSON type is a deserialization failure. */
+    private Map<String, Object> readObjectMap(JsonNode request, String member) {
+        JsonNode node = request.get(member);
+        if (node == null || node.isNull()) {
+            return null;
+        }
+        if (!node.isObject()) {
+            throw new AwsException("SerializationException", "Unexpected field type", 400);
+        }
+        return objectMapper.convertValue(node, new TypeReference<LinkedHashMap<String, Object>>() {});
+    }
+
+    /**
+     * Elements are checked before conversion so a scalar cannot escape as an IllegalArgumentException.
+     * AWS separates the two failures: a null element is a validation error, a non-object element a
+     * deserialization one. Note this differs from LogConfigurations, where a null element is dropped.
+     */
+    private List<Map<String, Object>> readMapList(JsonNode request, String member) {
+        JsonNode node = request.get(member);
+        if (node == null || node.isNull()) {
+            return null;
+        }
+        if (!node.isArray()) {
+            throw new AwsException("SerializationException", "Unexpected field type", 400);
+        }
+        List<Map<String, Object>> values = new ArrayList<>();
+        for (JsonNode element : node) {
+            if (element.isNull()) {
+                throw new AwsException("InvalidParameterException",
+                        "1 validation error detected: Value '" + node + "' at '"
+                                + Character.toLowerCase(member.charAt(0)) + member.substring(1)
+                                + "' failed to satisfy constraint: Member must satisfy constraint: "
+                                + "[Member must not be null]", 400);
+            }
+            if (!element.isObject()) {
+                throw new AwsException("SerializationException", "Unexpected value type in payload", 400);
+            }
+            values.add(objectMapper.convertValue(element, new TypeReference<Map<String, Object>>() {}));
+        }
+        return values;
     }
 
     private Response handleAdminLinkProviderForUser(JsonNode request) {

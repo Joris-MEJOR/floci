@@ -25,6 +25,7 @@ import io.github.hectorvent.floci.services.cognito.model.UserPool;
 import io.github.hectorvent.floci.services.cognito.model.UserPoolClient;
 import io.github.hectorvent.floci.services.cognito.model.UserPoolClientSecret;
 import io.github.hectorvent.floci.services.cognito.model.UserPoolDomain;
+import io.github.hectorvent.floci.services.cognito.model.ManagedLoginBranding;
 import io.github.hectorvent.floci.services.cognito.verification.CognitoMessageDispatcher;
 import io.github.hectorvent.floci.services.cognito.verification.VerificationCode;
 import io.github.hectorvent.floci.services.cognito.verification.VerificationCodeException;
@@ -68,6 +69,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.regex.Pattern;
 
 import static io.github.hectorvent.floci.core.common.ReservedTags.rejectUnknownReservedTags;
 
@@ -1497,6 +1499,188 @@ public class CognitoService implements ResourceProvider {
             case "cognito:user_status", "status" -> user.getUserStatus();
             default -> user.getAttributes().get(attrName);
         };
+    }
+
+    // ──────────────────────────── Managed Login Branding ────────────────────────────
+
+    private static final Pattern BRANDING_ID_PATTERN = Pattern.compile(
+            "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[4][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$");
+    private static final int MAX_BRANDING_ASSETS = 40;
+
+    public ManagedLoginBranding createManagedLoginBranding(String userPoolId, String clientId,
+                                                           Boolean useCognitoProvidedValues,
+                                                           Map<String, Object> settings,
+                                                           List<Map<String, Object>> assets) {
+        List<String> errors = new ArrayList<>();
+        collectAssetsLengthError(errors, assets);
+        throwBrandingValidationErrors(errors);
+
+        UserPoolClient client = describeUserPoolClient(userPoolId, clientId);
+        validateBrandingSource(useCognitoProvidedValues, settings);
+        if (client.getManagedLoginBranding() != null) {
+            throw new AwsException("ManagedLoginBrandingExistsException",
+                    "A ManagedLoginBranding already exists for client " + clientId, 400);
+        }
+
+        ManagedLoginBranding branding = new ManagedLoginBranding();
+        branding.setManagedLoginBrandingId(UUID.randomUUID().toString());
+        branding.setUserPoolId(userPoolId);
+        branding.setUseCognitoProvidedValues(Boolean.TRUE.equals(useCognitoProvidedValues));
+        branding.setSettings(settings);
+        branding.setAssets(assets);
+        client.setManagedLoginBranding(branding);
+        clientStore.put(clientId, client);
+        return branding;
+    }
+
+    public ManagedLoginBranding describeManagedLoginBranding(String userPoolId, String brandingId) {
+        List<String> errors = new ArrayList<>();
+        collectBrandingIdError(errors, brandingId);
+        throwBrandingValidationErrors(errors);
+
+        describeUserPool(userPoolId);
+        return findBrandingClient(userPoolId, brandingId).getManagedLoginBranding();
+    }
+
+    public ManagedLoginBranding describeManagedLoginBrandingByClient(String userPoolId, String clientId) {
+        UserPoolClient client = describeUserPoolClient(userPoolId, clientId);
+        ManagedLoginBranding branding = client.getManagedLoginBranding();
+        if (branding == null) {
+            throw new AwsException("ResourceNotFoundException",
+                    "ManagedLoginBranding for client " + clientId + " does not exist.", 400);
+        }
+        return branding;
+    }
+
+    /**
+     * Members the request omits are left as they were, matching the identity provider update
+     * semantics; an explicitly empty list or map is what clears them.
+     */
+    public ManagedLoginBranding updateManagedLoginBranding(String userPoolId, String brandingId,
+                                                           Boolean useCognitoProvidedValues,
+                                                           Map<String, Object> settings,
+                                                           List<Map<String, Object>> assets) {
+        List<String> errors = new ArrayList<>();
+        collectAssetsLengthError(errors, assets);
+        collectBrandingIdError(errors, brandingId);
+        throwBrandingValidationErrors(errors);
+
+        describeManagedLoginBranding(userPoolId, brandingId);
+        validateBrandingSource(useCognitoProvidedValues, settings);
+        UserPoolClient client = findBrandingClient(userPoolId, brandingId);
+        ManagedLoginBranding branding = client.getManagedLoginBranding();
+
+        if (useCognitoProvidedValues != null) {
+            branding.setUseCognitoProvidedValues(useCognitoProvidedValues);
+        }
+        if (settings != null) {
+            branding.setSettings(settings);
+        }
+        if (assets != null) {
+            branding.setAssets(assets);
+        }
+        branding.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+        clientStore.put(client.getClientId(), client);
+        return branding;
+    }
+
+    /**
+     * A branding request must select exactly one source of branding, and the same rule
+     * applies to create and to update. Measured against Cognito in ap-southeast-1:
+     *
+     * <pre>
+     * useCognitoProvidedValues  settings   result
+     * absent                    absent     InvalidParameterException
+     * true                      absent     accepted
+     * false                     absent     InvalidParameterException
+     * absent                    present    accepted
+     * true                      present    InvalidParameterException
+     * false                     present    accepted
+     * </pre>
+     *
+     * <p>So the member being present is not what counts: {@code false} selects no source,
+     * which is why it is rejected unless settings supply one.
+     */
+    private void validateBrandingSource(Boolean useCognitoProvidedValues, Map<String, Object> settings) {
+        if (Boolean.TRUE.equals(useCognitoProvidedValues) == (settings != null)) {
+            throw new AwsException("InvalidParameterException",
+                    "useCognitoProvidedValues or settings should be specified (but not both)", 400);
+        }
+    }
+
+    /**
+     * The shape checks AWS runs before it looks anything up, so an oversized asset list against a
+     * client or a branding id that does not exist reports the request problem rather than the
+     * missing resource. Measured against Cognito in ap-southeast-1: 41 assets with an unknown
+     * client reports the asset list, and 41 assets with a malformed branding id reports both, the
+     * asset list first.
+     */
+    private void collectAssetsLengthError(List<String> errors, List<Map<String, Object>> assets) {
+        if (assets != null && assets.size() > MAX_BRANDING_ASSETS) {
+            errors.add("Value '" + renderAssets(assets) + "' at 'assets' failed to satisfy constraint: "
+                    + "Member must have length less than or equal to " + MAX_BRANDING_ASSETS);
+        }
+    }
+
+    private void collectBrandingIdError(List<String> errors, String brandingId) {
+        if (brandingId == null || !BRANDING_ID_PATTERN.matcher(brandingId).matches()) {
+            errors.add("Value '" + brandingId + "' at 'managedLoginBrandingId' failed to satisfy "
+                    + "constraint: Member must satisfy regular expression pattern: "
+                    + BRANDING_ID_PATTERN.pattern());
+        }
+    }
+
+    private void throwBrandingValidationErrors(List<String> errors) {
+        if (errors.isEmpty()) {
+            return;
+        }
+        String header = errors.size() == 1
+                ? "1 validation error detected: "
+                : errors.size() + " validation errors detected: ";
+        throw new AwsException("InvalidParameterException", header + String.join("; ", errors), 400);
+    }
+
+    /** Mirrors the request model's {@code toString}, which AWS embeds in the length-constraint message. */
+    private String renderAssets(List<Map<String, Object>> assets) {
+        List<String> rendered = new ArrayList<>();
+        for (Map<String, Object> asset : assets) {
+            rendered.add("AssetType(category=" + asset.get("Category")
+                    + ", colorMode=" + asset.get("ColorMode")
+                    + ", extension=" + asset.get("Extension")
+                    + ", bytes=" + renderAssetBytes(asset.get("Bytes"))
+                    + ", resourceId=" + asset.get("ResourceId") + ")");
+        }
+        return "[" + String.join(", ", rendered) + "]";
+    }
+
+    /**
+     * AWS renders the blob as the buffer it decoded, so the reported length is the decoded byte
+     * count rather than the base64 string's. The lenient decoder is deliberate: this runs while
+     * building a rejection, and must not raise a second failure of its own.
+     */
+    private String renderAssetBytes(Object bytes) {
+        if (bytes == null) {
+            return "null";
+        }
+        int length = Base64.getMimeDecoder().decode(String.valueOf(bytes)).length;
+        return "java.nio.HeapByteBuffer[pos=0 lim=" + length + " cap=" + length + "]";
+    }
+
+    public void deleteManagedLoginBranding(String userPoolId, String brandingId) {
+        describeManagedLoginBranding(userPoolId, brandingId);
+        UserPoolClient client = findBrandingClient(userPoolId, brandingId);
+        client.setManagedLoginBranding(null);
+        clientStore.put(client.getClientId(), client);
+    }
+
+    private UserPoolClient findBrandingClient(String userPoolId, String brandingId) {
+        return clientStore.scan(k -> true).stream()
+                .filter(c -> userPoolId.equals(c.getUserPoolId())
+                        && c.getManagedLoginBranding() != null
+                        && brandingId.equals(c.getManagedLoginBranding().getManagedLoginBrandingId()))
+                .findFirst()
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                        "ManagedLoginBranding does not exist.", 400));
     }
 
     // ──────────────────────────── Groups ────────────────────────────

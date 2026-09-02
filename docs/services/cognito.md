@@ -145,6 +145,46 @@ further divergences, both deliberate:
 | AdminRemoveUserFromGroup | Removes a user from a group. |
 | AdminListGroupsForUser | Lists the groups assigned to a user. |
 
+### Managed Login Branding
+
+| Action | Description |
+|--------|-------------|
+| CreateManagedLoginBranding | Creates the branding for an app client. |
+| DescribeManagedLoginBranding | Returns a branding by its id. |
+| DescribeManagedLoginBrandingByClient | Returns the branding attached to an app client. |
+| UpdateManagedLoginBranding | Updates a branding's settings, assets or provided-values flag. |
+| DeleteManagedLoginBranding | Deletes a branding from its app client. |
+
+`CreateManagedLoginBranding` must name either `UseCognitoProvidedValues` or `Settings`; a
+request with neither is rejected. One branding per app client: a second
+`CreateManagedLoginBranding` for the same client is rejected with
+`ManagedLoginBrandingExistsException`. `ManagedLoginBrandingId` must be a
+version 4 UUID, and a malformed one is rejected before the lookup, as AWS does.
+`Assets` holds at most 40 entries on create and on update.
+`Settings` is omitted from the response when the caller supplied none, while `Assets` is
+always returned. Members an update omits are left unchanged.
+
+The asset-count and branding-id checks run before the pool, client or branding is looked
+up, so an oversized request naming something that does not exist reports the request
+problem rather than `ResourceNotFoundException`, and an update violating both reports them
+in one message with the asset list first.
+
+Branding is presentation for the hosted UI, which Floci does not serve, so it is stored
+and returned rather than rendered. Two divergences follow from that:
+
+- **`Settings` is stored opaquely.** AWS validates it against a deep schema, rejecting
+  unknown properties with `Invalid settings provided. Validation errors: [{property:
+  $.components...., errorType: UnknownProperty}]`. That schema is not published, so Floci
+  accepts any object.
+- **A wrongly typed `Settings` returns a client error.** AWS answers that particular input
+  with `InternalErrorException` and a 500; Floci returns
+  `SerializationException: Unexpected field type`, which is what AWS returns for a wrongly
+  typed `Assets`. Reproducing someone else's 500 seemed worse than being consistent.
+- **`ReturnMergedResources` is not honoured.** Against AWS it merges Cognito's own default
+  settings and assets into the response: on a pool with 8 configured assets it returns 38.
+  Reproducing that needs Cognito's default corpus, so Floci returns the stored branding
+  either way.
+
 ## Well-Known And OAuth Endpoints
 
 | Endpoint                                             | Description                                                      |
