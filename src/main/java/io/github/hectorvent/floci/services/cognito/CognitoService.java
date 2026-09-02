@@ -946,6 +946,140 @@ public class CognitoService implements ResourceProvider {
                 .format(java.time.Instant.now());
     }
 
+    // ──────────────────────────── Log Delivery ────────────────────────────
+
+    private static final Set<String> LOG_LEVELS = Set.of("ERROR", "INFO");
+    private static final Set<String> LOG_EVENT_SOURCES = Set.of("userAuthEvents", "userNotification");
+    private static final int MAX_LOG_CONFIGURATIONS = 2;
+
+    /**
+     * Replaces the pool's log configuration wholesale: AWS has no merge semantics here, and an
+     * empty list is what clears it.
+     */
+    public UserPool setLogDeliveryConfiguration(String userPoolId, List<Map<String, Object>> logConfigurations) {
+        validateLogConfigurations(logConfigurations);
+        rejectUnusableEventSources(logConfigurations);
+
+        UserPool pool = describeUserPool(userPoolId);
+        pool.setLogConfigurations(new ArrayList<>(logConfigurations));
+        poolStore.put(userPoolId, pool);
+        return pool;
+    }
+
+    public UserPool getLogDeliveryConfiguration(String userPoolId) {
+        return describeUserPool(userPoolId);
+    }
+
+    /**
+     * The shape checks AWS runs before it looks the pool up, so an oversized or malformed request
+     * against a pool that does not exist reports the request problem rather than the missing pool.
+     * Every violation is collected into one message, the list-length one ahead of the per-element
+     * ones, the way the service reports them.
+     */
+    private void validateLogConfigurations(List<Map<String, Object>> configs) {
+        if (configs == null) {
+            throw validationErrors(List.of(
+                    "Value null at 'logConfigurations' failed to satisfy constraint: Member must not be null"));
+        }
+
+        List<String> errors = new ArrayList<>();
+        if (configs.size() > MAX_LOG_CONFIGURATIONS) {
+            errors.add("Value '" + renderLogConfigurations(configs) + "' at 'logConfigurations' failed to "
+                    + "satisfy constraint: Member must have length less than or equal to " + MAX_LOG_CONFIGURATIONS);
+        }
+        for (int i = 0; i < configs.size(); i++) {
+            Map<String, Object> config = configs.get(i);
+            collectLogMemberError(errors, config.get("LogLevel"), LOG_LEVELS, i, "logLevel", "[ERROR, INFO]");
+            collectLogMemberError(errors, config.get("EventSource"), LOG_EVENT_SOURCES, i, "eventSource",
+                    "[userAuthEvents, userNotification]");
+        }
+        if (!errors.isEmpty()) {
+            throw validationErrors(errors);
+        }
+    }
+
+    /**
+     * Both complaints share one message, the missing-destination clause first, and each event
+     * source is named once however many configurations carry it.
+     *
+     * <p>"more then once" is the service's own spelling, kept so the message matches byte for byte.
+     */
+    private void rejectUnusableEventSources(List<Map<String, Object>> configs) {
+        Set<String> withoutDestination = new LinkedHashSet<>();
+        Set<String> seen = new LinkedHashSet<>();
+        Set<String> duplicated = new LinkedHashSet<>();
+        for (Map<String, Object> config : configs) {
+            String eventSource = String.valueOf(config.get("EventSource"));
+            if (!hasLogDestination(config)) {
+                withoutDestination.add(eventSource);
+            }
+            if (!seen.add(eventSource)) {
+                duplicated.add(eventSource);
+            }
+        }
+
+        StringBuilder message = new StringBuilder();
+        if (!withoutDestination.isEmpty()) {
+            message.append(" Following event sources in request have no destination: ")
+                    .append(new ArrayList<>(withoutDestination)).append(".");
+        }
+        if (!duplicated.isEmpty()) {
+            message.append(" Following event sources appear more then once in a request: ")
+                    .append(new ArrayList<>(duplicated)).append(".");
+        }
+        if (!message.isEmpty()) {
+            throw new AwsException("InvalidParameterException", "Request validation Failed." + message, 400);
+        }
+    }
+
+    private AwsException validationErrors(List<String> errors) {
+        String header = errors.size() == 1
+                ? "1 validation error detected: "
+                : errors.size() + " validation errors detected: ";
+        return new AwsException("InvalidParameterException", header + String.join("; ", errors), 400);
+    }
+
+    /** Mirrors the request model's {@code toString}, which AWS embeds in the length-constraint message. */
+    private String renderLogConfigurations(List<Map<String, Object>> configs) {
+        List<String> rendered = new ArrayList<>();
+        for (Map<String, Object> config : configs) {
+            rendered.add("LogConfigurationType(logLevel=" + config.get("LogLevel")
+                    + ", eventSource=" + config.get("EventSource")
+                    + ", cloudWatchLogsConfiguration=" + renderLogDestination(
+                            config.get("CloudWatchLogsConfiguration"), "CloudWatchLogsConfigurationType",
+                            "LogGroupArn", "logGroupArn")
+                    + ", s3Configuration=" + renderLogDestination(
+                            config.get("S3Configuration"), "S3ConfigurationType", "BucketArn", "bucketArn")
+                    + ", firehoseConfiguration=" + renderLogDestination(
+                            config.get("FirehoseConfiguration"), "FirehoseConfigurationType",
+                            "StreamArn", "streamArn")
+                    + ")");
+        }
+        return "[" + String.join(", ", rendered) + "]";
+    }
+
+    private String renderLogDestination(Object value, String typeName, String requestMember, String modelMember) {
+        if (!(value instanceof Map<?, ?> destination)) {
+            return "null";
+        }
+        return typeName + "(" + modelMember + "=" + destination.get(requestMember) + ")";
+    }
+
+    private boolean hasLogDestination(Map<String, Object> config) {
+        return config.get("CloudWatchLogsConfiguration") != null
+                || config.get("FirehoseConfiguration") != null
+                || config.get("S3Configuration") != null;
+    }
+
+    /** AWS reports the offending member with a 1-based index, e.g. {@code logConfigurations.1.member.logLevel}. */
+    private void collectLogMemberError(List<String> errors, Object value, Set<String> allowed, int index,
+                                       String member, String enumSet) {
+        if (value == null || !allowed.contains(String.valueOf(value))) {
+            errors.add("Value '" + value + "' at 'logConfigurations." + (index + 1) + ".member." + member
+                    + "' failed to satisfy constraint: Member must satisfy enum value set: " + enumSet);
+        }
+    }
+
     // ──────────────────────────── Users ────────────────────────────
 
     public CognitoUser adminCreateUser(String userPoolId, String username, Map<String, String> attributes,

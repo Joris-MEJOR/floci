@@ -19,6 +19,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -61,6 +62,8 @@ public class CognitoJsonHandler {
             case "CreateUserPoolDomain" -> handleCreateUserPoolDomain(request);
             case "DescribeUserPoolDomain" -> handleDescribeUserPoolDomain(request);
             case "DeleteUserPoolDomain" -> handleDeleteUserPoolDomain(request);
+            case "SetLogDeliveryConfiguration" -> handleSetLogDeliveryConfiguration(request);
+            case "GetLogDeliveryConfiguration" -> handleGetLogDeliveryConfiguration(request);
             case "AdminResetUserPassword" -> handleAdminResetUserPassword(request);
             case "AdminCreateUser" -> handleAdminCreateUser(request);
             case "AdminGetUser" -> handleAdminGetUser(request);
@@ -371,6 +374,57 @@ public class CognitoJsonHandler {
         ObjectNode response = objectMapper.createObjectNode();
         response.set("DomainDescription", userPoolDomainToNode(domain));
         return Response.ok(response).build();
+    }
+
+    private Response handleSetLogDeliveryConfiguration(JsonNode request) {
+        UserPool pool = service.setLogDeliveryConfiguration(
+                request.path("UserPoolId").asText(),
+                readObjectList(request, "LogConfigurations")
+        );
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("LogDeliveryConfiguration", logDeliveryConfigurationToNode(pool));
+        return Response.ok(response).build();
+    }
+
+    private Response handleGetLogDeliveryConfiguration(JsonNode request) {
+        UserPool pool = service.getLogDeliveryConfiguration(request.path("UserPoolId").asText());
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("LogDeliveryConfiguration", logDeliveryConfigurationToNode(pool));
+        return Response.ok(response).build();
+    }
+
+    private ObjectNode logDeliveryConfigurationToNode(UserPool pool) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("UserPoolId", pool.getId());
+        ArrayNode configurations = node.putArray("LogConfigurations");
+        pool.getLogConfigurations().forEach(config -> configurations.add(objectMapper.valueToTree(config)));
+        return node;
+    }
+
+    /**
+     * Absent or null yields null so the service can reject it. A value of the wrong JSON type is
+     * a deserialization failure, which AWS reports as SerializationException, and a null element
+     * inside the array is dropped, which is what AWS does with it.
+     */
+    private List<Map<String, Object>> readObjectList(JsonNode request, String member) {
+        JsonNode node = request.get(member);
+        if (node == null || node.isNull()) {
+            return null;
+        }
+        if (!node.isArray()) {
+            throw new AwsException("SerializationException", "Expected list or null", 400);
+        }
+        List<Map<String, Object>> values = new ArrayList<>();
+        for (JsonNode element : node) {
+            if (element.isNull()) {
+                continue;
+            }
+            if (!element.isObject()) {
+                throw new AwsException("SerializationException", "Expected null", 400);
+            }
+            values.add(objectMapper.convertValue(element, new TypeReference<Map<String, Object>>() {}));
+        }
+        return values;
     }
 
     private Response handleDeleteUserPoolDomain(JsonNode request) {
