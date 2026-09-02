@@ -11,6 +11,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import javax.net.ssl.KeyManager;
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLParameters;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.TrustManagerFactory;
 import javax.net.ssl.X509TrustManager;
@@ -32,6 +33,7 @@ import java.security.KeyStore;
 import java.security.PrivateKey;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
 import java.security.spec.PKCS8EncodedKeySpec;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -61,8 +63,10 @@ import java.util.stream.Collectors;
  *       every request since projected service account tokens rotate.</li>
  *   <li>Otherwise, a kubeconfig ({@code $KUBECONFIG}, first entry if multiple; else
  *       {@code ~/.kube/config}), current-context only, with a static bearer token or a
- *       client-certificate/client-key credential (PKCS#8 only). exec/auth-provider plugins
- *       (e.g. {@code aws eks get-token}) are not supported and fail with a clear error.</li>
+ *       client-certificate/client-key credential (PKCS#8 only). {@code insecure-skip-tls-verify}
+ *       is honored (skips both chain and hostname validation, matching kubectl), which covers
+ *       most kind/minikube configs. exec/auth-provider plugins (e.g. {@code aws eks get-token})
+ *       are not supported and fail with a clear error.</li>
  * </ul>
  */
 @ApplicationScoped
@@ -72,6 +76,22 @@ public class KubernetesApiClient {
     private static final Path SERVICE_ACCOUNT_TOKEN = SERVICE_ACCOUNT_DIR.resolve("token");
     private static final Path SERVICE_ACCOUNT_CA = SERVICE_ACCOUNT_DIR.resolve("ca.crt");
     private static final long POLL_INTERVAL_MS = 500;
+
+    /** Backs kubeconfig's {@code insecure-skip-tls-verify: true} (kind/minikube dev configs). */
+    private static final X509TrustManager INSECURE_TRUST_MANAGER = new X509TrustManager() {
+        @Override
+        public void checkClientTrusted(X509Certificate[] chain, String authType) {
+        }
+
+        @Override
+        public void checkServerTrusted(X509Certificate[] chain, String authType) {
+        }
+
+        @Override
+        public X509Certificate[] getAcceptedIssuers() {
+            return new X509Certificate[0];
+        }
+    };
 
     private final ObjectMapper mapper = new ObjectMapper();
     private final Object lock = new Object();
@@ -257,7 +277,7 @@ public class KubernetesApiClient {
             if (isRunningInCluster()) {
                 resolveInCluster();
             } else {
-                resolveFromKubeconfig();
+                resolveFromKubeconfig(kubeconfigPath());
             }
             initialized = true;
         }
@@ -265,6 +285,15 @@ public class KubernetesApiClient {
 
     private static boolean isRunningInCluster() {
         return System.getenv("KUBERNETES_SERVICE_HOST") != null || Files.exists(SERVICE_ACCOUNT_TOKEN);
+    }
+
+    /**
+     * Test-only: resolves from an explicit kubeconfig and marks the client ready, bypassing the
+     * in-cluster/{@code $KUBECONFIG} auto-detection {@link #ensureInitialized()} would otherwise do.
+     */
+    void initializeFromKubeconfigForTest(Path path) {
+        resolveFromKubeconfig(path);
+        this.initialized = true;
     }
 
     private void resolveInCluster() {
@@ -287,8 +316,7 @@ public class KubernetesApiClient {
         };
     }
 
-    private void resolveFromKubeconfig() {
-        var path = kubeconfigPath();
+    private void resolveFromKubeconfig(Path path) {
         if (!Files.exists(path)) {
             throw new IllegalStateException(
                     "The kubernetes Lambda executor needs either an in-cluster service account or a "
@@ -324,8 +352,16 @@ public class KubernetesApiClient {
         }
         this.baseUri = URI.create(server);
 
-        var caBytes = pemBytes(cluster, "certificate-authority", "certificate-authority-data", path);
-        var trustManager = caBytes != null ? trustManagerFromPem(caBytes) : defaultTrustManager();
+        // Matches kubectl: when set, this wins over any certificate-authority (chain
+        // validation is skipped either way, so a CA to validate against is moot).
+        var insecureSkipTlsVerify = cluster.path("insecure-skip-tls-verify").asBoolean(false);
+        X509TrustManager trustManager;
+        if (insecureSkipTlsVerify) {
+            trustManager = INSECURE_TRUST_MANAGER;
+        } else {
+            var caBytes = pemBytes(cluster, "certificate-authority", "certificate-authority-data", path);
+            trustManager = caBytes != null ? trustManagerFromPem(caBytes) : defaultTrustManager();
+        }
 
         var certBytes = pemBytes(user, "client-certificate", "client-certificate-data", path);
         var keyBytes = pemBytes(user, "client-key", "client-key-data", path);
@@ -346,10 +382,18 @@ public class KubernetesApiClient {
                     + "' has no supported credential (token or client-certificate/client-key) in " + path);
         }
 
-        this.http = HttpClient.newBuilder()
+        var httpBuilder = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(5))
-                .sslContext(sslContext(trustManager, keyManagers))
-                .build();
+                .sslContext(sslContext(trustManager, keyManagers));
+        if (insecureSkipTlsVerify) {
+            // The trust manager above already skips chain validation; this additionally
+            // skips hostname verification, matching kubectl's --insecure-skip-tls-verify
+            // (otherwise a kind/minikube server cert with no matching SAN still fails).
+            var sslParameters = new SSLParameters();
+            sslParameters.setEndpointIdentificationAlgorithm("");
+            httpBuilder.sslParameters(sslParameters);
+        }
+        this.http = httpBuilder.build();
         this.tokenSupplier = token == null ? null : () -> token;
     }
 
