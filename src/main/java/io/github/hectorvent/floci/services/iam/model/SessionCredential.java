@@ -52,8 +52,14 @@ public class SessionCredential {
 
     public SessionCredential(String accessKeyId, String secretAccessKey, String roleArn, Instant expiration,
                               String sessionPolicyDocument) {
+        this(accessKeyId, secretAccessKey, null, roleArn, expiration, sessionPolicyDocument);
+    }
+
+    public SessionCredential(String accessKeyId, String secretAccessKey, String sessionToken, String roleArn,
+                              Instant expiration, String sessionPolicyDocument) {
         this.accessKeyId = accessKeyId;
         this.secretAccessKey = secretAccessKey;
+        this.sessionToken = sessionToken;
         this.roleArn = roleArn;
         this.expiration = expiration;
         this.sessionPolicyDocument = sessionPolicyDocument;
@@ -61,19 +67,18 @@ public class SessionCredential {
 
     public SessionCredential(String accessKeyId, String secretAccessKey, String roleArn, Instant expiration,
                               String sessionPolicyDocument, String originAccountId) {
+        this(accessKeyId, secretAccessKey, null, roleArn, expiration, sessionPolicyDocument, originAccountId);
+    }
+
+    public SessionCredential(String accessKeyId, String secretAccessKey, String sessionToken, String roleArn,
+                              Instant expiration, String sessionPolicyDocument, String originAccountId) {
         this.accessKeyId = accessKeyId;
         this.secretAccessKey = secretAccessKey;
+        this.sessionToken = sessionToken;
         this.roleArn = roleArn;
         this.expiration = expiration;
         this.sessionPolicyDocument = sessionPolicyDocument;
         this.originAccountId = originAccountId;
-    }
-
-    public SessionCredential(String accessKeyId, String secretAccessKey, String sessionToken,
-                             String roleArn, Instant expiration, String sessionPolicyDocument,
-                             String originAccountId) {
-        this(accessKeyId, secretAccessKey, roleArn, expiration, sessionPolicyDocument, originAccountId);
-        this.sessionToken = sessionToken;
     }
 
     public String getAccessKeyId() { return accessKeyId; }

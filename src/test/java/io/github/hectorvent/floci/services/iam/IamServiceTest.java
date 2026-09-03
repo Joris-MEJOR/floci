@@ -72,6 +72,9 @@ class IamServiceTest {
 
         assertTrue(iamService.isCredentialAccessKeyInUse(accessKey));
         assertEquals(Optional.of(secret), iamService.findSecretKey(accessKey));
+        assertEquals(Optional.of(secret), iamService.findSecretKey(accessKey, token));
+        assertTrue(iamService.findSecretKey(accessKey, "wrong-token").isEmpty());
+        assertTrue(iamService.findSecretKey(accessKey, null).isEmpty());
         assertEquals(Optional.of("000000000000"), iamService.resolveAccountId(accessKey));
         assertTrue(iamService.validateEcsTaskRoleSessionToken(accessKey, token));
         assertFalse(iamService.validateEcsTaskRoleSessionToken(accessKey, "wrong-token"));
@@ -87,6 +90,7 @@ class IamServiceTest {
         assertTrue(iamService.isEcsTaskRoleCredential(accessKey));
         assertFalse(iamService.isCredentialAccessKeyInUse(accessKey));
         assertTrue(iamService.findSecretKey(accessKey).isEmpty());
+        assertTrue(iamService.findSecretKey(accessKey, token).isEmpty());
         assertTrue(iamService.resolveAccountId(accessKey).isEmpty());
         assertFalse(iamService.validateEcsTaskRoleSessionToken(accessKey, token));
         assertNotNull(iamService.resolveCallerContext(accessKey));
@@ -660,6 +664,24 @@ class IamServiceTest {
 
         assertNull(iamService.resolveCallerContext("ASIAIOSFODNN7EXAMPLE"));
         assertNull(iamService.resolveCallerPolicies("ASIAIOSFODNN7EXAMPLE"));
+    }
+
+    @Test
+    void findSecretKeyRequiresTheTemporaryCredentialSessionToken() {
+        String accessKeyId = "ASIASESSIONTOKENMATCH";
+        iamService.registerSession(
+                accessKeyId,
+                "temporary-secret",
+                "session-token",
+                null,
+                Instant.now().plusSeconds(3600),
+                null
+        );
+
+        assertEquals("temporary-secret", iamService.findSecretKey(accessKeyId, "session-token").orElseThrow());
+        assertTrue(iamService.findSecretKey(accessKeyId).isPresent());
+        assertTrue(iamService.findSecretKey(accessKeyId, "wrong-token").isEmpty());
+        assertTrue(iamService.findSecretKey(accessKeyId, null).isEmpty());
     }
 
     // =========================================================================
