@@ -30,6 +30,8 @@ An action given a user pool ID that does not resolve returns `ResourceNotFoundEx
 | ListUserPools | Lists local user pools visible in the request region. |
 | UpdateUserPool | Updates mutable user pool settings and persisted user-pool tags. |
 | DeleteUserPool | Deletes a local user pool and its related state. |
+| GetUserPoolMfaConfig | Returns the pool's MFA mode and, once configured, its software-token setting. |
+| SetUserPoolMfaConfig | Sets `MfaConfiguration` (`OFF`/`ON`/`OPTIONAL`) and `SoftwareTokenMfaConfiguration`. An absent `MfaConfiguration` means `OFF`, and turning MFA off drops the factor configuration with it. Validation follows the live service: `OFF` alongside a software-token, email or SMS factor is rejected, and `ON`/`OPTIONAL` with none of those three is rejected, in both cases on the member being present, not on its `Enabled` value. `WebAuthnConfiguration` sits outside both rules, as it does in AWS. SMS, email and WebAuthn configurations are validated and not stored: Floci cannot deliver those factors, so keeping the config would imply a capability it does not have. |
 
 ### User Pool Tags
 

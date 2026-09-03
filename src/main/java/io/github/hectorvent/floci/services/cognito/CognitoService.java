@@ -368,6 +368,63 @@ public class CognitoService implements ResourceProvider {
         return pool;
     }
 
+    /**
+     * SetUserPoolMfaConfig. Stores the MFA mode and the software-token setting, which is
+     * what GetUserPoolMfaConfig reports back and what the Terraform provider reads to
+     * detect drift on mfa_configuration / software_token_mfa_configuration.
+     *
+     * <p>SMS, email and WebAuthn MFA are accepted and not stored: Floci has no path to
+     * deliver an SMS or email factor, so retaining the config would claim a capability
+     * that does not exist.
+     */
+    /**
+     * @param otherFactorConfigured whether EmailMfaConfiguration or SmsMfaConfiguration was
+     *     present in the request. Both count towards the factor rules below even though
+     *     Floci does not deliver either challenge; WebAuthnConfiguration does not, measured
+     *     against the live service, which accepts it alongside OFF and does not accept it
+     *     as the sole factor for ON or OPTIONAL.
+     */
+    public UserPool setUserPoolMfaConfig(String id, String mfaConfiguration,
+                                         Boolean softwareTokenMfaEnabled,
+                                         boolean otherFactorConfigured) {
+        UserPool pool = describeUserPool(id);
+        // An absent MfaConfiguration means OFF, not "leave the current mode alone":
+        // measured against the live service, which resets a pool that was OPTIONAL back
+        // to OFF when the member is omitted.
+        String mode = mfaConfiguration != null ? mfaConfiguration : "OFF";
+        if (!List.of("OPTIONAL", "OFF", "ON").contains(mode)) {
+            throw new AwsException("InvalidParameterException",
+                    "1 validation error detected: Value '" + mode
+                            + "' at 'mfaConfiguration' failed to satisfy constraint: "
+                            + "Member must satisfy enum value set: [OPTIONAL, OFF, ON]", 400);
+        }
+        // Presence, not value: the live service rejects OFF alongside
+        // SoftwareTokenMfaConfiguration{Enabled:false} just as it does Enabled:true, and
+        // conversely accepts ON alongside Enabled:false, so the member being there is what
+        // counts, despite the "must be enabled" wording of the second message.
+        boolean anyFactorConfigured = softwareTokenMfaEnabled != null || otherFactorConfigured;
+        if ("OFF".equals(mode) && anyFactorConfigured) {
+            throw new AwsException("InvalidParameterException",
+                    "Invalid MFA configuration given, can't turn off MFA and configure an "
+                            + "MFA together.", 400);
+        }
+        if (!"OFF".equals(mode) && !anyFactorConfigured) {
+            throw new AwsException("InvalidParameterException",
+                    "Invalid MFA Configuration given. SMS MFA, Email MFA, or Software Token "
+                            + "MFA must be enabled.", 400);
+        }
+        pool.setMfaConfiguration(mode);
+        if ("OFF".equals(mode)) {
+            // Turning MFA off drops the factor configuration with it: the live service
+            // answers OFF alone afterwards, with no SoftwareTokenMfaConfiguration member.
+            pool.setSoftwareTokenMfaEnabled(null);
+        } else if (softwareTokenMfaEnabled != null) {
+            pool.setSoftwareTokenMfaEnabled(softwareTokenMfaEnabled);
+        }
+        poolStore.put(id, pool);
+        return pool;
+    }
+
     public List<UserPool> listUserPools() {
         return poolStore.scan(k -> true);
     }
