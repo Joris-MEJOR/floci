@@ -62,8 +62,11 @@ link-local metadata route. Configure `FLOCI_SERVICES_ECS_DOCKER_NETWORK`, or the
 claims `169.254.170.2` for Floci on its shared network; task allocations begin at `.3` so the
 metadata address is not reused. Keep the listener on port `80` for clients using the unmodified
 standard relative-URI provider; a custom port requires a client that explicitly targets that port.
-If the listener cannot bind, Floci startup fails closed rather than running with a broken credential
-endpoint.
+This provider requires Floci itself to run in a container that owns `169.254.170.2`; native Floci is
+not supported for this opt-in surface. A custom container setup must assign that address with
+Compose `link_local_ips` or Docker's `--link-local-ip` on the same network used by ECS tasks. If the
+address or listener port is unavailable, Floci startup fails closed before launching tasks rather
+than running with a broken credential endpoint.
 
 ### Tasks
 

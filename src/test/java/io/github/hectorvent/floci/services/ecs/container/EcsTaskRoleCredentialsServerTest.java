@@ -10,8 +10,11 @@ import io.vertx.core.http.HttpServer;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
+import java.util.concurrent.CompletionException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
@@ -47,6 +50,33 @@ class EcsTaskRoleCredentialsServerTest {
         server.start().join();
 
         verify(httpServer).listen(eq(18080), eq(EcsTaskRoleCredentialsServer.TASK_METADATA_HOST), any());
+    }
+
+    @Test
+    void failsClosedWhenMetadataAddressCannotBind() {
+        Vertx vertx = mock(Vertx.class);
+        HttpServer httpServer = mock(HttpServer.class, RETURNS_SELF);
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        EcsTaskRoleCredentials credentials = mock(EcsTaskRoleCredentials.class);
+        IllegalStateException bindFailure = new IllegalStateException("address unavailable");
+        when(credentials.enabled()).thenReturn(true);
+        when(config.services().ecs().taskRoleCredentialsPort()).thenReturn(80);
+        when(vertx.createHttpServer()).thenReturn(httpServer);
+        doAnswer(invocation -> {
+            @SuppressWarnings("unchecked")
+            Handler<AsyncResult<HttpServer>> callback =
+                    (Handler<AsyncResult<HttpServer>>) invocation.getArgument(2);
+            callback.handle(Future.failedFuture(bindFailure));
+            return httpServer;
+        }).when(httpServer).listen(eq(80), eq(EcsTaskRoleCredentialsServer.TASK_METADATA_HOST), any());
+
+        EcsTaskRoleCredentialsServer server =
+                new EcsTaskRoleCredentialsServer(vertx, config, credentials);
+
+        CompletionException failure = assertThrows(CompletionException.class, () -> server.start().join());
+
+        assertSame(bindFailure, failure.getCause());
+        verify(httpServer).listen(eq(80), eq(EcsTaskRoleCredentialsServer.TASK_METADATA_HOST), any());
     }
 
     @Test

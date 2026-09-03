@@ -17,7 +17,9 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * Private AWS ECS container-credentials endpoint. Tasks receive only a relative URI; Docker
- * networking supplies the link-local route and no host port is published by this listener.
+ * networking supplies the link-local route and no host port is published by this listener. The
+ * exact-address bind intentionally rejects native or custom deployments that do not assign the
+ * standard metadata address to Floci, instead of advertising an unreachable provider to tasks.
  */
 @ApplicationScoped
 public class EcsTaskRoleCredentialsServer {
@@ -44,7 +46,8 @@ public class EcsTaskRoleCredentialsServer {
         try {
             start().get(10, TimeUnit.SECONDS);
         } catch (Exception e) {
-            throw new IllegalStateException("ECS task credential listener could not start", e);
+            throw new IllegalStateException("ECS task credential listener could not start on "
+                    + TASK_METADATA_HOST + "; assign that link-local address to the Floci container", e);
         }
     }
 
