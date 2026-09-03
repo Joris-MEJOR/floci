@@ -402,6 +402,10 @@ floci:
       # Fail an AWS::Lambda::Function whose S3 code cannot be read, as real CloudFormation
       # does. Set true to fall back to the built-in stub handler instead (issue #2648).
       allow-stub-lambda-code: false
+      # Stub a resource whose type has no provisioner: synthetic physical id, arn:aws:stub:::
+      # ARN attribute, CREATE_COMPLETE, reported at warn with a resource status reason. Set
+      # false to fail such a resource instead, which rolls the stack back.
+      allow-stub-unsupported-resource-types: true
     acm:
       enabled: true
       validation-wait-seconds: 0
