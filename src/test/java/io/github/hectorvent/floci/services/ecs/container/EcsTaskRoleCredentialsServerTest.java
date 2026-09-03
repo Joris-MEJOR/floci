@@ -1,14 +1,53 @@
 package io.github.hectorvent.floci.services.ecs.container;
 
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.iam.model.SessionCreds;
+import io.vertx.core.AsyncResult;
+import io.vertx.core.Future;
+import io.vertx.core.Handler;
+import io.vertx.core.Vertx;
+import io.vertx.core.http.HttpServer;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.RETURNS_SELF;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 class EcsTaskRoleCredentialsServerTest {
+
+    @Test
+    void bindsOnlyToAwsTaskMetadataAddress() {
+        Vertx vertx = mock(Vertx.class);
+        HttpServer httpServer = mock(HttpServer.class, RETURNS_SELF);
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        EcsTaskRoleCredentials credentials = mock(EcsTaskRoleCredentials.class);
+        when(credentials.enabled()).thenReturn(true);
+        when(config.services().ecs().taskRoleCredentialsPort()).thenReturn(18080);
+        when(vertx.createHttpServer()).thenReturn(httpServer);
+        doAnswer(invocation -> {
+            @SuppressWarnings("unchecked")
+            Handler<AsyncResult<HttpServer>> callback =
+                    (Handler<AsyncResult<HttpServer>>) invocation.getArgument(2);
+            callback.handle(Future.succeededFuture(httpServer));
+            return httpServer;
+        }).when(httpServer).listen(eq(18080), eq(EcsTaskRoleCredentialsServer.TASK_METADATA_HOST), any());
+
+        EcsTaskRoleCredentialsServer server =
+                new EcsTaskRoleCredentialsServer(vertx, config, credentials);
+
+        server.start().join();
+
+        verify(httpServer).listen(eq(18080), eq(EcsTaskRoleCredentialsServer.TASK_METADATA_HOST), any());
+    }
 
     @Test
     void responseUsesAwsContainerCredentialsShape() {

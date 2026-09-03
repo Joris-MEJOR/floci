@@ -108,6 +108,20 @@ class EcsTaskRoleCredentialsTest {
     }
 
     @Test
+    void linkLocalTaskAllocationsReserveMetadataAddressAndStartAtThree() {
+        String roleArn = "arn:aws:iam::111122223333:role/task-role";
+        EcsTaskRoleCredentials.IssuedCredentials first = credentials.issue(
+                "arn:aws:ecs:us-east-1:111122223333:task/default/task-link-a", roleArn,
+                "us-east-1").orElseThrow();
+        EcsTaskRoleCredentials.IssuedCredentials second = credentials.issue(
+                "arn:aws:ecs:us-east-1:111122223333:task/default/task-link-b", roleArn,
+                "us-east-1").orElseThrow();
+
+        assertEquals("169.254.170.3", credentials.linkLocalIp(first.taskArn(), "app").orElseThrow());
+        assertEquals("169.254.170.4", credentials.linkLocalIp(second.taskArn(), "app").orElseThrow());
+    }
+
+    @Test
     void rejectsNonCanonicalTaskAndRoleArns() {
         assertTrue(credentials.issue(
                 "arn:aws:ecs:us-east-1:111122223333:task/",

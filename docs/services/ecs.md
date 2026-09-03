@@ -36,6 +36,35 @@ own `RegisterTaskDefinition`) sees no drift. Neither changes how a local task ru
 every task on the host's own architecture, and a task's output stays with its Docker container
 rather than being routed to the configured log driver.
 
+### ECS task-role credentials
+
+Set `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_ENABLED=true` to opt in to AWS-compatible task-role
+credentials for Docker-backed tasks whose task definition declares `taskRoleArn`. The feature is
+off by default. Each task receives the standard ECS relative credential variable, for example:
+
+```text
+AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/v2/credentials/<opaque-task-token>
+```
+
+The AWS SDK combines this path with the ECS container metadata address. Floci removes static,
+profile, full-URI, and authorization-token credential overrides for a task-role container and sets
+`AWS_EC2_METADATA_DISABLED=true`, so the relative container credential provider is the only
+credential source exposed to that task. The endpoint returns AWS-shaped temporary credentials and
+refreshes them inside `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_REFRESH_WINDOW_SECONDS`, retaining
+the same relative URI while rotating the access key and token. Sessions expire after
+`FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_TTL_SECONDS` and are revoked when the task stops or Floci
+restarts. The task role must already exist in the task's account; an unknown role fails the launch.
+
+The listener binds to `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_PORT` (default `80`) and does not
+publish a host port. It is reachable only through the task container's private Docker network and
+link-local metadata route. Configure `FLOCI_SERVICES_ECS_DOCKER_NETWORK`, or the shared
+`FLOCI_SERVICES_DOCKER_NETWORK`, before enabling the feature. The standard `docker-compose.yml`
+claims `169.254.170.2` for Floci on its shared network; task allocations begin at `.3` so the
+metadata address is not reused. Keep the listener on port `80` for clients using the unmodified
+standard relative-URI provider; a custom port requires a client that explicitly targets that port.
+If the listener cannot bind, Floci startup fails closed rather than running with a broken credential
+endpoint.
+
 ### Tasks
 
 | Operation | Description |
@@ -210,20 +239,6 @@ unchanged.
 | `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_PORT` | `80` | Private link-local task credential listener port |
 | `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_TTL_SECONDS` | `3600` | Lifetime of each task-role credential session |
 | `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_REFRESH_WINDOW_SECONDS` | `300` | Refresh credentials this many seconds before expiry |
-
-### Task role credentials
-
-Set `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_ENABLED=true` to provide temporary
-credentials to Docker-backed tasks whose task definition has a `taskRoleArn`. Floci
-sets the AWS-standard `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` variable and serves the
-credential response from a private link-local address on the configured Docker network.
-Each task receives its own opaque provider path and credential session. Credentials are
-rotated before expiry and revoked when the task stops.
-
-The listener is not intended for host publication. Keep port 80 private to the Docker
-network and do not map `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_PORT` onto a host port.
-Task definitions and run-task overrides cannot replace the managed relative URI with
-static credentials, profile selectors, a full credential URI, or an authorization token.
 
 ### EFS volume ownership
 

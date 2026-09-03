@@ -22,6 +22,9 @@ import java.util.concurrent.TimeUnit;
 @ApplicationScoped
 public class EcsTaskRoleCredentialsServer {
 
+    /** AWS ECS container-credentials link-local metadata address. */
+    public static final String TASK_METADATA_HOST = "169.254.170.2";
+
     private static final Logger LOG = Logger.getLogger(EcsTaskRoleCredentialsServer.class);
 
     private final Vertx vertx;
@@ -65,14 +68,16 @@ public class EcsTaskRoleCredentialsServer {
         int port = config.services().ecs().taskRoleCredentialsPort();
         httpServer = vertx.createHttpServer()
                 .requestHandler(router)
-                .listen(port, result -> {
+                .listen(port, TASK_METADATA_HOST, result -> {
                     if (result.succeeded()) {
-                        LOG.infof("ECS task credential listener started on port %d", port);
+                        LOG.infof("ECS task credential listener started on %s:%d",
+                                TASK_METADATA_HOST, port);
                         started.complete(null);
                     } else {
                         httpServer = null;
-                        LOG.warnf("ECS task credential listener failed on port %d: %s",
-                                port, result.cause() == null ? "unknown error" : result.cause().getMessage());
+                        LOG.warnf("ECS task credential listener failed on %s:%d: %s",
+                                TASK_METADATA_HOST, port,
+                                result.cause() == null ? "unknown error" : result.cause().getMessage());
                         started.completeExceptionally(result.cause());
                     }
                 });
