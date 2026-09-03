@@ -4117,6 +4117,11 @@ public class CloudFormationResourceProvisioner {
             }
         }
 
+        List<String> functionResponseTypes = resolveStringList(props, "FunctionResponseTypes", engine);
+        if (!functionResponseTypes.isEmpty()) {
+            req.put("FunctionResponseTypes", functionResponseTypes);
+        }
+
         var esm = lambdaService.createEventSourceMapping(region, req);
         r.setPhysicalId(esm.getUuid());
         r.getAttributes().put("Id", esm.getUuid());
