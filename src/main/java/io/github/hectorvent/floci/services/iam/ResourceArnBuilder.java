@@ -6,10 +6,14 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.container.ContainerRequestContext;
+import jakarta.ws.rs.core.MediaType;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.URLDecoder;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -58,6 +62,7 @@ public class ResourceArnBuilder {
             case "secretsmanager" -> List.of(buildSecretsManagerArn(ctx, region, accountId));
             case "ssm"            -> List.of(buildSsmArn(ctx, region, accountId));
             case "kms"            -> List.of(buildKmsArn(path, region, accountId));
+            case "sts"            -> List.of(buildStsArn(ctx));
             default               -> List.of("*");
         };
     }
@@ -328,6 +333,28 @@ public class ResourceArnBuilder {
         return AwsArnUtils.Arn.of("kms", region, accountId, "key/" + keyId).toString();
     }
 
+    // ── STS ───────────────────────────────────────────────────────────────────
+    private String buildStsArn(ContainerRequestContext ctx) {
+        String roleArn = firstFormParam(ctx, "RoleArn");
+        if (roleArn == null || roleArn.isBlank()) {
+            return "*";
+        }
+        roleArn = roleArn.trim();
+        try {
+            AwsArnUtils.Arn parsed = AwsArnUtils.parse(roleArn);
+            if (!"iam".equals(parsed.service())
+                    || !parsed.region().isEmpty()
+                    || !parsed.accountId().matches("\\d{12}")
+                    || !parsed.resource().startsWith("role/")
+                    || parsed.resource().length() == "role/".length()) {
+                return "*";
+            }
+            return roleArn;
+        } catch (IllegalArgumentException e) {
+            return "*";
+        }
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────────────
 
     private JsonNode readJsonBody(ContainerRequestContext ctx) {
@@ -370,8 +397,52 @@ public class ResourceArnBuilder {
     }
 
     private String firstFormParam(ContainerRequestContext ctx, String name) {
-        // Form params are typically available as query params in REST-Assured / JAX-RS
         String v = ctx.getUriInfo().getQueryParameters().getFirst(name);
-        return v;
+        if (v != null) {
+            return v;
+        }
+        MediaType mediaType = ctx.getMediaType();
+        if (mediaType == null
+                || !"application".equalsIgnoreCase(mediaType.getType())
+                || !"x-www-form-urlencoded".equalsIgnoreCase(mediaType.getSubtype())) {
+            return null;
+        }
+        InputStream in = ctx.getEntityStream();
+        if (in == null) {
+            return null;
+        }
+        byte[] body;
+        try {
+            body = in.readAllBytes();
+        } catch (IOException e) {
+            return null;
+        }
+        ctx.setEntityStream(new ByteArrayInputStream(body));
+        Charset charset = resolveCharset(mediaType);
+        String form = new String(body, charset);
+        try {
+            for (String pair : form.split("&")) {
+                int eq = pair.indexOf('=');
+                String key = eq < 0 ? pair : pair.substring(0, eq);
+                if (name.equals(URLDecoder.decode(key, charset))) {
+                    return eq < 0 ? "" : URLDecoder.decode(pair.substring(eq + 1), charset);
+                }
+            }
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+        return null;
+    }
+
+    private Charset resolveCharset(MediaType mediaType) {
+        String name = mediaType.getParameters().get("charset");
+        if (name == null || name.isBlank()) {
+            return StandardCharsets.UTF_8;
+        }
+        try {
+            return Charset.forName(name);
+        } catch (RuntimeException e) {
+            return StandardCharsets.UTF_8;
+        }
     }
 }

@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.MultivaluedMap;
+import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.UriInfo;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -60,6 +61,42 @@ class ResourceArnBuilderTest {
             when(ctx.getEntityStream()).thenReturn(newIn);
             return null;
         }).when(ctx).setEntityStream(any(InputStream.class));
+    }
+
+    private void setFormBody(String form) {
+        contextProperties.clear();
+        byte[] bytes = form.getBytes(StandardCharsets.UTF_8);
+        ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+        when(ctx.getMediaType()).thenReturn(MediaType.APPLICATION_FORM_URLENCODED_TYPE);
+        when(ctx.getEntityStream()).thenReturn(in);
+        doAnswer(inv -> {
+            InputStream newIn = inv.getArgument(0);
+            when(ctx.getEntityStream()).thenReturn(newIn);
+            return null;
+        }).when(ctx).setEntityStream(any(InputStream.class));
+    }
+
+    // ── STS ─────────────────────────────────────────────────────────────────────
+
+    @Test
+    void stsBuildsExactRoleArnFromFormBodyAndPreservesStream() throws IOException {
+        String form = "Action=AssumeRole&RoleArn=arn%3Aaws%3Aiam%3A%3A222222222222%3Arole%2Fapp%2Ftarget"
+                + "&RoleSessionName=test";
+        setFormBody(form);
+
+        String arn = builder.build("sts", ctx, "us-east-1", "111111111111");
+
+        assertEquals("arn:aws:iam::222222222222:role/app/target", arn);
+        assertEquals(form, new String(ctx.getEntityStream().readAllBytes(), StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void stsReturnsWildcardForMissingOrInvalidRoleArn() {
+        setFormBody("Action=GetCallerIdentity");
+        assertEquals("*", builder.build("sts", ctx, "us-east-1", "111111111111"));
+
+        setFormBody("Action=AssumeRole&RoleArn=arn%3Aaws%3As3%3A%3A%3Anot-a-role");
+        assertEquals("*", builder.build("sts", ctx, "us-east-1", "111111111111"));
     }
 
     // ── DynamoDB ─────────────────────────────────────────────────────────────────
