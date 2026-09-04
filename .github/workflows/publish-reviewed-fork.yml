@@ -147,6 +147,13 @@ jobs:
       IMAGE: ghcr.io/mejor-technologies/floci
       DIGEST: ${{ needs.publish.outputs.digest }}
     steps:
+      # The classic image store cannot retain both architectures under one index digest.
+      # Match the publication daemon's containerd store without logging into any registry.
+      - uses: docker/setup-docker-action@e43656e248c0bd0647d3f5c195d116aacf6fcaf4
+        with:
+          version: v29.7.2
+          daemon-config: |
+            {"features":{"containerd-snapshotter":true}}
       - name: Require public anonymous pulls for both architectures
         shell: bash
         run: |
