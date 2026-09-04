@@ -57,6 +57,14 @@ public class SigV4Validator {
      * @return true if the token is valid, identities match, and the token is not expired
      */
     public boolean validate(String token, String expectedGroupId, String expectedUsername) {
+        return validate(token, expectedGroupId, expectedUsername, "elasticache");
+    }
+
+    /** Service is selected by the server route, never by the incoming credential scope. */
+    public boolean validate(String token, String expectedGroupId, String expectedUsername, String expectedService) {
+        if (!"elasticache".equals(expectedService) && !"memorydb".equals(expectedService)) {
+            return false;
+        }
         try {
             URI uri = URI.create("http://" + token);
             String clusterId = uri.getHost();
@@ -103,7 +111,8 @@ public class SigV4Validator {
 
             String decodedCredential = urlDecode(credential);
             String[] credParts = decodedCredential.split("/");
-            if (credParts.length < 5) {
+            if (credParts.length != 5 || !expectedService.equals(credParts[3])
+                    || !"aws4_request".equals(credParts[4])) {
                 return false;
             }
             String accessKeyId = credParts[0];

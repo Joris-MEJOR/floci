@@ -325,6 +325,19 @@ class SigV4ValidatorTest {
     }
 
     @Test
+    void bindsOtherwiseValidEcsTokensToTheServerSelectedService() throws Exception {
+        SigV4Validator validator = new SigV4Validator(ecsIamService(Instant.now().plusSeconds(3600)));
+        for (String service : java.util.List.of("sts", "s3", "rds-db", "memorydb")) {
+            assertFalse(validator.validate(createEcsElastiCacheToken(ECS_SESSION_TOKEN, service),
+                    "cache-cluster-01", "default"), service);
+        }
+        assertTrue(validator.validate(createEcsElastiCacheToken(ECS_SESSION_TOKEN, "memorydb"),
+                "cache-cluster-01", "default", "memorydb"));
+        assertFalse(validator.validate(createEcsElastiCacheToken(ECS_SESSION_TOKEN),
+                "cache-cluster-01", "default", "memorydb"));
+    }
+
+    @Test
     void validateRejectsEcsTaskRoleTokenWithoutSessionToken() throws Exception {
         IamService iamService = ecsIamService(Instant.now().plusSeconds(3600));
         SigV4Validator validator = new SigV4Validator(iamService);
@@ -421,6 +434,10 @@ class SigV4ValidatorTest {
     }
 
     private static String createEcsElastiCacheToken(String sessionToken) throws Exception {
+        return createEcsElastiCacheToken(sessionToken, "elasticache");
+    }
+
+    private static String createEcsElastiCacheToken(String sessionToken, String service) throws Exception {
         Method signer = SigV4TokenTestHelper.class.getDeclaredMethod(
                 "signToken",
                 String.class,
@@ -448,7 +465,7 @@ class SigV4ValidatorTest {
                 ECS_ACCESS_KEY_ID,
                 ECS_SECRET_ACCESS_KEY,
                 "us-east-1",
-                "elasticache",
+                service,
                 Instant.now().minusSeconds(60),
                 900,
                 params,

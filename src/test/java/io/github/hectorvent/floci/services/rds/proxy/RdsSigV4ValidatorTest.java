@@ -315,6 +315,14 @@ class RdsSigV4ValidatorTest {
     }
 
     @Test
+    void rejectsOtherwiseValidEcsTokensSignedForAnotherService() throws Exception {
+        RdsSigV4Validator validator = new RdsSigV4Validator(ecsIamService(Instant.now().plusSeconds(3600)));
+        for (String service : java.util.List.of("sts", "s3", "elasticache", "memorydb")) {
+            assertFalse(validator.validate(createEcsRdsToken(ECS_SESSION_TOKEN, service), "admin"), service);
+        }
+    }
+
+    @Test
     void validateRejectsEcsTaskRoleTokenWithoutSessionToken() throws Exception {
         IamService iamService = ecsIamService(Instant.now().plusSeconds(3600));
         RdsSigV4Validator validator = new RdsSigV4Validator(iamService);
@@ -481,6 +489,10 @@ class RdsSigV4ValidatorTest {
     }
 
     private static String createEcsRdsToken(String sessionToken) throws Exception {
+        return createEcsRdsToken(sessionToken, "rds-db");
+    }
+
+    private static String createEcsRdsToken(String sessionToken, String service) throws Exception {
         Method signer = SigV4TokenTestHelper.class.getDeclaredMethod(
                 "signToken",
                 String.class,
@@ -508,7 +520,7 @@ class RdsSigV4ValidatorTest {
                 ECS_ACCESS_KEY_ID,
                 ECS_SECRET_ACCESS_KEY,
                 "us-east-1",
-                "rds-db",
+                service,
                 Instant.now().minusSeconds(60),
                 900,
                 params,

@@ -103,7 +103,8 @@ public class RdsSigV4Validator {
 
             String decodedCredential = urlDecode(credential);
             String[] credParts = decodedCredential.split("/");
-            if (credParts.length < 5) {
+            if (credParts.length != 5 || !"rds-db".equals(credParts[3])
+                    || !"aws4_request".equals(credParts[4])) {
                 return false;
             }
             String accessKeyId = credParts[0];
