@@ -48,6 +48,11 @@ bash tools/fork-ecs-smoke.sh IMAGE --platform amd64
 bash tools/fork-ecs-smoke.sh IMAGE --platform arm64
 ```
 
+For a custom daemon on the same Linux host, pass `--docker-socket /absolute/daemon/socket`.
+The CI workflow resolves this from its selected Docker context. Docker Desktop keeps the default
+`/var/run/docker.sock` daemon-host path, not the macOS client proxy path. Before creating tasks,
+the contract verifies that the mounted socket and controller report the same Docker daemon ID.
+
 The test uses a clean digest-pinned probe image, three real task containers, the default boto3
 container-role provider, an allowed object read and an explicit list-buckets denial. It asserts
 stable-path rotation, old-key denial, task-scoped revocation while another task remains allowed,

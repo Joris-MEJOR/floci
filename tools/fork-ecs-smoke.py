@@ -9,6 +9,7 @@ port, and it never prints a bearer path or credential value.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -529,7 +530,7 @@ def assert_no_host_ports(inspect: dict[str, Any], what: str) -> None:
         raise ContractFailure(f"{what} publishes a host port")
 
 
-def assert_floci_runtime(floci: str, network: str) -> None:
+def assert_floci_runtime(floci: str, network: str) -> dict[str, str]:
     inspect = exact_container_inspect(floci)
     assert_no_host_ports(inspect, "Floci")
     if docker_run("port", floci).strip():
@@ -542,6 +543,23 @@ def assert_floci_runtime(floci: str, network: str) -> None:
     uid = docker_run("exec", floci, "sh", "-c", "awk '/^Uid:/ {print $2}' /proc/1/status").strip()
     if uid != "1001":
         raise ContractFailure(f"Floci listener process has uid {uid!r}, expected 1001")
+    # A custom Docker context can use a different socket from /var/run/docker.sock.
+    # Fail before launching tasks if the emulator and controller see different daemons.
+    expected_daemon = docker_run("info", "--format", "{{.ID}}").strip()
+    actual_daemon = docker_run(
+        "exec", floci, "python3", "-c",
+        "import http.client,json,socket; "
+        "c=http.client.HTTPConnection('localhost',timeout=5); "
+        "c.sock=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); c.sock.settimeout(5); "
+        "c.sock.connect('/var/run/docker.sock'); c.request('GET','/info'); "
+        "r=c.getresponse(); assert r.status == 200; print(json.load(r)['ID']); c.close()",
+    ).strip()
+    if not expected_daemon or actual_daemon != expected_daemon:
+        raise ContractFailure("Floci Docker socket and controller target different daemons")
+    return {
+        "controller_fingerprint": hashlib.sha256(expected_daemon.encode()).hexdigest(),
+        "mounted_socket_fingerprint": hashlib.sha256(actual_daemon.encode()).hexdigest(),
+    }
 
 
 def task_container_inspects(
@@ -722,6 +740,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--network", help="unique test network name (default: generated)")
     parser.add_argument("--floci-name", help="unique Floci container name (default: generated)")
     parser.add_argument(
+        "--docker-socket", default="/var/run/docker.sock",
+        help="daemon-host socket path to mount into Floci (not the workstation proxy path)",
+    )
+    parser.add_argument(
         "--platform",
         choices=("amd64", "arm64"),
         help="Docker target platform for Floci and the probe image (default: daemon platform)",
@@ -733,6 +755,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if not args.docker_socket.startswith("/") or any(c in args.docker_socket for c in ",\n\r"):
+        raise ContractFailure("Docker socket must be an absolute daemon-host path without commas or newlines")
     if args.rotation_wait_seconds < 61 or args.rotation_wait_seconds > 90:
         raise ContractFailure("rotation wait must be between 61 and 90 seconds")
     if args.expiry_wait_seconds < 61 or args.expiry_wait_seconds > 90:
@@ -783,7 +807,7 @@ def main() -> int:
             "--label",
             labels[2],
             "--mount",
-            "type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock",
+            "type=bind,src=" + args.docker_socket + ",dst=/var/run/docker.sock",
             "-e",
             "FLOCI_BASE_URL=http://" + floci + ":4566",
             "-e",
@@ -828,7 +852,7 @@ def main() -> int:
         )
         docker_run("start", floci)
         wait_for_health(floci)
-        assert_floci_runtime(floci, network)
+        daemon_identity = assert_floci_runtime(floci, network)
         floci_inspect = exact_container_inspect(floci)
         actual_image = (floci_inspect.get("ImageManifestDescriptor") or {}).get("digest") or floci_inspect.get("Image")
         if actual_image != floci_image["Id"]:
@@ -1031,6 +1055,7 @@ def main() -> int:
             "expiry_denial": expired_replay,
             "image_platform": args.platform,
             "image_manifest": floci_image["Id"],
+            "docker_daemon_identity": daemon_identity,
             "isolation": "unknown path denied; cross-task bearer replay intentionally out of scope",
             "cleanup": "Floci state and exact Docker resources removed",
         }

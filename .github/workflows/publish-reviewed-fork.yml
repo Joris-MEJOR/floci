@@ -98,10 +98,13 @@ jobs:
         run: |
           set -euo pipefail
           docker load -i "$RUNNER_TEMP/floci-reviewed.tar"
+          socket=$(docker context inspect "$(docker context show)" --format '{{.Endpoints.docker.Host}}')
+          [[ "$socket" == unix:///* ]]
+          socket=${socket#unix://}
           bash tools/fork-image-smoke.sh "$IMAGE:$TAG" amd64 | tee evidence/smoke-amd64.txt
           bash tools/fork-image-smoke.sh "$IMAGE:$TAG" arm64 | tee evidence/smoke-arm64.txt
-          bash tools/fork-ecs-smoke.sh "$IMAGE:$TAG" --platform amd64 | tee evidence/ecs-runtime-amd64.txt
-          bash tools/fork-ecs-smoke.sh "$IMAGE:$TAG" --platform arm64 | tee evidence/ecs-runtime-arm64.txt
+          bash tools/fork-ecs-smoke.sh "$IMAGE:$TAG" --platform amd64 --docker-socket "$socket" | tee evidence/ecs-runtime-amd64.txt
+          bash tools/fork-ecs-smoke.sh "$IMAGE:$TAG" --platform arm64 --docker-socket "$socket" | tee evidence/ecs-runtime-arm64.txt
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
         with:
           registry: ghcr.io
