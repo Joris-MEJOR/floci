@@ -112,7 +112,7 @@ def metadata_status(path: str) -> int:
         return error.code
 
 
-def run_probe(check_unknown: bool) -> dict[str, Any]:
+def run_probe(check_unknown: bool, idle_seconds: int = 0) -> dict[str, Any]:
     relative_uri = os.environ.get("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "")
     endpoint = os.environ.get("AWS_ENDPOINT_URL", "")
     validate_runtime_environment(endpoint, relative_uri)
@@ -157,6 +157,21 @@ def run_probe(check_unknown: bool) -> dict[str, Any]:
     else:
         fail("S3 list_buckets unexpectedly succeeded for the deny-only task role")
 
+    initial_key_fingerprint = fingerprint(credentials.access_key)
+    if idle_seconds:
+        # Keep the actual SDK clients and their credential cache alive across a full lease TTL.
+        # Do not construct a replacement session/client or inject replacement credentials.
+        time.sleep(idle_seconds)
+        resumed_identity = sts.get_caller_identity()
+        if resumed_identity.get("Account") != account or resumed_identity.get("Arn") != arn:
+            fail("cached STS client changed task identity after idle")
+        response = s3.get_object(Bucket=os.environ["FORK_ALLOWED_BUCKET"], Key=os.environ["FORK_ALLOWED_KEY"])
+        with response["Body"] as body:
+            if body.read() != b"fork-ecs-runtime-contract":
+                fail("cached S3 client could not read the allowed object after idle")
+        if fingerprint(credentials.access_key) == initial_key_fingerprint:
+            fail("cached SDK client retained its expired key after idle")
+
     result: dict[str, Any] = {
         "credential_provider": credentials.method,
         "access_key_fingerprint": fingerprint(credentials.access_key),
@@ -170,6 +185,10 @@ def run_probe(check_unknown: bool) -> dict[str, Any]:
     expiry = getattr(credentials, "_expiry_time", None)
     if expiry is not None:
         result["credential_expiry"] = expiry.isoformat()
+    if idle_seconds:
+        result["cached_client_continuity"] = True
+        result["cached_client_idle_seconds"] = idle_seconds
+        result["cached_client_initial_key_fingerprint"] = initial_key_fingerprint
     if check_unknown:
         unknown_token = "Z" * 48
         status = metadata_status(f"/v2/credentials/{unknown_token}")
@@ -182,6 +201,8 @@ def run_probe(check_unknown: bool) -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--idle-seconds", type=int, choices=(0, 125), default=0,
+                        help="reuse the same SDK clients after the contract's 120-second TTL")
     parser.add_argument(
         "--once",
         action="store_true",
@@ -193,7 +214,7 @@ def main() -> int:
         help="also assert an unknown metadata token is denied",
     )
     args = parser.parse_args()
-    result = run_probe(args.unknown)
+    result = run_probe(args.unknown, args.idle_seconds)
     print(json.dumps(result, sort_keys=True), flush=True)
     if not args.once:
         hold_seconds = int(os.environ.get("FORK_PROBE_HOLD_SECONDS", "90"))

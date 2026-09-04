@@ -149,7 +149,7 @@ def setup(payload: dict[str, Any]) -> dict[str, Any]:
                     {"name": "FORK_EXPECTED_ROLE_ARN", "value": role["Role"]["Arn"]},
                     {"name": "FORK_ALLOWED_BUCKET", "value": bucket},
                     {"name": "FORK_ALLOWED_KEY", "value": object_key},
-                    {"name": "FORK_PROBE_HOLD_SECONDS", "value": "300"},
+                    {"name": "FORK_PROBE_HOLD_SECONDS", "value": "900"},
                     {
                         "name": "NO_PROXY",
                         "value": "169.254.170.2," + payload["floci_name"] + ",127.0.0.1,localhost",
@@ -334,7 +334,7 @@ def cleanup(payload: dict[str, Any]) -> dict[str, Any]:
             }:
                 errors.append(label + ":" + code)
 
-    for label in ("initial", "rotated", "task1", "task2"):
+    for label in ("initial", "rotated", "task1", "task2", "resumed"):
         capture_path = CAPTURE_ROOT / ("fork-ecs-capture-" + label + ".json")
         try:
             capture_path.unlink()
@@ -616,8 +616,11 @@ def wait_for_task_containers(
     raise ContractFailure("not all ECS task containers appeared")
 
 
-def wait_for_probe_json(container: str, unknown: bool = False, timeout: float = 35.0) -> dict[str, Any]:
+def wait_for_probe_json(container: str, unknown: bool = False, timeout: float = 35.0,
+                        idle_seconds: int = 0) -> dict[str, Any]:
     command = ["python3", "/opt/fork-ecs-probe.py", "--once"]
+    if idle_seconds:
+        command.extend(["--idle-seconds", str(idle_seconds)])
     if unknown:
         command.append("--unknown")
     deadline = time.monotonic() + timeout
@@ -631,12 +634,15 @@ def wait_for_probe_json(container: str, unknown: bool = False, timeout: float = 
                     continue
                 if isinstance(value, dict):
                     return value
+        if idle_seconds:
+            break  # A cached-client failure must not be hidden by a fresh-client retry.
         time.sleep(1)
     detail = redact((stderr or "").strip())
     raise ContractFailure(f"probe did not pass in container {container}: {detail or 'no JSON result'}")
 
 
 def control(floci: str, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
+    started = time.monotonic()
     completed = subprocess.run(
         ["docker", "exec", "-i", floci, "python3", "/tmp/fork-ecs-control.py", operation],
         input=json.dumps(payload, separators=(",", ":")),
@@ -654,6 +660,16 @@ def control(floci: str, operation: str, payload: dict[str, Any]) -> dict[str, An
         except json.JSONDecodeError:
             continue
         if isinstance(value, dict):
+            # Failure-safe diagnostics: never serialize the request or raw credentials.
+            diagnostic = {key: value[key] for key in (
+                "status", "expiration", "captured", "denied", "allowed",
+                "access_key_fingerprint", "path_fingerprint",
+            ) if key in value}
+            print(json.dumps({"event": "control", "operation": operation,
+                              "label": payload.get("label"),
+                              "wall_time": time.time(), "monotonic": time.monotonic(),
+                              "elapsed_seconds": time.monotonic() - started,
+                              "result": diagnostic}, sort_keys=True), file=sys.stderr, flush=True)
             return value
     raise ContractFailure(f"control operation {operation!r} returned no JSON")
 
@@ -737,6 +753,8 @@ def cleanup(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--diagnostic-idle-seconds", type=int, default=0,
+                        help="bounded extra idle time before A renewal; diagnostic only")
     parser.add_argument("image", help="local or digest-qualified Floci image under test")
     parser.add_argument("--probe-image", required=True, help="local probe image built from Dockerfile.fork-probe")
     parser.add_argument("--network", help="unique test network name (default: generated)")
@@ -757,6 +775,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if not 0 <= args.diagnostic_idle_seconds <= 90:
+        raise ContractFailure("diagnostic idle must be between 0 and 90 seconds")
     if not args.docker_socket.startswith("/") or any(c in args.docker_socket for c in ",\n\r"):
         raise ContractFailure("Docker socket must be an absolute daemon-host path without commas or newlines")
     if args.rotation_wait_seconds < 61 or args.rotation_wait_seconds > 90:
@@ -964,6 +984,7 @@ def main() -> int:
         # Task A proves enumeration denial with a fabricated path.  It never possesses task B's
         # path, so the known local bearer-replay capability is intentionally not tested as ACL
         # isolation.  The probe only records HTTP 404 and fingerprints.
+        time.sleep(args.diagnostic_idle_seconds)
         unknown_result = wait_for_probe_json(task_containers[ordered_task_ids[0]]["Id"], unknown=True)
         if unknown_result.get("unknown_metadata_status") != 404 or unknown_result.get("unknown_metadata_denied") is not True:
             raise ContractFailure("task A could enumerate an unknown metadata path")
@@ -1011,16 +1032,41 @@ def main() -> int:
         if live_b_replay.get("denied") is not False or live_b_replay.get("allowed") is not True:
             raise ContractFailure("revoking Task A denied a still-live Task B credential")
 
-        # Task C has not refreshed since startup, so waiting beyond its original TTL gives a
-        # deterministic expired-key check.  Task B was deliberately refreshed above; no
-        # cross-task freshness assumption is made after this wait.
+        # Task C stays idle past its credential TTL, but its task authorization must survive.
+        # Reject the captured expired key before any SDK request can renew the credential.
+        idle_task = task_containers[ordered_task_ids[2]]
+        idle_started_at = exact_container_inspect(idle_task["Id"]).get("State", {}).get("StartedAt")
         time.sleep(args.expiry_wait_seconds)
-        expired = control(floci, "metadata", {"path": path_by_task[ordered_task_ids[2]]})
-        if expired.get("status") != 404:
-            raise ContractFailure("expired task credentials still served metadata")
         expired_replay = control(floci, "replay", {"label": "task2", **object_ref})
         if expired_replay.get("denied") is not True:
             raise ContractFailure("expired task credentials were still accepted")
+        idle_state = exact_container_inspect(idle_task["Id"]).get("State", {})
+        if idle_state.get("Running") is not True:
+            raise ContractFailure("idle task stopped before credential continuity check")
+        if not idle_started_at or idle_state.get("StartedAt") != idle_started_at:
+            raise ContractFailure("idle task restarted during credential continuity check")
+        resumed_probe = wait_for_probe_json(idle_task["Id"])
+        if resumed_probe.get("credential_provider") != "container-role":
+            raise ContractFailure("idle task left the default credential provider")
+        if resumed_probe.get("credential_path_fingerprint") != task2_capture.get("path_fingerprint"):
+            raise ContractFailure("idle task credential URI changed")
+        if resumed_probe.get("access_key_fingerprint") == task2_capture.get("access_key_fingerprint"):
+            raise ContractFailure("idle task reused its expired credential")
+        resumed_capture = control(floci, "capture", {"path": path_by_task[ordered_task_ids[2]], "label": "resumed"})
+        if resumed_capture.get("access_key_fingerprint") != resumed_probe.get("access_key_fingerprint"):
+            raise ContractFailure("idle task and controller disagreed on renewed credentials")
+
+        cached_probe = wait_for_probe_json(idle_task["Id"], timeout=160, idle_seconds=125)
+        if cached_probe.get("cached_client_continuity") is not True:
+            raise ContractFailure("long-lived SDK client did not prove credential continuity")
+        if cached_probe.get("credential_path_fingerprint") != task2_capture.get("path_fingerprint"):
+            raise ContractFailure("cached SDK client credential URI changed")
+        cached_state = exact_container_inspect(idle_task["Id"]).get("State", {})
+        if cached_state.get("Running") is not True or cached_state.get("StartedAt") != idle_started_at:
+            raise ContractFailure("cached SDK task stopped or restarted during idle")
+        resumed_capture = control(floci, "capture", {"path": path_by_task[ordered_task_ids[2]], "label": "resumed"})
+        if resumed_capture.get("access_key_fingerprint") != cached_probe.get("access_key_fingerprint"):
+            raise ContractFailure("cached SDK and controller disagreed on renewed credentials")
 
         control(
             floci,
@@ -1033,7 +1079,7 @@ def main() -> int:
         for task_id, label in (
             (ordered_task_ids[0], "rotated"),
             (ordered_task_ids[1], "task1"),
-            (ordered_task_ids[2], "task2"),
+            (ordered_task_ids[2], "resumed"),
         ):
             stopped_metadata = control(floci, "metadata", {"path": path_by_task[task_id]})
             if stopped_metadata.get("status") != 404:
@@ -1055,6 +1101,8 @@ def main() -> int:
             "revocation_denial": stopped_a_replay,
             "unaffected_live_task": live_b_replay,
             "expiry_denial": expired_replay,
+            "idle_task_continuity": resumed_probe,
+            "cached_client_continuity": cached_probe,
             "image_platform": args.platform,
             "image_manifest": floci_image["Id"],
             "docker_daemon_identity": daemon_identity,
@@ -1064,6 +1112,18 @@ def main() -> int:
     except Exception as error:
         primary_error = error
     finally:
+        # Inspect only allowlisted state, before cleanup destroys failure evidence.
+        for task_id, task in task_containers.items():
+            try:
+                state = exact_container_inspect(task["Id"]).get("State", {})
+                print(json.dumps({"event": "task_final_state", "task_id": task_id,
+                                  "wall_time": time.time(), "monotonic": time.monotonic(),
+                                  "state": {key: state.get(key) for key in (
+                                      "Status", "Running", "ExitCode", "OOMKilled", "StartedAt", "FinishedAt"
+                                  )}}, sort_keys=True), file=sys.stderr, flush=True)
+            except Exception:
+                print(json.dumps({"event": "task_final_state_unavailable", "task_id": task_id}),
+                      file=sys.stderr, flush=True)
         cleanup_errors = cleanup(floci, network, task_containers, task_ids, floci_created, network_created)
         if cleanup_errors:
             if primary_error is None:

@@ -56,10 +56,18 @@ the contract verifies that the mounted socket and controller report the same Doc
 The test uses a clean digest-pinned probe image, three real task containers, the default boto3
 container-role provider, an allowed object read and an explicit list-buckets denial. It asserts
 stable-path rotation, old-key denial, task-scoped revocation while another task remains allowed,
-expiry, and exact Docker cleanup. TTL 120 seconds and refresh window 60 seconds leave room for
-emulated-platform startup; allow about three minutes per platform. Output contains observed role
+expired-key denial, default-SDK recovery after a running task is idle past its credential TTL,
+and reuse of the same STS/S3 client instances across another 125-second idle interval. It also
+checks revocation of the latest renewed credential on task stop and exact Docker cleanup. TTL is
+120 seconds and the refresh window is 60 seconds; allow about five minutes per platform. The task
+fixture holds for 900 seconds to cover emulated startup and both idle intervals, not to extend
+credential validity. A cached-client failure is not retried with a new client. Output contains observed role
 identities, one-way credential fingerprints, image manifest identity, and authentication error
 codes, never credential values or bearer paths. The runner emits success only after cleanup.
+Redacted control timing and final container state are emitted to stderr even on failure. Preserve
+stderr separately from the success JSON when collecting CI artifacts. The optional
+`--diagnostic-idle-seconds 61` adds a bounded idle interval before task A renewal without skipping
+any assertion, and reproduces the old idle-task failure on the previously published image.
 The three-container `RunTask` control call permits a 60-second read timeout for emulated cold
 starts, with exactly one attempt. Credential assertions, TTL, and all other API deadlines remain
 unchanged; a timeout is still a failed contract, never a successful or retried task launch.

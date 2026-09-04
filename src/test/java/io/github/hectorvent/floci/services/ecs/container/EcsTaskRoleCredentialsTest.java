@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.ecs.container;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
@@ -8,11 +9,15 @@ import io.github.hectorvent.floci.services.iam.model.SessionCreds;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Clock;
 import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -25,9 +30,12 @@ import static org.mockito.Mockito.when;
 
 class EcsTaskRoleCredentialsTest {
 
+    private static final Instant TEST_NOW = Instant.parse("2030-01-01T00:00:00Z");
+
     private IamService iamService;
     private EmulatorConfig config;
     private EcsTaskRoleCredentials credentials;
+    private MutableClock clock;
 
     @BeforeEach
     void setUp() {
@@ -39,7 +47,9 @@ class EcsTaskRoleCredentialsTest {
         when(iamService.findRole(anyString(), anyString())).thenReturn(Optional.of(
                 new IamRole("AROAEXAMPLE", "task-role", "/", "arn:aws:iam::111122223333:role/task-role",
                         ecsTasksTrustPolicy())));
-        credentials = new EcsTaskRoleCredentials(iamService, config);
+        clock = new MutableClock(TEST_NOW);
+        credentials = new EcsTaskRoleCredentials(iamService, config,
+                new EcsTaskRoleTrustPolicy(new ObjectMapper()), clock);
     }
 
     private static String ecsTasksTrustPolicy() {
@@ -85,6 +95,104 @@ class EcsTaskRoleCredentialsTest {
         assertEquals(taskArn, refreshed.taskArn());
         assertNotEquals(first.credentials().accessKeyId(), refreshed.credentials().accessKeyId());
         verify(iamService).revokeEcsTaskRoleSession(taskArn, first.credentials().accessKeyId());
+    }
+
+    @Test
+    void refreshTaskIfNeededLeavesHealthyLeaseUntouchedOutsideWindow() {
+        String taskArn = "arn:aws:ecs:us-east-1:111122223333:task/default/task-refresh-early";
+        String roleArn = "arn:aws:iam::111122223333:role/task-role";
+        when(config.services().ecs().taskRoleCredentialsTtlSeconds()).thenReturn(120);
+        when(config.services().ecs().taskRoleCredentialsRefreshWindowSeconds()).thenReturn(30);
+        EcsTaskRoleCredentials.IssuedCredentials first = credentials.issue(taskArn, roleArn, "us-east-1")
+                .orElseThrow();
+        when(iamService.resolveEcsTaskRoleSessionByPath(first.relativeUri()))
+                .thenReturn(Optional.of(mock(SessionCredential.class)));
+
+        clock.advanceSeconds(60);
+        EcsTaskRoleCredentials.IssuedCredentials current = credentials.refreshTaskIfNeeded(taskArn)
+                .orElseThrow();
+
+        assertSame(first, current);
+        verify(iamService, never()).revokeEcsTaskRoleSession(anyString(), anyString());
+    }
+
+    @Test
+    void refreshTaskIfNeededRotatesDueLeaseBeforeExpiry() {
+        String taskArn = "arn:aws:ecs:us-east-1:111122223333:task/default/task-refresh-due";
+        String roleArn = "arn:aws:iam::111122223333:role/task-role";
+        when(config.services().ecs().taskRoleCredentialsTtlSeconds()).thenReturn(120);
+        when(config.services().ecs().taskRoleCredentialsRefreshWindowSeconds()).thenReturn(30);
+        EcsTaskRoleCredentials.IssuedCredentials first = credentials.issue(taskArn, roleArn, "us-east-1")
+                .orElseThrow();
+        when(iamService.resolveEcsTaskRoleSessionByPath(first.relativeUri()))
+                .thenReturn(Optional.of(mock(SessionCredential.class)), Optional.empty());
+
+        clock.advanceSeconds(91);
+        EcsTaskRoleCredentials.IssuedCredentials refreshed = credentials.refreshTaskIfNeeded(taskArn)
+                .orElseThrow();
+
+        assertEquals(first.relativeUri(), refreshed.relativeUri());
+        assertNotEquals(first.credentials().accessKeyId(), refreshed.credentials().accessKeyId());
+        assertEquals(TEST_NOW.plusSeconds(211), refreshed.expiration());
+        verify(iamService).revokeEcsTaskRoleSession(taskArn, first.credentials().accessKeyId());
+    }
+
+    @Test
+    void refreshTaskIfNeededRevokesAtExactExpiryInsteadOfRevivingLease() {
+        String taskArn = "arn:aws:ecs:us-east-1:111122223333:task/default/task-refresh-expired";
+        String roleArn = "arn:aws:iam::111122223333:role/task-role";
+        when(config.services().ecs().taskRoleCredentialsTtlSeconds()).thenReturn(120);
+        when(config.services().ecs().taskRoleCredentialsRefreshWindowSeconds()).thenReturn(30);
+        EcsTaskRoleCredentials.IssuedCredentials first = credentials.issue(taskArn, roleArn, "us-east-1")
+                .orElseThrow();
+
+        clock.advanceSeconds(120);
+        assertTrue(credentials.refreshTaskIfNeeded(taskArn).isEmpty());
+        assertTrue(credentials.current(first.relativeUri()).isEmpty());
+        verify(iamService).revokeEcsTaskRoleSession(taskArn, first.credentials().accessKeyId());
+    }
+
+    @Test
+    void refreshTaskIfNeededFailsClosedWhenIamRevokedOutsideWindow() {
+        String taskArn = "arn:aws:ecs:us-east-1:111122223333:task/default/task-refresh-revoked";
+        String roleArn = "arn:aws:iam::111122223333:role/task-role";
+        when(config.services().ecs().taskRoleCredentialsTtlSeconds()).thenReturn(120);
+        when(config.services().ecs().taskRoleCredentialsRefreshWindowSeconds()).thenReturn(30);
+        EcsTaskRoleCredentials.IssuedCredentials first = credentials.issue(taskArn, roleArn, "us-east-1")
+                .orElseThrow();
+        when(iamService.resolveEcsTaskRoleSessionByPath(first.relativeUri())).thenReturn(Optional.empty());
+
+        clock.advanceSeconds(10);
+        assertTrue(credentials.refreshTaskIfNeeded(taskArn).isEmpty());
+        assertTrue(credentials.current(first.relativeUri()).isEmpty());
+        verify(iamService).revokeEcsTaskRoleSession(taskArn, first.credentials().accessKeyId());
+    }
+
+    @Test
+    void revokeTaskWinsWhetherItPrecedesOrFollowsRefresh() {
+        String roleArn = "arn:aws:iam::111122223333:role/task-role";
+        String beforeTask = "arn:aws:ecs:us-east-1:111122223333:task/default/task-stop-before";
+        EcsTaskRoleCredentials.IssuedCredentials before = credentials.issue(beforeTask, roleArn, "us-east-1")
+                .orElseThrow();
+        credentials.revokeTask(beforeTask);
+        assertTrue(credentials.refreshTaskIfNeeded(beforeTask).isEmpty());
+        assertTrue(credentials.current(before.relativeUri()).isEmpty());
+
+        String afterTask = "arn:aws:ecs:us-east-1:111122223333:task/default/task-stop-after";
+        when(config.services().ecs().taskRoleCredentialsTtlSeconds()).thenReturn(120);
+        when(config.services().ecs().taskRoleCredentialsRefreshWindowSeconds()).thenReturn(30);
+        EcsTaskRoleCredentials.IssuedCredentials after = credentials.issue(afterTask, roleArn, "us-east-1")
+                .orElseThrow();
+        when(iamService.resolveEcsTaskRoleSessionByPath(after.relativeUri()))
+                .thenReturn(Optional.of(mock(SessionCredential.class)), Optional.empty());
+        clock.advanceSeconds(91);
+        EcsTaskRoleCredentials.IssuedCredentials rotated = credentials.refreshTaskIfNeeded(afterTask)
+                .orElseThrow();
+        credentials.revokeTask(afterTask);
+
+        assertTrue(credentials.current(rotated.relativeUri()).isEmpty());
+        verify(iamService).revokeEcsTaskRoleSession(afterTask, after.credentials().accessKeyId());
+        verify(iamService).revokeEcsTaskRoleSession(afterTask, rotated.credentials().accessKeyId());
     }
 
     @Test
@@ -254,6 +362,33 @@ class EcsTaskRoleCredentialsTest {
         verify(iamService, never()).registerEcsTaskRoleSession(
                 anyString(), anyString(), anyString(), anyString(), anyString(), anyString(),
                 any(Instant.class), anyString());
+    }
+
+    private static final class MutableClock extends Clock {
+        private Instant now;
+
+        private MutableClock(Instant now) {
+            this.now = now;
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            return this;
+        }
+
+        @Override
+        public Instant instant() {
+            return now;
+        }
+
+        private void advanceSeconds(long seconds) {
+            now = now.plusSeconds(seconds);
+        }
     }
 
     private static String ecsTrustPolicyFor(String servicePrincipal) {

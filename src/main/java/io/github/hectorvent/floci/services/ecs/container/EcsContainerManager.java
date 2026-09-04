@@ -444,6 +444,40 @@ public class EcsContainerManager {
         }
     }
 
+    /**
+     * Returns a trustworthy running-state result for lease renewal. Unlike
+     * {@link #getExitCodeIfStopped(String)}, this method never conflates an inspection failure
+     * with a running container, so callers can fail closed before renewing credentials.
+     */
+    public ContainerRunningState getContainerRunningState(String dockerId) {
+        if (dockerId == null || dockerId.isBlank()) {
+            return ContainerRunningState.UNKNOWN;
+        }
+        try {
+            var inspect = lifecycleManager.getDockerClient().inspectContainerCmd(dockerId).exec();
+            if (inspect == null || inspect.getState() == null || inspect.getState().getRunning() == null) {
+                return ContainerRunningState.UNKNOWN;
+            }
+            return Boolean.TRUE.equals(inspect.getState().getRunning())
+                    ? ContainerRunningState.RUNNING : ContainerRunningState.STOPPED;
+        } catch (NotFoundException removed) {
+            // An externally removed container is known not to be live and is safe to treat as
+            // stopped for the reconciler's no-renewal decision.
+            return ContainerRunningState.STOPPED;
+        } catch (Exception e) {
+            LOG.debugv("Could not determine running state for container {0}: {1}",
+                    dockerId, e.getMessage());
+            return ContainerRunningState.UNKNOWN;
+        }
+    }
+
+    /** Explicit tri-state result used to gate task-role credential renewal. */
+    public enum ContainerRunningState {
+        RUNNING,
+        STOPPED,
+        UNKNOWN
+    }
+
     private Optional<EcsTaskRoleCredentials.IssuedCredentials> issueTaskCredentials(EcsTask task,
                                                                                        TaskDefinition taskDef,
                                                                                        String region) {

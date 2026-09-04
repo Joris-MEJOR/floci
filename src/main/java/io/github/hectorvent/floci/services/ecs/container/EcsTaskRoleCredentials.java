@@ -10,12 +10,14 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
 import java.security.SecureRandom;
+import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 
@@ -35,6 +37,7 @@ public class EcsTaskRoleCredentials {
     private final IamService iamService;
     private final EmulatorConfig config;
     private final EcsTaskRoleTrustPolicy trustPolicy;
+    private final Clock clock;
 
     /** Guards all lease/index/IP transitions so refresh and revocation are atomic. */
     private final Object lock = new Object();
@@ -47,9 +50,16 @@ public class EcsTaskRoleCredentials {
     @Inject
     public EcsTaskRoleCredentials(IamService iamService, EmulatorConfig config,
                                   EcsTaskRoleTrustPolicy trustPolicy) {
+        this(iamService, config, trustPolicy, Clock.systemUTC());
+    }
+
+    /** Constructor with an injectable clock for deterministic lease-boundary tests. */
+    EcsTaskRoleCredentials(IamService iamService, EmulatorConfig config,
+                           EcsTaskRoleTrustPolicy trustPolicy, Clock clock) {
         this.iamService = iamService;
         this.config = config;
         this.trustPolicy = trustPolicy;
+        this.clock = Objects.requireNonNull(clock, "clock");
     }
 
     /** Convenience constructor retained for focused unit tests and embedders. */
@@ -97,7 +107,7 @@ public class EcsTaskRoleCredentials {
                 revokeLeaseLocked(lease);
                 return Optional.empty();
             }
-            Instant now = Instant.now();
+            Instant now = clock.instant();
             Optional<SessionCredential> active = iamService.resolveEcsTaskRoleSessionByPath(relativeUri);
             if (active.isEmpty() || !lease.expiration().isAfter(now)) {
                 revokeLeaseLocked(lease);
@@ -124,7 +134,7 @@ public class EcsTaskRoleCredentials {
                 }
                 return Optional.empty();
             }
-            if (lease == null || !lease.expiration().isAfter(Instant.now())
+            if (lease == null || !lease.expiration().isAfter(clock.instant())
                     || iamService.resolveEcsTaskRoleSessionByPath(relativeUri).isEmpty()) {
                 if (lease != null) {
                     revokeLeaseLocked(lease);
@@ -132,6 +142,46 @@ public class EcsTaskRoleCredentials {
                 return Optional.empty();
             }
             return refreshLocked(relativeUri, lease);
+        }
+    }
+
+    /**
+     * Rotates a task lease before expiration when the owner has confirmed the task is still
+     * running. Expired leases are revoked rather than revived; explicit IAM revocation is checked
+     * even when the lease is outside the refresh window.
+     */
+    public Optional<IssuedCredentials> refreshTaskIfNeeded(String taskArn) {
+        if (taskArn == null || taskArn.isBlank()) {
+            return Optional.empty();
+        }
+        synchronized (lock) {
+            IssuedCredentials lease = byTask.get(taskArn);
+            if (lease == null) {
+                return Optional.empty();
+            }
+            if (!validCredentialTiming()) {
+                revokeLeaseLocked(lease);
+                return Optional.empty();
+            }
+
+            Instant now = clock.instant();
+            if (!lease.expiration().isAfter(now)) {
+                revokeLeaseLocked(lease);
+                return Optional.empty();
+            }
+
+            // Resolve on every owner tick so an explicit IAM revoke cannot be masked by the
+            // in-memory lease while the task is outside the refresh window.
+            if (iamService.resolveEcsTaskRoleSessionByPath(lease.relativeUri()).isEmpty()) {
+                revokeLeaseLocked(lease);
+                return Optional.empty();
+            }
+
+            long refreshWindow = config.services().ecs().taskRoleCredentialsRefreshWindowSeconds();
+            if (lease.expiration().isAfter(now.plusSeconds(refreshWindow))) {
+                return Optional.of(lease);
+            }
+            return refreshLocked(lease.relativeUri(), lease);
         }
     }
 
@@ -260,7 +310,7 @@ public class EcsTaskRoleCredentials {
         if (session == null) {
             return Optional.empty();
         }
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         int ttl = config.services().ecs().taskRoleCredentialsTtlSeconds();
         Instant expiration = now.plusSeconds(ttl);
         iamService.registerEcsTaskRoleSession(taskArn, accountId,

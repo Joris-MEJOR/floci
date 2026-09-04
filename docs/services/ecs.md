@@ -53,14 +53,22 @@ credential source injected by Floci. Task images and application code must not c
 credential files, credential environment defaults, or explicit SDK credentials, which can take
 precedence over any injected provider. The endpoint returns AWS-shaped temporary credentials and
 refreshes them inside `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_REFRESH_WINDOW_SECONDS`, retaining
-the same relative URI while rotating the access key and token. Sessions expire after
-`FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_TTL_SECONDS` and are revoked when the task stops or Floci
-restarts. The task role must already exist in the task's account and its trust policy must contain
+the same relative URI while rotating the access key and token. Individual credentials expire after
+`FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_TTL_SECONDS`: expired keys are never accepted. Idle tasks
+do not depend on SDK traffic for renewal: Floci proactively renews credentials for confirmed
+running tasks, preserving the relative URI. Task stop or Floci restart revokes the endpoint as
+well as its credentials. The task role must already exist in the task's account and its trust policy must contain
 an unconditional `Allow` for the exact `ecs-tasks.amazonaws.com` service principal and
 `sts:AssumeRole`; an unknown role, a role trusted only by another service, an explicit matching
 `Deny`, or a conditioned statement fails the launch. The refresh window must be non-negative and
 strictly shorter than the TTL; invalid values fail closed rather than rotating on every metadata
 request.
+
+Running-task reconciliation renews credentials before expiry only after Docker confirms a live
+task container. An unknown or failed Docker inspection is not proof of liveness. If renewal is
+missed until after the credential TTL, the endpoint fails closed rather than reviving an expired
+lease from a metadata request. Keep the refresh window comfortably longer than the five-second
+reconciliation interval and expected Docker inspection latency.
 
 The listener binds to `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_PORT` (default `80`) and does not
 publish a host port. It is reachable only through the task container's private Docker network and

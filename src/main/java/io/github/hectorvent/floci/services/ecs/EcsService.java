@@ -1642,14 +1642,37 @@ public class EcsService implements ContainerTeardown, ResourceProvider {
             return;
         }
 
-        // Inspect every container; abort if any are still running.
+        // Inspect every container before renewing a task-role lease. A null exit code alone is
+        // ambiguous (the legacy helper also uses it for inspection failures), so only the explicit
+        // tri-state result may authorize a renewal. Unknown state fails closed and leaves the
+        // handle for the next reconciliation tick.
         Map<String, Integer> exitCodes = new LinkedHashMap<>();
+        boolean liveContainer = false;
         for (Map.Entry<String, String> entry : handle.getContainerIds().entrySet()) {
+            EcsContainerManager.ContainerRunningState runningState =
+                    containerManager.getContainerRunningState(entry.getValue());
+            if (runningState == EcsContainerManager.ContainerRunningState.UNKNOWN) {
+                return;
+            }
+            if (runningState == EcsContainerManager.ContainerRunningState.RUNNING) {
+                liveContainer = true;
+                continue;
+            }
             Integer code = containerManager.getExitCodeIfStopped(entry.getValue());
             if (code == null) {
                 return;
             }
             exitCodes.put(entry.getKey(), code);
+        }
+
+        if (liveContainer) {
+            // EcsTaskRoleCredentials serializes this owner tick with explicit StopTask/reconcile
+            // revocation. If stop wins, the task lease is gone; if refresh wins, stop revokes the
+            // newly-issued lease before Docker teardown proceeds.
+            if (taskRoleCredentials != null) {
+                taskRoleCredentials.refreshTaskIfNeeded(taskArn);
+            }
+            return;
         }
 
         // All containers have exited. Atomically claim the handle to avoid
