@@ -99,6 +99,15 @@ local emulator does not provide an AWS-equivalent hostile-container or multi-ten
 boundary. Missing, incorrect, expired, and revoked ECS session tokens fail authentication on the
 direct RDS, ElastiCache, S3, and execute-api paths, independently of the global IAM filter.
 
+With IAM enforcement enabled, `DescribeServices` and `UpdateService` authorize the exact ECS
+service ARN. Short service names use the requested cluster, or `default` when omitted; full ARNs
+retain their identity. Every member of a `DescribeServices` request must be authorized. Invalid
+identifiers and mismatched cluster/service references are rejected rather than checked against a
+wildcard resource. IAM follows the JSON target operation even when a conflicting query action is
+present. Whitespace-padded identifiers are rejected, and ARN references cannot alias literal
+ARN-named resources. Service lookup does not fall back to another cluster or region. This does not
+claim resource-level IAM support for all other ECS operations.
+
 ### Tasks
 
 | Operation | Description |

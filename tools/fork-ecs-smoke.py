@@ -83,6 +83,8 @@ def clients(*, read_timeout: int = 8):
 def setup(payload: dict[str, Any]) -> dict[str, Any]:
     role_name = payload["role_name"]
     cluster_name = payload["cluster_name"]
+    service_names = payload["service_names"]
+    foreign_cluster_name = payload["foreign_cluster_name"]
     family = payload["family"]
     probe_image = payload["probe_image"]
     endpoint_allowlist = payload["endpoint_allowlist"]
@@ -120,14 +122,9 @@ def setup(payload: dict[str, Any]) -> dict[str, Any]:
                 "Effect": "Deny",
                 "Action": "s3:ListAllMyBuckets",
                 "Resource": "*",
-            }
+            },
         ],
     }
-    iam.put_role_policy(
-        RoleName=role_name,
-        PolicyName=policy_name,
-        PolicyDocument=json.dumps(policy, separators=(",", ":")),
-    )
     # Seed one object that the task role is explicitly allowed to read.  The role's
     # ListAllMyBuckets action remains explicitly denied, giving the probe both a positive
     # authorization check and a deliberate denial check without treating a deny-only role as
@@ -135,6 +132,25 @@ def setup(payload: dict[str, Any]) -> dict[str, Any]:
     s3.create_bucket(Bucket=bucket)
     s3.put_object(Bucket=bucket, Key=object_key, Body=b"fork-ecs-runtime-contract")
     cluster = ecs.create_cluster(clusterName=cluster_name)["cluster"]
+    foreign_cluster = ecs.create_cluster(clusterName=foreign_cluster_name)["cluster"]
+
+    def service_arn(cluster_arn: str, service_name: str) -> str:
+        marker = ":cluster/"
+        if marker not in cluster_arn:
+            raise RuntimeError("ECS cluster ARN has an unexpected shape")
+        return cluster_arn.replace(marker, ":service/", 1) + "/" + service_name
+
+    primary_service_arns = {
+        key: service_arn(cluster["clusterArn"], service_names[key])
+        for key in ("allowed_a", "allowed_b", "forbidden")
+    }
+    foreign_service_arn = service_arn(foreign_cluster["clusterArn"], service_names["foreign"])
+    # Deliberately use a valid ECS service ARN with a different account.  The service does not
+    # exist; IAM must reject it by resource scope before the ECS handler can report a missing
+    # service, proving account identity is part of the authorization decision.
+    foreign_account_service_arn = (
+        f"arn:aws:ecs:{REGION}:999999999999:service/{cluster_name}/{service_names['foreign']}"
+    )
     task_definition_args: dict[str, Any] = {
         "family": family,
         "taskRoleArn": role["Role"]["Arn"],
@@ -152,6 +168,17 @@ def setup(payload: dict[str, Any]) -> dict[str, Any]:
                     {"name": "FORK_EXPECTED_ROLE_ARN", "value": role["Role"]["Arn"]},
                     {"name": "FORK_ALLOWED_BUCKET", "value": bucket},
                     {"name": "FORK_ALLOWED_KEY", "value": object_key},
+                    {"name": "FORK_ALLOWED_ECS_CLUSTER_ARN", "value": cluster["clusterArn"]},
+                    {"name": "FORK_ALLOWED_ECS_CLUSTER_NAME", "value": cluster_name},
+                    {"name": "FORK_ALLOWED_ECS_SERVICE_A_ARN", "value": primary_service_arns["allowed_a"]},
+                    {"name": "FORK_ALLOWED_ECS_SERVICE_B_ARN", "value": primary_service_arns["allowed_b"]},
+                    {"name": "FORK_FORBIDDEN_ECS_SERVICE_ARN", "value": primary_service_arns["forbidden"]},
+                    {"name": "FORK_FOREIGN_ECS_CLUSTER_ARN", "value": foreign_cluster["clusterArn"]},
+                    {"name": "FORK_FOREIGN_ECS_SERVICE_ARN", "value": foreign_service_arn},
+                    {
+                        "name": "FORK_FOREIGN_ACCOUNT_ECS_SERVICE_ARN",
+                        "value": foreign_account_service_arn,
+                    },
                     {"name": "FORK_PROBE_HOLD_SECONDS", "value": "900"},
                     {
                         "name": "NO_PROXY",
@@ -167,6 +194,43 @@ def setup(payload: dict[str, Any]) -> dict[str, Any]:
             "operatingSystemFamily": "LINUX",
         }
     task_definition = ecs.register_task_definition(**task_definition_args)["taskDefinition"]
+
+    def create_service(cluster_arn: str, service_name: str) -> dict[str, Any]:
+        service = ecs.create_service(
+            cluster=cluster_arn,
+            serviceName=service_name,
+            taskDefinition=task_definition["taskDefinitionArn"],
+            desiredCount=0,
+            launchType="FARGATE",
+        )["service"]
+        if service.get("serviceArn") is None or service.get("serviceName") != service_name:
+            raise RuntimeError("ECS service creation returned an unexpected identity")
+        return service
+
+    primary_services = {
+        key: create_service(cluster["clusterArn"], service_names[key])
+        for key in ("allowed_a", "allowed_b", "forbidden")
+    }
+    foreign_service = create_service(foreign_cluster["clusterArn"], service_names["foreign"])
+    if any(primary_services[key].get("serviceArn") != primary_service_arns[key]
+           for key in primary_services):
+        raise RuntimeError("ECS service ARN did not match its cluster-scoped identity")
+    if foreign_service.get("serviceArn") != foreign_service_arn:
+        raise RuntimeError("foreign ECS service ARN did not match its cluster-scoped identity")
+
+    policy["Statement"].append(
+        {
+            "Sid": "AllowScopedEcsServiceControl",
+            "Effect": "Allow",
+            "Action": ["ecs:DescribeServices", "ecs:UpdateService"],
+            "Resource": [primary_service_arns["allowed_a"], primary_service_arns["allowed_b"]],
+        }
+    )
+    iam.put_role_policy(
+        RoleName=role_name,
+        PolicyName=policy_name,
+        PolicyDocument=json.dumps(policy, separators=(",", ":")),
+    )
     return {
         "role_arn": role["Role"]["Arn"],
         "role_name": role_name,
@@ -176,6 +240,14 @@ def setup(payload: dict[str, Any]) -> dict[str, Any]:
         "task_image": task_definition["containerDefinitions"][0]["image"],
         "bucket": bucket,
         "object_key": object_key,
+        "services": {
+            "allowed_a": {"name": service_names["allowed_a"], "arn": primary_service_arns["allowed_a"]},
+            "allowed_b": {"name": service_names["allowed_b"], "arn": primary_service_arns["allowed_b"]},
+            "forbidden": {"name": service_names["forbidden"], "arn": primary_service_arns["forbidden"]},
+            "foreign": {"name": service_names["foreign"], "arn": foreign_service_arn},
+        },
+        "foreign_cluster_arn": foreign_cluster["clusterArn"],
+        "foreign_account_service_arn": foreign_account_service_arn,
         "runtime_platform": task_definition.get("runtimePlatform"),
         "ttl_seconds": 120,
         "refresh_window_seconds": 60,
@@ -427,6 +499,28 @@ def stop_tasks(payload: dict[str, Any]) -> dict[str, Any]:
     return {"stopped": True}
 
 
+def service_state(payload: dict[str, Any]) -> dict[str, Any]:
+    """Read one exact service with control credentials for denied-update readback."""
+
+    _, ecs, _ = clients()
+    response = ecs.describe_services(
+        cluster=payload["cluster_arn"],
+        services=[payload["service_arn"]],
+    )
+    services = response.get("services") or []
+    if len(services) != 1 or response.get("failures"):
+        raise RuntimeError("ECS service readback did not resolve exactly one service")
+    service = services[0]
+    if service.get("serviceArn") != payload["service_arn"]:
+        raise RuntimeError("ECS service readback returned an unexpected ARN")
+    return {
+        "service_arn": service["serviceArn"],
+        "service_name": service.get("serviceName"),
+        "desired_count": service.get("desiredCount"),
+        "status": service.get("status"),
+    }
+
+
 def cleanup(payload: dict[str, Any]) -> dict[str, Any]:
     iam, ecs, s3 = clients()
     errors: list[str] = []
@@ -440,6 +534,7 @@ def cleanup(payload: dict[str, Any]) -> dict[str, Any]:
                 "NoSuchEntity",
                 "ResourceNotFoundException",
                 "ClusterNotFoundException",
+                "ServiceNotFoundException",
                 "NoSuchBucket",
                 "NoSuchKey",
                 "NotFound",
@@ -455,6 +550,22 @@ def cleanup(payload: dict[str, Any]) -> dict[str, Any]:
             pass
     call("delete-object", lambda: s3.delete_object(Bucket=payload["bucket"], Key=payload["object_key"]))
     call("delete-bucket", lambda: s3.delete_bucket(Bucket=payload["bucket"]))
+    # Services must be inactive before their exact clusters can be removed. All services have
+    # desiredCount=0, but force=True keeps teardown deterministic if a failed probe changed one.
+    services = payload.get("services") or {}
+    foreign_cluster_arn = payload.get("foreign_cluster_arn")
+    for key, service in services.items():
+        cluster_arn = foreign_cluster_arn if key == "foreign" else payload["cluster_arn"]
+        if not cluster_arn or not isinstance(service, dict) or not service.get("arn"):
+            raise RuntimeError("cleanup service identity is incomplete")
+        call(
+            "delete-service-" + key,
+            lambda cluster_arn=cluster_arn, service_arn=service["arn"]: ecs.delete_service(
+                cluster=cluster_arn,
+                service=service_arn,
+                force=True,
+            ),
+        )
     call(
         "deregister-task-definition",
         lambda: ecs.deregister_task_definition(taskDefinition=payload["task_definition_arn"]),
@@ -468,6 +579,8 @@ def cleanup(payload: dict[str, Any]) -> dict[str, Any]:
         lambda: iam.delete_role_policy(RoleName=payload["role_name"], PolicyName=payload["policy_name"]),
     )
     call("delete-role", lambda: iam.delete_role(RoleName=payload["role_name"]))
+    if foreign_cluster_arn:
+        call("delete-foreign-cluster", lambda: ecs.delete_cluster(cluster=foreign_cluster_arn))
     call("delete-cluster", lambda: ecs.delete_cluster(cluster=payload["cluster_arn"]))
     if errors:
         raise RuntimeError("cleanup failed")
@@ -487,6 +600,7 @@ def main() -> int:
         "replay": replay,
         "overlap": overlap,
         "stop": stop_tasks,
+        "service_state": service_state,
         "cleanup": cleanup,
     }.get(operation)
     if result is None:
@@ -731,12 +845,15 @@ def wait_for_task_containers(
 
 
 def wait_for_probe_json(container: str, unknown: bool = False, timeout: float = 35.0,
-                        idle_seconds: int = 0, retry_failures: bool = True) -> dict[str, Any]:
+                        idle_seconds: int = 0, retry_failures: bool = True,
+                        resource_scope: bool = False) -> dict[str, Any]:
     command = ["python3", "/opt/fork-ecs-probe.py", "--once"]
     if idle_seconds:
         command.extend(["--idle-seconds", str(idle_seconds)])
     if unknown:
         command.append("--unknown")
+    if resource_scope:
+        command.append("--resource-scope")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         code, stdout, stderr = docker_try("exec", container, *command)
@@ -954,6 +1071,13 @@ def main() -> int:
     floci = args.floci_name or "floci-dev1434-" + run_id
     role_name = "fork-ecs-role-" + run_id
     cluster_name = "fork-ecs-cluster-" + run_id
+    service_names = {
+        "allowed_a": "fork-ecs-allowed-a-" + run_id,
+        "allowed_b": "fork-ecs-allowed-b-" + run_id,
+        "forbidden": "fork-ecs-forbidden-" + run_id,
+        "foreign": "fork-ecs-foreign-" + run_id,
+    }
+    foreign_cluster_name = "fork-ecs-foreign-cluster-" + run_id
     family = "fork-ecs-task-" + run_id
     labels = [
         "floci.fork.contract=true",
@@ -1056,6 +1180,8 @@ def main() -> int:
             {
                 "role_name": role_name,
                 "cluster_name": cluster_name,
+                "service_names": service_names,
+                "foreign_cluster_name": foreign_cluster_name,
                 "family": family,
                 "probe_image": args.probe_image,
                 "floci_name": floci,
@@ -1132,6 +1258,32 @@ def main() -> int:
         access_fingerprints = {result.get("access_key_fingerprint") for result in probe_results.values()}
         if len(identity_arns) != 3 or len(access_fingerprints) != 3:
             raise ContractFailure("task role identities or access keys were not unique")
+
+        # Exercise ECS service resource scoping through the workload's default boto3 provider
+        # chain before any timed credential capture. The control readback surrounds the denied
+        # UpdateService so a successful-looking denial cannot hide a state mutation.
+        forbidden_service = setup["services"]["forbidden"]
+        forbidden_before = control(
+            floci,
+            "service_state",
+            {"cluster_arn": setup["cluster_arn"], "service_arn": forbidden_service["arn"]},
+        )
+        if forbidden_before.get("desired_count") != 0:
+            raise ContractFailure("forbidden ECS service did not start at desiredCount zero")
+        resource_scope_probe = wait_for_probe_json(
+            task_containers[min(task_containers)]["Id"],
+            retry_failures=False,
+            resource_scope=True,
+        )
+        if (resource_scope_probe.get("ecs_resource_scope") or {}).get("passed") is not True:
+            raise ContractFailure("task-role ECS service resource scope contract did not pass")
+        forbidden_after = control(
+            floci,
+            "service_state",
+            {"cluster_arn": setup["cluster_arn"], "service_arn": forbidden_service["arn"]},
+        )
+        if forbidden_after.get("desired_count") != forbidden_before.get("desired_count"):
+            raise ContractFailure("denied ECS UpdateService changed the forbidden service")
 
         ordered_task_ids = sorted(task_containers)
         # Diagnostic idleness precedes credential captures so the overlap assertion still tests
@@ -1281,6 +1433,11 @@ def main() -> int:
             "rotation": "stable URI, new key, TTL120/refresh60",
             "authorization": "allowed object read; list-buckets denied",
             "observed_tasks": probe_results,
+            "ecs_service_scope": {
+                "probe": resource_scope_probe,
+                "forbidden_before": forbidden_before,
+                "forbidden_after": forbidden_after,
+            },
             "rotated_task": rotated_probe,
             "rotation_overlap": rotation_overlap,
             "unaffected_live_task": live_b_replay,

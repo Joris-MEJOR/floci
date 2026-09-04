@@ -56,6 +56,137 @@ def fail(message: str) -> NoReturn:
     raise RuntimeError(message)
 
 
+def expect_access_denied(callable_: Any, label: str) -> str:
+    """Run one intentionally denied request without retrying or exposing request details."""
+
+    try:
+        callable_()
+    except ClientError as error:
+        code = error.response.get("Error", {}).get("Code")
+        if code not in {"AccessDenied", "AccessDeniedException", "UnauthorizedOperation"}:
+            fail(label + " returned an unexpected authorization code")
+        return str(code)
+    fail(label + " unexpectedly succeeded")
+
+
+def required_environment(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        fail(name + " is required")
+    return value
+
+
+def run_ecs_resource_scope(session: boto3.Session, client_config: Config) -> dict[str, Any]:
+    """Prove ECS service ARN scoping using clients from the default task-role session."""
+
+    ecs = session.client("ecs", endpoint_url=os.environ["AWS_ENDPOINT_URL"], config=client_config)
+    cluster_arn = required_environment("FORK_ALLOWED_ECS_CLUSTER_ARN")
+    cluster_name = required_environment("FORK_ALLOWED_ECS_CLUSTER_NAME")
+    allowed_arns = [
+        required_environment("FORK_ALLOWED_ECS_SERVICE_A_ARN"),
+        required_environment("FORK_ALLOWED_ECS_SERVICE_B_ARN"),
+    ]
+    forbidden_arn = required_environment("FORK_FORBIDDEN_ECS_SERVICE_ARN")
+    foreign_cluster_arn = required_environment("FORK_FOREIGN_ECS_CLUSTER_ARN")
+    foreign_service_arn = required_environment("FORK_FOREIGN_ECS_SERVICE_ARN")
+    foreign_account_service_arn = required_environment("FORK_FOREIGN_ACCOUNT_ECS_SERVICE_ARN")
+
+    described = ecs.describe_services(cluster=cluster_arn, services=allowed_arns)
+    if described.get("failures"):
+        fail("allowed ECS DescribeServices returned failures")
+    services = described.get("services") or []
+    if len(services) != len(allowed_arns):
+        fail("allowed ECS DescribeServices returned an unexpected count")
+    by_arn = {service.get("serviceArn"): service for service in services}
+    if set(by_arn) != set(allowed_arns):
+        fail("allowed ECS DescribeServices returned the wrong service set")
+    allowed_names: list[str] = []
+    for service_arn in allowed_arns:
+        service = by_arn[service_arn]
+        expected_name = service_arn.rsplit("/", 1)[-1]
+        if service.get("serviceName") != expected_name:
+            fail("allowed ECS DescribeServices returned the wrong service name")
+        allowed_names.append(expected_name)
+
+    short_described = ecs.describe_services(cluster=cluster_name, services=allowed_names)
+    if short_described.get("failures"):
+        fail("short-name ECS DescribeServices returned failures")
+    short_services = short_described.get("services") or []
+    if len(short_services) != len(allowed_arns):
+        fail("short-name ECS DescribeServices returned an unexpected count")
+    short_by_arn = {service.get("serviceArn"): service for service in short_services}
+    if set(short_by_arn) != set(allowed_arns):
+        fail("short-name ECS DescribeServices returned the wrong service set")
+    if any(short_by_arn[service_arn].get("serviceName") != service_name
+           for service_arn, service_name in zip(allowed_arns, allowed_names)):
+        fail("short-name ECS DescribeServices returned the wrong service name")
+
+    update_results: list[dict[str, Any]] = []
+    for service_arn in allowed_arns:
+        updated = ecs.update_service(cluster=cluster_arn, service=service_arn, desiredCount=0)
+        service = updated.get("service") or {}
+        if service.get("serviceArn") != service_arn or service.get("desiredCount") != 0:
+            fail("allowed ECS UpdateService returned the wrong service state")
+        update_results.append({"service_arn": service_arn, "desired_count": 0})
+
+    short_update_results: list[dict[str, Any]] = []
+    for service_arn, service_name in zip(allowed_arns, allowed_names):
+        updated = ecs.update_service(cluster=cluster_name, service=service_name, desiredCount=0)
+        service = updated.get("service") or {}
+        if (service.get("serviceArn") != service_arn
+                or service.get("serviceName") != service_name
+                or service.get("desiredCount") != 0):
+            fail("short-name ECS UpdateService returned the wrong service state")
+        short_update_results.append({"service_name": service_name, "service_arn": service_arn})
+
+    mixed_describe_code = expect_access_denied(
+        lambda: ecs.describe_services(
+            cluster=cluster_arn,
+            services=[allowed_arns[0], forbidden_arn],
+        ),
+        "mixed ECS DescribeServices",
+    )
+    foreign_cluster_code = expect_access_denied(
+        lambda: ecs.describe_services(
+            cluster=foreign_cluster_arn,
+            services=[foreign_service_arn],
+        ),
+        "foreign-cluster ECS DescribeServices",
+    )
+    foreign_account_code = expect_access_denied(
+        lambda: ecs.describe_services(
+            cluster=cluster_name,
+            services=[foreign_account_service_arn],
+        ),
+        "foreign-account ECS DescribeServices",
+    )
+    forbidden_update_code = expect_access_denied(
+        lambda: ecs.update_service(
+            cluster=cluster_arn,
+            service=forbidden_arn,
+            desiredCount=1,
+        ),
+        "forbidden ECS UpdateService",
+    )
+    return {
+        "passed": True,
+        "allowed_describe": True,
+        "allowed_service_arns": allowed_arns,
+        "allowed_service_names": allowed_names,
+        "short_name_describe": True,
+        "allowed_update": update_results,
+        "short_name_update": short_update_results,
+        "mixed_describe_denied": True,
+        "mixed_describe_error_code": mixed_describe_code,
+        "foreign_cluster_describe_denied": True,
+        "foreign_cluster_describe_error_code": foreign_cluster_code,
+        "foreign_account_describe_denied": True,
+        "foreign_account_describe_error_code": foreign_account_code,
+        "forbidden_update_denied": True,
+        "forbidden_update_error_code": forbidden_update_code,
+    }
+
+
 def allowed_endpoints() -> set[str]:
     raw = os.environ.get("FORK_ALLOWED_ENDPOINT_URLS", "")
     values = {item.strip().rstrip("/") for item in raw.split(",") if item.strip()}
@@ -112,7 +243,7 @@ def metadata_status(path: str) -> int:
         return error.code
 
 
-def run_probe(check_unknown: bool, idle_seconds: int = 0) -> dict[str, Any]:
+def run_probe(check_unknown: bool, idle_seconds: int = 0, resource_scope: bool = False) -> dict[str, Any]:
     relative_uri = os.environ.get("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "")
     endpoint = os.environ.get("AWS_ENDPOINT_URL", "")
     validate_runtime_environment(endpoint, relative_uri)
@@ -158,6 +289,9 @@ def run_probe(check_unknown: bool, idle_seconds: int = 0) -> dict[str, Any]:
         fail("S3 list_buckets unexpectedly succeeded for the deny-only task role")
 
     initial_key_fingerprint = fingerprint(credentials.access_key)
+    resource_scope_result = None
+    if resource_scope:
+        resource_scope_result = run_ecs_resource_scope(session, client_config)
     if idle_seconds:
         # Keep the actual SDK clients and their credential cache alive across a full lease TTL.
         # Do not construct a replacement session/client or inject replacement credentials.
@@ -189,6 +323,8 @@ def run_probe(check_unknown: bool, idle_seconds: int = 0) -> dict[str, Any]:
         result["cached_client_continuity"] = True
         result["cached_client_idle_seconds"] = idle_seconds
         result["cached_client_initial_key_fingerprint"] = initial_key_fingerprint
+    if resource_scope_result is not None:
+        result["ecs_resource_scope"] = resource_scope_result
     if check_unknown:
         unknown_token = "Z" * 48
         status = metadata_status(f"/v2/credentials/{unknown_token}")
@@ -213,8 +349,13 @@ def main() -> int:
         action="store_true",
         help="also assert an unknown metadata token is denied",
     )
+    parser.add_argument(
+        "--resource-scope",
+        action="store_true",
+        help="assert task-role ECS service ARN allow/deny boundaries",
+    )
     args = parser.parse_args()
-    result = run_probe(args.unknown, args.idle_seconds)
+    result = run_probe(args.unknown, args.idle_seconds, args.resource_scope)
     print(json.dumps(result, sort_keys=True), flush=True)
     if not args.once:
         hold_seconds = int(os.environ.get("FORK_PROBE_HOLD_SECONDS", "90"))

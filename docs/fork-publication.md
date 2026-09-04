@@ -65,6 +65,11 @@ fixture holds for 900 seconds to cover emulated startup and both idle intervals,
 credential validity. A cached-client failure is not retried with a new client. Output contains observed role
 identities, one-way credential fingerprints, image manifest identity, and authentication error
 codes, never credential values or bearer paths. The runner emits success only after cleanup.
+The service-authorization checks use exact service ARNs for `ecs:DescribeServices` and
+`ecs:UpdateService`, rather than wildcard permissions. They exercise name and ARN inputs,
+multiple requested services, and denied unrelated targets before the timed credential captures.
+Service lookup must stay within the requested cluster and region; a missing authorized service
+must never resolve to a same-named service elsewhere.
 Redacted control timing and final container state are emitted to stderr even on failure. Preserve
 stderr separately from the success JSON when collecting CI artifacts. The optional
 `--diagnostic-idle-seconds 61` adds a bounded idle interval before task A renewal without skipping

@@ -918,14 +918,11 @@ public class EcsService implements ContainerTeardown, ResourceProvider {
                                           String availabilityZoneRebalancing, boolean forceNewDeployment,
                                           String region) {
         EcsCluster cluster = resolveClusterOrDefault(clusterRef, region);
-
-        serviceName = extractServiceName(serviceName);
-
-        String key = serviceKey(region, cluster.getClusterName(), serviceName);
-        EcsServiceModel svc = services.get(key);
+        EcsServiceModel svc = resolveService(cluster.getClusterName(), serviceName, region);
         if (svc == null) {
             throw new AwsException("ServiceNotFoundException", "Service " + serviceName + " not found.", 404);
         }
+        String key = serviceKey(region, cluster.getClusterName(), svc.getServiceName());
         if ("INACTIVE".equals(svc.getStatus())) {
             throw new AwsException("ServiceNotActiveException",
                     "Service " + serviceName + " is not active.", 400);
@@ -2006,11 +2003,14 @@ public class EcsService implements ContainerTeardown, ResourceProvider {
     }
 
     private EcsCluster resolveCluster(String clusterRef, String region) {
-        EcsCluster byName = clusters.get(clusterKey(region, clusterRef));
+        // ARN references must never alias a legacy resource whose literal name is that ARN.
+        EcsCluster byName = clusterRef.startsWith("arn:") ? null : clusters.get(clusterKey(region, clusterRef));
         if (byName != null) {
             return byName;
         }
-        return clusters.values().stream()
+        return clusters.entrySet().stream()
+                .filter(entry -> entry.getKey().startsWith(region + "::"))
+                .map(Map.Entry::getValue)
                 .filter(c -> c.getClusterArn().equals(clusterRef))
                 .findFirst().orElse(null);
     }
@@ -2061,10 +2061,16 @@ public class EcsService implements ContainerTeardown, ResourceProvider {
     }
 
     private EcsServiceModel resolveService(String clusterName, String serviceId, String region) {
-        EcsServiceModel svc = services.get(serviceKey(region, clusterName, serviceId));
+        EcsServiceModel svc = serviceId.startsWith("arn:") ? null
+                : services.get(serviceKey(region, clusterName, serviceId));
         if (svc != null) { return svc; }
-        return services.values().stream()
-                .filter(s -> s.getServiceArn().equals(serviceId) || s.getServiceName().equals(serviceId))
+        // Match the same cluster and region that IAM authorized. A global name fallback could
+        // return a different cluster's service when the authorized target does not exist.
+        String prefix = serviceKeyPrefix(region, clusterName);
+        return services.entrySet().stream()
+                .filter(entry -> entry.getKey().startsWith(prefix))
+                .map(Map.Entry::getValue)
+                .filter(s -> s.getServiceArn().equals(serviceId))
                 .findFirst().orElse(null);
     }
 
