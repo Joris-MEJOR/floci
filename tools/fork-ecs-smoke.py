@@ -58,7 +58,7 @@ def fingerprint(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
 
-def clients():
+def clients(*, read_timeout: int = 8):
     # Control calls use public synthetic credentials and the loopback endpoint only.  They are
     # intentionally separate from the workload's default boto3 provider chain.
     session = boto3.Session(
@@ -69,7 +69,7 @@ def clients():
     )
     config = Config(
         connect_timeout=4,
-        read_timeout=8,
+        read_timeout=read_timeout,
         retries={"total_max_attempts": 1, "mode": "standard"},
     )
     return session.client("iam", endpoint_url=CONTROL_ENDPOINT, config=config), session.client(
@@ -180,7 +180,9 @@ def setup(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_tasks(payload: dict[str, Any]) -> dict[str, Any]:
-    _, ecs, _ = clients()
+    # RunTask synchronously starts three real containers. QEMU cold starts can exceed
+    # the normal API read deadline; keep one attempt so a timeout never duplicates tasks.
+    _, ecs, _ = clients(read_timeout=60)
     response = ecs.run_task(
         cluster=payload["cluster_arn"],
         taskDefinition=payload["task_definition_arn"],

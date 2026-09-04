@@ -60,6 +60,9 @@ expiry, and exact Docker cleanup. TTL 120 seconds and refresh window 60 seconds 
 emulated-platform startup; allow about three minutes per platform. Output contains observed role
 identities, one-way credential fingerprints, image manifest identity, and authentication error
 codes, never credential values or bearer paths. The runner emits success only after cleanup.
+The three-container `RunTask` control call permits a 60-second read timeout for emulated cold
+starts, with exactly one attempt. Credential assertions, TTL, and all other API deadlines remain
+unchanged; a timeout is still a failed contract, never a successful or retried task launch.
 
 The existing S3 directory-permission test is skipped when run as root because root bypasses the
 permission under test. This storage-permission skip does not skip an ECS/token regression. It
