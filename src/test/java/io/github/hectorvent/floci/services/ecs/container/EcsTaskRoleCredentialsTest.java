@@ -59,6 +59,13 @@ class EcsTaskRoleCredentialsTest {
                 """;
     }
 
+    private static SessionCredential activeFor(EcsTaskRoleCredentials.IssuedCredentials lease) {
+        SessionCredential active = mock(SessionCredential.class);
+        when(active.getAccessKeyId()).thenReturn(lease.credentials().accessKeyId());
+        when(active.getTaskArn()).thenReturn(lease.taskArn());
+        return active;
+    }
+
     @Test
     void issuesExactTaskScopedRelativeUriAndSession() {
         String taskArn = "arn:aws:ecs:us-east-1:111122223333:task/default/task-a";
@@ -85,8 +92,9 @@ class EcsTaskRoleCredentialsTest {
         String roleArn = "arn:aws:iam::111122223333:role/task-role";
         EcsTaskRoleCredentials.IssuedCredentials first = credentials.issue(taskArn, roleArn, "us-east-1")
                 .orElseThrow();
+        SessionCredential firstActive = activeFor(first);
         when(iamService.resolveEcsTaskRoleSessionByPath(first.relativeUri()))
-                .thenReturn(Optional.of(mock(SessionCredential.class)), Optional.empty());
+                .thenReturn(Optional.of(firstActive), Optional.empty());
 
         EcsTaskRoleCredentials.IssuedCredentials refreshed = credentials.refresh(first.relativeUri())
                 .orElseThrow();
@@ -94,7 +102,8 @@ class EcsTaskRoleCredentialsTest {
         assertEquals(first.relativeUri(), refreshed.relativeUri());
         assertEquals(taskArn, refreshed.taskArn());
         assertNotEquals(first.credentials().accessKeyId(), refreshed.credentials().accessKeyId());
-        verify(iamService).revokeEcsTaskRoleSession(taskArn, first.credentials().accessKeyId());
+        verify(iamService, never()).revokeEcsTaskRoleSessionGeneration(
+                taskArn, first.credentials().accessKeyId());
     }
 
     @Test
@@ -105,8 +114,9 @@ class EcsTaskRoleCredentialsTest {
         when(config.services().ecs().taskRoleCredentialsRefreshWindowSeconds()).thenReturn(30);
         EcsTaskRoleCredentials.IssuedCredentials first = credentials.issue(taskArn, roleArn, "us-east-1")
                 .orElseThrow();
+        SessionCredential firstActive = activeFor(first);
         when(iamService.resolveEcsTaskRoleSessionByPath(first.relativeUri()))
-                .thenReturn(Optional.of(mock(SessionCredential.class)));
+                .thenReturn(Optional.of(firstActive));
 
         clock.advanceSeconds(60);
         EcsTaskRoleCredentials.IssuedCredentials current = credentials.refreshTaskIfNeeded(taskArn)
@@ -124,8 +134,9 @@ class EcsTaskRoleCredentialsTest {
         when(config.services().ecs().taskRoleCredentialsRefreshWindowSeconds()).thenReturn(30);
         EcsTaskRoleCredentials.IssuedCredentials first = credentials.issue(taskArn, roleArn, "us-east-1")
                 .orElseThrow();
+        SessionCredential firstActive = activeFor(first);
         when(iamService.resolveEcsTaskRoleSessionByPath(first.relativeUri()))
-                .thenReturn(Optional.of(mock(SessionCredential.class)), Optional.empty());
+                .thenReturn(Optional.of(firstActive), Optional.empty());
 
         clock.advanceSeconds(91);
         EcsTaskRoleCredentials.IssuedCredentials refreshed = credentials.refreshTaskIfNeeded(taskArn)
@@ -134,7 +145,8 @@ class EcsTaskRoleCredentialsTest {
         assertEquals(first.relativeUri(), refreshed.relativeUri());
         assertNotEquals(first.credentials().accessKeyId(), refreshed.credentials().accessKeyId());
         assertEquals(TEST_NOW.plusSeconds(211), refreshed.expiration());
-        verify(iamService).revokeEcsTaskRoleSession(taskArn, first.credentials().accessKeyId());
+        verify(iamService, never()).revokeEcsTaskRoleSessionGeneration(
+                taskArn, first.credentials().accessKeyId());
     }
 
     @Test
@@ -149,7 +161,7 @@ class EcsTaskRoleCredentialsTest {
         clock.advanceSeconds(120);
         assertTrue(credentials.refreshTaskIfNeeded(taskArn).isEmpty());
         assertTrue(credentials.current(first.relativeUri()).isEmpty());
-        verify(iamService).revokeEcsTaskRoleSession(taskArn, first.credentials().accessKeyId());
+        verify(iamService).revokeEcsTaskRoleSessionGeneration(taskArn, first.credentials().accessKeyId());
     }
 
     @Test
@@ -165,7 +177,7 @@ class EcsTaskRoleCredentialsTest {
         clock.advanceSeconds(10);
         assertTrue(credentials.refreshTaskIfNeeded(taskArn).isEmpty());
         assertTrue(credentials.current(first.relativeUri()).isEmpty());
-        verify(iamService).revokeEcsTaskRoleSession(taskArn, first.credentials().accessKeyId());
+        verify(iamService).revokeEcsTaskRoleSession(taskArn);
     }
 
     @Test
@@ -183,16 +195,65 @@ class EcsTaskRoleCredentialsTest {
         when(config.services().ecs().taskRoleCredentialsRefreshWindowSeconds()).thenReturn(30);
         EcsTaskRoleCredentials.IssuedCredentials after = credentials.issue(afterTask, roleArn, "us-east-1")
                 .orElseThrow();
+        SessionCredential afterActive = activeFor(after);
         when(iamService.resolveEcsTaskRoleSessionByPath(after.relativeUri()))
-                .thenReturn(Optional.of(mock(SessionCredential.class)), Optional.empty());
+                .thenReturn(Optional.of(afterActive), Optional.empty());
         clock.advanceSeconds(91);
         EcsTaskRoleCredentials.IssuedCredentials rotated = credentials.refreshTaskIfNeeded(afterTask)
                 .orElseThrow();
         credentials.revokeTask(afterTask);
 
         assertTrue(credentials.current(rotated.relativeUri()).isEmpty());
-        verify(iamService).revokeEcsTaskRoleSession(afterTask, after.credentials().accessKeyId());
-        verify(iamService).revokeEcsTaskRoleSession(afterTask, rotated.credentials().accessKeyId());
+        verify(iamService).revokeEcsTaskRoleSession(afterTask);
+    }
+
+    @Test
+    void failedTrustRotationRevokesEveryOverlappingGeneration() {
+        String taskArn = "arn:aws:ecs:us-east-1:111122223333:task/default/task-trust-rotation";
+        String roleArn = "arn:aws:iam::111122223333:role/task-role";
+        when(config.services().ecs().taskRoleCredentialsTtlSeconds()).thenReturn(120);
+        when(config.services().ecs().taskRoleCredentialsRefreshWindowSeconds()).thenReturn(30);
+        EcsTaskRoleCredentials.IssuedCredentials first = credentials.issue(taskArn, roleArn, "us-east-1")
+                .orElseThrow();
+        SessionCredential firstActive = activeFor(first);
+        when(iamService.resolveEcsTaskRoleSessionByPath(first.relativeUri()))
+                .thenReturn(Optional.of(firstActive));
+
+        clock.advanceSeconds(91);
+        EcsTaskRoleCredentials.IssuedCredentials rotated = credentials.refreshTaskIfNeeded(taskArn)
+                .orElseThrow();
+        SessionCredential rotatedActive = activeFor(rotated);
+        when(iamService.resolveEcsTaskRoleSessionByPath(rotated.relativeUri()))
+                .thenReturn(Optional.of(rotatedActive));
+        when(iamService.findRole(anyString(), anyString())).thenReturn(Optional.of(
+                new IamRole("AROAEXAMPLE", "task-role", "/",
+                        "arn:aws:iam::111122223333:role/task-role",
+                        ecsTrustPolicyFor("lambda.amazonaws.com"))));
+
+        assertTrue(credentials.refresh(rotated.relativeUri()).isEmpty());
+        assertTrue(credentials.current(rotated.relativeUri()).isEmpty());
+        verify(iamService).revokeEcsTaskRoleSession(taskArn);
+        verify(iamService, never()).revokeEcsTaskRoleSessionGeneration(
+                taskArn, first.credentials().accessKeyId());
+    }
+
+    @Test
+    void invalidTimingRevokesEveryOverlappingGeneration() {
+        String taskArn = "arn:aws:ecs:us-east-1:111122223333:task/default/task-invalid-timing";
+        String roleArn = "arn:aws:iam::111122223333:role/task-role";
+        when(config.services().ecs().taskRoleCredentialsTtlSeconds()).thenReturn(120);
+        when(config.services().ecs().taskRoleCredentialsRefreshWindowSeconds()).thenReturn(30);
+        EcsTaskRoleCredentials.IssuedCredentials first = credentials.issue(taskArn, roleArn, "us-east-1")
+                .orElseThrow();
+        SessionCredential firstActive = activeFor(first);
+        when(iamService.resolveEcsTaskRoleSessionByPath(first.relativeUri()))
+                .thenReturn(Optional.of(firstActive));
+        clock.advanceSeconds(91);
+        credentials.refreshTaskIfNeeded(taskArn).orElseThrow();
+
+        when(config.services().ecs().taskRoleCredentialsRefreshWindowSeconds()).thenReturn(-1);
+        assertTrue(credentials.refreshTaskIfNeeded(taskArn).isEmpty());
+        verify(iamService).revokeEcsTaskRoleSession(taskArn);
     }
 
     @Test
@@ -204,7 +265,7 @@ class EcsTaskRoleCredentialsTest {
         credentials.revokeTask(taskArn);
 
         assertTrue(credentials.current(first.relativeUri()).isEmpty());
-        verify(iamService).revokeEcsTaskRoleSession(taskArn, first.credentials().accessKeyId());
+        verify(iamService).revokeEcsTaskRoleSession(taskArn);
     }
 
     @Test
@@ -220,8 +281,8 @@ class EcsTaskRoleCredentialsTest {
 
         assertTrue(credentials.current(first.relativeUri()).isEmpty());
         assertTrue(credentials.current(second.relativeUri()).isEmpty());
-        verify(iamService).revokeEcsTaskRoleSession(first.taskArn(), first.credentials().accessKeyId());
-        verify(iamService).revokeEcsTaskRoleSession(second.taskArn(), second.credentials().accessKeyId());
+        verify(iamService).revokeEcsTaskRoleSession(first.taskArn());
+        verify(iamService).revokeEcsTaskRoleSession(second.taskArn());
     }
 
     @Test

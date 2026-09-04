@@ -121,11 +121,16 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * ECS task-role sessions are deliberately process-local. A task container cannot survive a
      * Floci restart, so persisting its credentials would leave a bearer credential with no owning
      * task. The access-key and path indexes are kept separately to make both SigV4 authentication
-     * and the AWS container-credentials endpoint exact and O(1).
+     * and the AWS container-credentials endpoint exact and O(1). A task may have a bounded set of
+     * overlapping generations while a running SDK drains an in-flight request: {@code byTask} and
+     * {@code byPath} always identify the newest generation, while {@code byAccessKey} retains each
+     * unexpired generation until its advertised expiry (or explicit task revocation).
      */
     private final Map<String, SessionCredential> ecsTaskSessionsByAccessKey = new ConcurrentHashMap<>();
     private final Map<String, SessionCredential> ecsTaskSessionsByPath = new ConcurrentHashMap<>();
     private final Map<String, SessionCredential> ecsTaskSessionsByTask = new ConcurrentHashMap<>();
+    private final Map<String, Map<String, SessionCredential>> ecsTaskSessionGenerationsByTask =
+            new ConcurrentHashMap<>();
     /**
      * Holds at most one entry per account under {@link #ACCOUNT_ALIAS_KEY} — an account alias is a
      * single value, and the store is already account-namespaced, so no further keying is needed.
@@ -1977,17 +1982,22 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             throw new IllegalArgumentException("ECS task role identity is invalid", e);
         }
 
-        SessionCredential prior = ecsTaskSessionsByTask.remove(taskArn);
-        if (prior != null) {
-            revokeEcsTaskSession(prior);
-        }
+        // Rotation deliberately overlaps generations. Validate every collision before touching
+        // the current task generation so a rejected replacement cannot revoke a still-valid key.
+        purgeExpiredEcsTaskSessions();
         SessionCredential accessCollision = ecsTaskSessionsByAccessKey.get(accessKeyId);
         if (accessCollision != null) {
             throw new IllegalArgumentException("ECS access key is already issued");
         }
         SessionCredential pathCollision = ecsTaskSessionsByPath.get(credentialPath);
-        if (pathCollision != null) {
+        if (pathCollision != null && !taskArn.equals(pathCollision.getTaskArn())) {
             throw new IllegalArgumentException("ECS credential path is already issued");
+        }
+        if (pathCollision == null) {
+            SessionCredential indexedPathCollision = resolveEcsTaskRoleSessionByPath(credentialPath).orElse(null);
+            if (indexedPathCollision != null && !taskArn.equals(indexedPathCollision.getTaskArn())) {
+                throw new IllegalArgumentException("ECS credential path is already issued");
+            }
         }
 
         Instant now = Instant.now();
@@ -1999,8 +2009,18 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         session.setLastUpdated(now);
         session.setRevoked(false);
 
+        SessionCredential prior = ecsTaskSessionsByTask.get(taskArn);
+        if (prior != null && !credentialPath.equals(prior.getCredentialPath())) {
+            // A non-stable re-issue gets a new metadata path. The previous path is no longer the
+            // task's latest endpoint, but its access key remains valid until that generation's
+            // advertised expiry so an in-flight request can drain safely.
+            ecsTaskSessionsByPath.remove(prior.getCredentialPath(), prior);
+        }
         ecsTaskSessionsByTask.put(taskArn, session);
         ecsTaskSessionsByAccessKey.put(accessKeyId, session);
+        ecsTaskSessionGenerationsByTask
+                .computeIfAbsent(taskArn, ignored -> new ConcurrentHashMap<>())
+                .put(accessKeyId, session);
         ecsTaskSessionsByPath.put(credentialPath, session);
     }
 
@@ -2009,6 +2029,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         if (credentialPath == null || credentialPath.isBlank()) {
             return Optional.empty();
         }
+        purgeExpiredEcsTaskSessions();
         SessionCredential session = ecsTaskSessionsByPath.get(credentialPath);
         if (session == null) {
             return Optional.empty();
@@ -2025,6 +2046,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         if (accessKeyId == null || accessKeyId.isBlank()) {
             return Optional.empty();
         }
+        purgeExpiredEcsTaskSessions();
         SessionCredential session = ecsTaskSessionsByAccessKey.get(accessKeyId);
         if (session == null) {
             return Optional.empty();
@@ -2045,6 +2067,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
 
     /** Collision check for newly minted credentials without weakening revoked-key recognition. */
     public synchronized boolean isCredentialAccessKeyInUse(String accessKeyId) {
+        purgeExpiredEcsTaskSessions();
         if (accessKeyId == null || ecsTaskSessionsByAccessKey.containsKey(accessKeyId)) {
             return accessKeyId != null;
         }
@@ -2062,6 +2085,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         if (accessKeyId == null || accessKeyId.isBlank()) {
             return false;
         }
+        purgeExpiredEcsTaskSessions();
         SessionCredential session = ecsTaskSessionsByAccessKey.get(accessKeyId);
         if (session == null || !isActiveEcsTaskSession(session)
                 || presentedToken == null || presentedToken.isBlank()) {
@@ -2072,25 +2096,53 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 presentedToken.getBytes(java.nio.charset.StandardCharsets.UTF_8));
     }
 
-    /** Revokes the active ECS session owned by an exact task. */
+    /** Revokes every ECS generation owned by an exact task. */
     public synchronized void revokeEcsTaskRoleSession(String taskArn) {
         if (taskArn == null || taskArn.isBlank()) {
             return;
         }
-        SessionCredential session = ecsTaskSessionsByTask.remove(taskArn);
-        if (session != null) {
-            revokeEcsTaskSession(session);
+        Map<String, SessionCredential> generations = ecsTaskSessionGenerationsByTask.get(taskArn);
+        if (generations != null) {
+            for (SessionCredential session : List.copyOf(generations.values())) {
+                revokeEcsTaskSession(session);
+            }
+            ecsTaskSessionGenerationsByTask.remove(taskArn, generations);
+        } else {
+            SessionCredential session = ecsTaskSessionsByTask.get(taskArn);
+            if (session != null) {
+                revokeEcsTaskSession(session);
+            }
+        }
+        ecsTaskSessionsByTask.remove(taskArn);
+    }
+
+    /**
+     * Revokes an externally-selected generation. Revoking the task's current generation is a
+     * task-level authorization decision, so all overlapping generations are invalidated; an old
+     * generation can be retired independently without interrupting the current one.
+     */
+    public synchronized void revokeEcsTaskRoleSession(String taskArn, String accessKeyId) {
+        purgeExpiredEcsTaskSessions();
+        SessionCredential session = accessKeyId == null ? null : ecsTaskSessionsByAccessKey.get(accessKeyId);
+        if (session != null && (taskArn == null || taskArn.equals(session.getTaskArn()))) {
+            String ownerTask = session.getTaskArn();
+            SessionCredential current = ownerTask == null ? null : ecsTaskSessionsByTask.get(ownerTask);
+            if (current == session) {
+                revokeEcsTaskRoleSession(ownerTask);
+            } else {
+                revokeEcsTaskRoleSessionGeneration(ownerTask, accessKeyId);
+            }
         }
     }
 
-    /** Revokes one access key when a task session is rotated or a container stops. */
-    public synchronized void revokeEcsTaskRoleSession(String taskArn, String accessKeyId) {
-        SessionCredential session = accessKeyId == null ? null : ecsTaskSessionsByAccessKey.get(accessKeyId);
+    /** Revokes exactly one ECS generation, including an expired-generation cleanup. */
+    public synchronized void revokeEcsTaskRoleSessionGeneration(String taskArn, String accessKeyId) {
+        if (accessKeyId == null || accessKeyId.isBlank()) {
+            return;
+        }
+        SessionCredential session = ecsTaskSessionsByAccessKey.get(accessKeyId);
         if (session != null && (taskArn == null || taskArn.equals(session.getTaskArn()))) {
             revokeEcsTaskSession(session);
-            if (taskArn != null) {
-                ecsTaskSessionsByTask.remove(taskArn, session);
-            }
         }
     }
 
@@ -2114,6 +2166,25 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         }
         if (session.getTaskArn() != null) {
             ecsTaskSessionsByTask.remove(session.getTaskArn(), session);
+            Map<String, SessionCredential> generations = ecsTaskSessionGenerationsByTask
+                    .get(session.getTaskArn());
+            if (generations != null) {
+                generations.remove(accessKeyId, session);
+                if (generations.isEmpty()) {
+                    ecsTaskSessionGenerationsByTask.remove(session.getTaskArn(), generations);
+                }
+            }
+        }
+    }
+
+    /** Removes expired/revoked ECS generations without retaining unbounded tombstones. */
+    private void purgeExpiredEcsTaskSessions() {
+        Instant now = Instant.now();
+        for (SessionCredential session : List.copyOf(ecsTaskSessionsByAccessKey.values())) {
+            if (session == null || session.isRevoked() || session.getExpiration() == null
+                    || !session.getExpiration().isAfter(now)) {
+                revokeEcsTaskSession(session);
+            }
         }
     }
 

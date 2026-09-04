@@ -56,8 +56,11 @@ refreshes them inside `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_REFRESH_WINDOW_S
 the same relative URI while rotating the access key and token. Individual credentials expire after
 `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_TTL_SECONDS`: expired keys are never accepted. Idle tasks
 do not depend on SDK traffic for renewal: Floci proactively renews credentials for confirmed
-running tasks, preserving the relative URI. Task stop or Floci restart revokes the endpoint as
-well as its credentials. The task role must already exist in the task's account and its trust policy must contain
+running tasks, preserving the relative URI. Rotation publishes a new generation without shortening
+the previous generation's advertised expiration: requests already signed with a still-valid key
+remain authorized under the same role policy. This bounded overlap does not extend any key's TTL.
+Task stop or Floci restart revokes the endpoint and every credential generation owned by that task.
+The task role must already exist in the task's account and its trust policy must contain
 an unconditional `Allow` for the exact `ecs-tasks.amazonaws.com` service principal and
 `sts:AssumeRole`; an unknown role, a role trusted only by another service, an explicit matching
 `Deny`, or a conditioned statement fails the launch. The refresh window must be non-negative and

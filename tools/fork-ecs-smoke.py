@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -32,8 +33,10 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -299,6 +302,116 @@ def replay(payload: dict[str, Any]) -> dict[str, Any]:
     return {"denied": False, "allowed": True, "error_code": None}
 
 
+def _capture_summary(label: str, path: str) -> dict[str, Any]:
+    if not LABEL_RE.fullmatch(label):
+        raise ValueError("invalid capture label")
+    capture_path = CAPTURE_ROOT / ("fork-ecs-capture-" + label + ".json")
+    with capture_path.open(encoding="utf-8") as handle:
+        credentials = json.load(handle)
+    required = ("AccessKeyId", "SecretAccessKey", "Token", "Expiration", "RoleArn")
+    if any(not isinstance(credentials.get(key), str) or not credentials[key] for key in required):
+        raise RuntimeError("capture omitted required fields")
+    return {
+        "access_key_fingerprint": fingerprint(credentials["AccessKeyId"]),
+        "path_fingerprint": fingerprint(path),
+        "expiration": credentials["Expiration"],
+        "role_arn": credentials["RoleArn"],
+    }
+
+
+def _expiration_epoch(value: Any) -> float:
+    if not isinstance(value, str) or not value:
+        raise RuntimeError("capture expiration is missing")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise RuntimeError("capture expiration is not ISO-8601") from error
+    if parsed.tzinfo is None:
+        raise RuntimeError("capture expiration has no timezone")
+    return parsed.timestamp()
+
+
+def _assert_allowed(value: dict[str, Any], label: str) -> None:
+    if value.get("denied") is not False or value.get("allowed") is not True:
+        raise RuntimeError(label + " did not remain usable before expiration")
+
+
+def _assert_stopped_denial(value: dict[str, Any], label: str) -> None:
+    if value.get("denied") is not True or value.get("allowed") is not None:
+        raise RuntimeError(label + " remained usable after task stop")
+    if value.get("error_code") in {"ExpiredToken", "ExpiredTokenException"}:
+        raise RuntimeError(label + " denial was caused by expiration, not task stop")
+
+
+def overlap(payload: dict[str, Any]) -> dict[str, Any]:
+    """Prove generation overlap, then revoke both generations with one exact task stop."""
+
+    initial_label = payload.get("initial_label", "initial")
+    rotated_label = payload.get("rotated_label", "rotated")
+    initial = _capture_summary(initial_label, payload["path"])
+    rotated = _capture_summary(rotated_label, payload["path"])
+    if initial["path_fingerprint"] != rotated["path_fingerprint"]:
+        raise RuntimeError("credential URI changed during generation rotation")
+    if initial["access_key_fingerprint"] == rotated["access_key_fingerprint"]:
+        raise RuntimeError("generation rotation did not produce a new access key")
+    initial_expiration = _expiration_epoch(initial["expiration"])
+    rotated_expiration = _expiration_epoch(rotated["expiration"])
+    minimum_remaining = int(payload.get("minimum_remaining_seconds", 10))
+    if minimum_remaining < 1 or minimum_remaining > 60:
+        raise ValueError("minimum overlap lifetime must be between 1 and 60 seconds")
+    before_stop_remaining = min(initial_expiration, rotated_expiration) - time.time()
+    if before_stop_remaining <= minimum_remaining:
+        raise RuntimeError("generation overlap did not retain both credentials before expiry")
+
+    object_ref = {"bucket": payload["bucket"], "object_key": payload["object_key"]}
+    initial_replay = replay({"label": initial_label, **object_ref})
+    _assert_allowed(initial_replay, "initial generation")
+    rotated_replay = replay({"label": rotated_label, **object_ref})
+    _assert_allowed(rotated_replay, "rotated generation")
+
+    _, ecs, _ = clients(read_timeout=60)
+    ecs.stop_task(
+        cluster=payload["cluster_arn"],
+        task=payload["task_arn"],
+        reason="credential overlap contract stop",
+    )
+    stop_deadline = time.monotonic() + 15
+    stopped_status = None
+    while time.monotonic() < stop_deadline:
+        stopped_status, _ = _metadata(payload["path"])
+        if stopped_status == 404:
+            break
+        if stopped_status != 200:
+            raise RuntimeError("stopped task credential URI returned an unexpected status")
+        time.sleep(0.25)
+    if stopped_status != 404:
+        raise RuntimeError("stopped task credential URI remained live")
+    after_stop_remaining = min(initial_expiration, rotated_expiration) - time.time()
+    if after_stop_remaining <= 0:
+        raise RuntimeError("generation stop denials could be explained by expiration")
+
+    stopped_initial_replay = replay({"label": initial_label, **object_ref})
+    _assert_stopped_denial(stopped_initial_replay, "initial generation")
+    stopped_rotated_replay = replay({"label": rotated_label, **object_ref})
+    _assert_stopped_denial(stopped_rotated_replay, "rotated generation")
+    after_replay_remaining = min(initial_expiration, rotated_expiration) - time.time()
+    if after_replay_remaining <= 0:
+        raise RuntimeError("generation stop denials finished after credential expiration")
+    return {
+        "overlap": True,
+        "initial": initial,
+        "rotated": rotated,
+        "initial_replay": initial_replay,
+        "rotated_replay": rotated_replay,
+        "before_stop_remaining_seconds": round(before_stop_remaining, 3),
+        "after_stop_remaining_seconds": round(after_stop_remaining, 3),
+        "after_replay_remaining_seconds": round(after_replay_remaining, 3),
+        "stopped_metadata_status": stopped_status,
+        "stopped_initial_replay": stopped_initial_replay,
+        "stopped_rotated_replay": stopped_rotated_replay,
+    }
+
+
 def stop_tasks(payload: dict[str, Any]) -> dict[str, Any]:
     _, ecs, _ = clients()
     errors: list[str] = []
@@ -372,6 +485,7 @@ def main() -> int:
         "metadata": metadata,
         "capture": capture,
         "replay": replay,
+        "overlap": overlap,
         "stop": stop_tasks,
         "cleanup": cleanup,
     }.get(operation)
@@ -617,7 +731,7 @@ def wait_for_task_containers(
 
 
 def wait_for_probe_json(container: str, unknown: bool = False, timeout: float = 35.0,
-                        idle_seconds: int = 0) -> dict[str, Any]:
+                        idle_seconds: int = 0, retry_failures: bool = True) -> dict[str, Any]:
     command = ["python3", "/opt/fork-ecs-probe.py", "--once"]
     if idle_seconds:
         command.extend(["--idle-seconds", str(idle_seconds)])
@@ -634,11 +748,57 @@ def wait_for_probe_json(container: str, unknown: bool = False, timeout: float = 
                     continue
                 if isinstance(value, dict):
                     return value
-        if idle_seconds:
-            break  # A cached-client failure must not be hidden by a fresh-client retry.
+        if idle_seconds or not retry_failures:
+            # A cached-client or generation-observation failure must not be hidden by a
+            # fresh-client retry.
+            break
         time.sleep(1)
     detail = redact((stderr or "").strip())
     raise ContractFailure(f"probe did not pass in container {container}: {detail or 'no JSON result'}")
+
+
+def wait_for_rotated_probe(container: str, previous_key: str, timeout: float) -> dict[str, Any]:
+    """Observe one natural refresh without retrying a failed positive-auth probe."""
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        remaining = max(1.0, deadline - time.monotonic())
+        result = wait_for_probe_json(
+            container,
+            timeout=min(35.0, remaining),
+            retry_failures=False,
+        )
+        if result.get("access_key_fingerprint") != previous_key:
+            return result
+        time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+    raise ContractFailure("task credential did not rotate within the bounded refresh window")
+
+
+def expiration_epoch(value: Any) -> float:
+    if not isinstance(value, str) or not value:
+        raise ContractFailure("credential capture omitted expiration")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ContractFailure("credential capture expiration is not ISO-8601") from error
+    if parsed.tzinfo is None:
+        raise ContractFailure("credential capture expiration has no timezone")
+    return parsed.timestamp()
+
+
+def wait_for_expiration(value: Any, maximum_wait: float = 180.0) -> float:
+    """Wait for one captured generation's advertised expiry, with a bounded deadline."""
+
+    expiry = expiration_epoch(value)
+    remaining = expiry - time.time()
+    if remaining < -1:
+        raise ContractFailure("captured credential expired before its expiry wait")
+    if remaining > maximum_wait:
+        raise ContractFailure("captured credential expiry exceeded the bounded wait")
+    while remaining > 0:
+        time.sleep(min(30.0, remaining + 1.0))
+        remaining = expiry - time.time()
+    return expiry
 
 
 def control(floci: str, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -769,7 +929,12 @@ def parse_args() -> argparse.Namespace:
         help="Docker target platform for Floci and the probe image (default: daemon platform)",
     )
     parser.add_argument("--rotation-wait-seconds", type=int, default=61)
-    parser.add_argument("--expiry-wait-seconds", type=int, default=65)
+    parser.add_argument(
+        "--expiry-wait-seconds",
+        type=int,
+        default=180,
+        help="maximum seconds allowed for a captured credential to reach its advertised expiry",
+    )
     return parser.parse_args()
 
 
@@ -781,8 +946,8 @@ def main() -> int:
         raise ContractFailure("Docker socket must be an absolute daemon-host path without commas or newlines")
     if args.rotation_wait_seconds < 61 or args.rotation_wait_seconds > 90:
         raise ContractFailure("rotation wait must be between 61 and 90 seconds")
-    if args.expiry_wait_seconds < 61 or args.expiry_wait_seconds > 90:
-        raise ContractFailure("expiry wait must be between 61 and 90 seconds")
+    if args.expiry_wait_seconds < 121 or args.expiry_wait_seconds > 300:
+        raise ContractFailure("expiry wait bound must be between 121 and 300 seconds")
 
     run_id = uuid.uuid4().hex[:10]
     network = args.network or "floci-dev1434-ecs-" + run_id
@@ -969,6 +1134,9 @@ def main() -> int:
             raise ContractFailure("task role identities or access keys were not unique")
 
         ordered_task_ids = sorted(task_containers)
+        # Diagnostic idleness precedes credential captures so the overlap assertion still tests
+        # live generations rather than accidentally waiting out their advertised expiration.
+        time.sleep(args.diagnostic_idle_seconds)
         initial_capture = control(floci, "capture", {"path": path_by_task[ordered_task_ids[0]], "label": "initial"})
         task1_capture = control(floci, "capture", {"path": path_by_task[ordered_task_ids[1]], "label": "task1"})
         task2_capture = control(floci, "capture", {"path": path_by_task[ordered_task_ids[2]], "label": "task2"})
@@ -984,13 +1152,15 @@ def main() -> int:
         # Task A proves enumeration denial with a fabricated path.  It never possesses task B's
         # path, so the known local bearer-replay capability is intentionally not tested as ACL
         # isolation.  The probe only records HTTP 404 and fingerprints.
-        time.sleep(args.diagnostic_idle_seconds)
         unknown_result = wait_for_probe_json(task_containers[ordered_task_ids[0]]["Id"], unknown=True)
         if unknown_result.get("unknown_metadata_status") != 404 or unknown_result.get("unknown_metadata_denied") is not True:
             raise ContractFailure("task A could enumerate an unknown metadata path")
 
-        time.sleep(args.rotation_wait_seconds)
-        rotated_probe = wait_for_probe_json(task_containers[ordered_task_ids[0]]["Id"])
+        rotated_probe = wait_for_rotated_probe(
+            task_containers[ordered_task_ids[0]]["Id"],
+            initial_capture.get("access_key_fingerprint", ""),
+            args.rotation_wait_seconds,
+        )
         if rotated_probe.get("credential_provider") != "container-role":
             raise ContractFailure("rotated probe left the default provider chain")
         if rotated_probe.get("credential_path_fingerprint") != initial_capture.get("path_fingerprint"):
@@ -1000,34 +1170,36 @@ def main() -> int:
         rotated_capture = control(floci, "capture", {"path": path_by_task[ordered_task_ids[0]], "label": "rotated"})
         if rotated_capture.get("access_key_fingerprint") != rotated_probe.get("access_key_fingerprint"):
             raise ContractFailure("controller and probe disagreed on the rotated access key")
-        old_replay = control(floci, "replay", {"label": "initial", **object_ref})
-        if old_replay.get("denied") is not True or old_replay.get("allowed") is not None:
-            raise ContractFailure("rotated-out credentials were still accepted")
 
-        # Revoke Task A before expiring Task C.  Refresh Task B's lease immediately before the
-        # stop so its positive object read proves that revocation is task-scoped rather than a
-        # transport-wide or role-wide deny.
-        current_b = control(floci, "metadata", {"path": path_by_task[ordered_task_ids[1]]})
-        if current_b.get("status") != 200:
-            raise ContractFailure("Task B credentials were not live before Task A revocation")
+        # Capture B before A stops. Its subsequent positive replay must use an already-issued
+        # generation, not credentials fetched after the revocation under test.
         task1_capture = control(
-            floci,
-            "capture",
-            {"path": path_by_task[ordered_task_ids[1]], "label": "task1"},
+            floci, "capture", {"path": path_by_task[ordered_task_ids[1]], "label": "task1"},
         )
         if task1_capture.get("captured") is not True:
-            raise ContractFailure("controller could not refresh Task B credentials")
-        control(
+            raise ContractFailure("Task B credentials were not live before Task A revocation")
+
+        # Prove bounded overlap and stop revocation in one control process.  Both generations must
+        # remain valid before their advertised expiry; the exact Task A stop must then revoke both.
+        rotation_overlap = control(
             floci,
-            "stop",
-            {"cluster_arn": setup["cluster_arn"], "task_arns": [task_arn_by_id[ordered_task_ids[0]]]},
+            "overlap",
+            {
+                "cluster_arn": setup["cluster_arn"],
+                "task_arn": task_arn_by_id[ordered_task_ids[0]],
+                "path": path_by_task[ordered_task_ids[0]],
+                "bucket": setup["bucket"],
+                "object_key": setup["object_key"],
+                "initial_label": "initial",
+                "rotated_label": "rotated",
+                "minimum_remaining_seconds": 10,
+            },
         )
-        stopped_a = control(floci, "metadata", {"path": path_by_task[ordered_task_ids[0]]})
-        if stopped_a.get("status") != 404:
-            raise ContractFailure("revoked Task A credential URI remained live")
-        stopped_a_replay = control(floci, "replay", {"label": "rotated", **object_ref})
-        if stopped_a_replay.get("denied") is not True:
-            raise ContractFailure("revoked Task A credentials were still accepted")
+        if rotation_overlap.get("overlap") is not True:
+            raise ContractFailure("generation overlap contract did not pass")
+
+        # Task B's pre-stop capture remains untouched so its positive read proves that stopping
+        # Task A is task-scoped rather than a transport-wide or role-wide deny.
         live_b_replay = control(floci, "replay", {"label": "task1", **object_ref})
         if live_b_replay.get("denied") is not False or live_b_replay.get("allowed") is not True:
             raise ContractFailure("revoking Task A denied a still-live Task B credential")
@@ -1036,7 +1208,20 @@ def main() -> int:
         # Reject the captured expired key before any SDK request can renew the credential.
         idle_task = task_containers[ordered_task_ids[2]]
         idle_started_at = exact_container_inspect(idle_task["Id"]).get("State", {}).get("StartedAt")
-        time.sleep(args.expiry_wait_seconds)
+        # ARM emulation can spend most of a lease on the preceding A-rotation checks. Refresh the
+        # capture itself immediately before the bounded expiry proof, then use only that captured
+        # generation for the positive read and post-expiry replay.
+        task2_capture = control(
+            floci,
+            "capture",
+            {"path": path_by_task[ordered_task_ids[2]], "label": "task2"},
+        )
+        if task2_capture.get("captured") is not True:
+            raise ContractFailure("controller could not capture the current Task C credential")
+        pre_expiry_replay = control(floci, "replay", {"label": "task2", **object_ref})
+        if pre_expiry_replay.get("denied") is not False or pre_expiry_replay.get("allowed") is not True:
+            raise ContractFailure("captured Task C credentials were not usable before expiration")
+        wait_for_expiration(task2_capture.get("expiration"), maximum_wait=args.expiry_wait_seconds)
         expired_replay = control(floci, "replay", {"label": "task2", **object_ref})
         if expired_replay.get("denied") is not True:
             raise ContractFailure("expired task credentials were still accepted")
@@ -1097,9 +1282,9 @@ def main() -> int:
             "authorization": "allowed object read; list-buckets denied",
             "observed_tasks": probe_results,
             "rotated_task": rotated_probe,
-            "rotation_denial": old_replay,
-            "revocation_denial": stopped_a_replay,
+            "rotation_overlap": rotation_overlap,
             "unaffected_live_task": live_b_replay,
+            "pre_expiry_replay": pre_expiry_replay,
             "expiry_denial": expired_replay,
             "idle_task_continuity": resumed_probe,
             "cached_client_continuity": cached_probe,

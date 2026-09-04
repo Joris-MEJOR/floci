@@ -43,6 +43,8 @@ public class EcsTaskRoleCredentials {
     private final Object lock = new Object();
     private final Map<String, IssuedCredentials> byTask = new HashMap<>();
     private final Map<String, IssuedCredentials> byPath = new HashMap<>();
+    /** All unexpired generations by exact task; byTask/byPath contain only the newest one. */
+    private final Map<String, Map<String, IssuedCredentials>> generationsByTask = new HashMap<>();
     private final Map<String, String> linkLocalByContainer = new HashMap<>();
     private final Set<String> allocatedLinkLocalIps = new HashSet<>();
     private int nextLinkLocalHost = 3;
@@ -104,13 +106,23 @@ public class EcsTaskRoleCredentials {
                 return Optional.empty();
             }
             if (!validCredentialTiming()) {
-                revokeLeaseLocked(lease);
+                revokeTaskLeasesLocked(lease.taskArn());
                 return Optional.empty();
             }
             Instant now = clock.instant();
-            Optional<SessionCredential> active = iamService.resolveEcsTaskRoleSessionByPath(relativeUri);
-            if (active.isEmpty() || !lease.expiration().isAfter(now)) {
+            if (!lease.expiration().isAfter(now)) {
                 revokeLeaseLocked(lease);
+                return Optional.empty();
+            }
+            Optional<SessionCredential> active = iamService.resolveEcsTaskRoleSessionByPath(relativeUri);
+            if (active.isEmpty()) {
+                // A live-path revocation is a task-level authorization decision. Do not leave an
+                // older overlapping key usable after the current metadata generation disappears.
+                revokeTaskLeasesLocked(lease.taskArn());
+                return Optional.empty();
+            }
+            if (!sameGeneration(active.orElseThrow(), lease)) {
+                revokeTaskLeasesLocked(lease.taskArn());
                 return Optional.empty();
             }
             long refreshWindow = config.services().ecs().taskRoleCredentialsRefreshWindowSeconds();
@@ -130,15 +142,23 @@ public class EcsTaskRoleCredentials {
             IssuedCredentials lease = byPath.get(relativeUri);
             if (!validCredentialTiming()) {
                 if (lease != null) {
+                    revokeTaskLeasesLocked(lease.taskArn());
+                }
+                return Optional.empty();
+            }
+            if (lease == null || !lease.expiration().isAfter(clock.instant())) {
+                if (lease != null) {
                     revokeLeaseLocked(lease);
                 }
                 return Optional.empty();
             }
-            if (lease == null || !lease.expiration().isAfter(clock.instant())
-                    || iamService.resolveEcsTaskRoleSessionByPath(relativeUri).isEmpty()) {
-                if (lease != null) {
-                    revokeLeaseLocked(lease);
-                }
+            Optional<SessionCredential> active = iamService.resolveEcsTaskRoleSessionByPath(relativeUri);
+            if (active.isEmpty()) {
+                revokeTaskLeasesLocked(lease.taskArn());
+                return Optional.empty();
+            }
+            if (!sameGeneration(active.orElseThrow(), lease)) {
+                revokeTaskLeasesLocked(lease.taskArn());
                 return Optional.empty();
             }
             return refreshLocked(relativeUri, lease);
@@ -160,7 +180,7 @@ public class EcsTaskRoleCredentials {
                 return Optional.empty();
             }
             if (!validCredentialTiming()) {
-                revokeLeaseLocked(lease);
+                revokeTaskLeasesLocked(taskArn);
                 return Optional.empty();
             }
 
@@ -172,8 +192,9 @@ public class EcsTaskRoleCredentials {
 
             // Resolve on every owner tick so an explicit IAM revoke cannot be masked by the
             // in-memory lease while the task is outside the refresh window.
-            if (iamService.resolveEcsTaskRoleSessionByPath(lease.relativeUri()).isEmpty()) {
-                revokeLeaseLocked(lease);
+            Optional<SessionCredential> active = iamService.resolveEcsTaskRoleSessionByPath(lease.relativeUri());
+            if (active.isEmpty() || !sameGeneration(active.orElseThrow(), lease)) {
+                revokeTaskLeasesLocked(taskArn);
                 return Optional.empty();
             }
 
@@ -191,12 +212,7 @@ public class EcsTaskRoleCredentials {
             return;
         }
         synchronized (lock) {
-            IssuedCredentials lease = byTask.get(taskArn);
-            if (lease != null) {
-                revokeLeaseLocked(lease);
-            } else {
-                iamService.revokeEcsTaskRoleSession(taskArn);
-            }
+            revokeTaskLeasesLocked(taskArn);
         }
     }
 
@@ -213,11 +229,14 @@ public class EcsTaskRoleCredentials {
     /** Revokes every process-local lease during emulator shutdown. */
     public void revokeAll() {
         synchronized (lock) {
-            for (IssuedCredentials lease : List.copyOf(byTask.values())) {
-                revokeLeaseLocked(lease);
+            Set<String> taskArns = new HashSet<>(generationsByTask.keySet());
+            taskArns.addAll(byTask.keySet());
+            for (String taskArn : taskArns) {
+                revokeTaskLeasesLocked(taskArn);
             }
             byTask.clear();
             byPath.clear();
+            generationsByTask.clear();
             linkLocalByContainer.clear();
             allocatedLinkLocalIps.clear();
         }
@@ -256,13 +275,10 @@ public class EcsTaskRoleCredentials {
     }
 
     private Optional<IssuedCredentials> refreshLocked(String relativeUri, IssuedCredentials oldLease) {
-        // The in-memory lease is the owner-side source of truth during rotation. The IAM index is
-        // replaced under the same lock; an external caller cannot revoke this lease except through
-        // this registry, so a mocked/empty IAM read must not turn a valid refresh into a launch
-        // failure.
-        iamService.revokeEcsTaskRoleSession(oldLease.taskArn(), oldLease.credentials().accessKeyId());
-        byPath.remove(relativeUri, oldLease);
-        byTask.remove(oldLease.taskArn(), oldLease);
+        // Keep the old generation in IAM until its advertised expiry. Long-lived SDK calls may
+        // have captured it just before this metadata refresh; revoking it here races those calls.
+        // issueLocked validates the replacement and publishes it as the latest path atomically
+        // under this registry lock, while explicit task revocation still clears both generations.
         return issueLocked(oldLease.taskArn(), oldLease.roleArn(),
                 AwsArnUtils.regionOrDefault(oldLease.taskArn(), "us-east-1"), relativeUri);
     }
@@ -270,8 +286,10 @@ public class EcsTaskRoleCredentials {
     private Optional<IssuedCredentials> issueLocked(String taskArn, String roleArn, String region,
                                                      String requestedPath) {
         if (!enabled() || !validCredentialTiming() || !validTaskRole(taskArn, roleArn)) {
+            revokeTaskLeasesLocked(taskArn);
             return Optional.empty();
         }
+        pruneExpiredGenerationsLocked(taskArn);
         AwsArnUtils.Arn role = AwsArnUtils.parse(roleArn);
         String roleName = role.resource().substring(role.resource().lastIndexOf('/') + 1);
         String accountId = role.accountId();
@@ -279,18 +297,21 @@ public class EcsTaskRoleCredentials {
                 iamService.findRole(accountId, roleName);
         if (exactRole.isEmpty() || !roleArn.equals(exactRole.get().getArn())
                 || !trustPolicy.allows(exactRole.get().getAssumeRolePolicyDocument())) {
+            // A trust-policy change is an authorization revocation, not a failed refresh that may
+            // leave an older generation alive. Invalidate every generation for this exact task.
+            revokeTaskLeasesLocked(taskArn);
             return Optional.empty();
         }
 
-        IssuedCredentials prior = byTask.remove(taskArn);
-        if (prior != null) {
-            revokeLeaseLocked(prior);
-        }
-
+        IssuedCredentials prior = byTask.get(taskArn);
         String path = requestedPath == null ? newPath() : requestedPath;
         int pathAttempts = 0;
-        while (byPath.containsKey(path)
-                || iamService.resolveEcsTaskRoleSessionByPath(path).isPresent()) {
+        if (requestedPath != null && !pathAvailableForTask(path, taskArn)) {
+            // A stable task URI must never be reassigned to another task. Keep the prior
+            // generation valid until its expiry and let the next owner tick retry the rotation.
+            return Optional.empty();
+        }
+        while (!pathAvailableForTask(path, taskArn)) {
             path = newPath();
             if (++pathAttempts >= 8) {
                 return Optional.empty();
@@ -317,15 +338,79 @@ public class EcsTaskRoleCredentials {
                 session.accessKeyId(), session.secretAccessKey(), session.sessionToken(), roleArn,
                 expiration, path);
         IssuedCredentials lease = new IssuedCredentials(taskArn, roleArn, path, session, expiration, now);
+        if (prior != null && !path.equals(prior.relativeUri())) {
+            // Keep the prior access-key generation for its own expiry, but expose only the newest
+            // metadata URI. Normal rotations pass the same URI and therefore preserve stability.
+            byPath.remove(prior.relativeUri(), prior);
+        }
         byTask.put(taskArn, lease);
         byPath.put(path, lease);
+        generationsByTask.computeIfAbsent(taskArn, ignored -> new HashMap<>())
+                .put(session.accessKeyId(), lease);
         return Optional.of(lease);
     }
 
     private void revokeLeaseLocked(IssuedCredentials lease) {
+        removeLeaseIndexesLocked(lease);
+        iamService.revokeEcsTaskRoleSessionGeneration(lease.taskArn(), lease.credentials().accessKeyId());
+    }
+
+    private void revokeTaskLeasesLocked(String taskArn) {
+        if (taskArn == null || taskArn.isBlank()) {
+            return;
+        }
+        Map<String, IssuedCredentials> generations = generationsByTask.remove(taskArn);
+        if (generations != null) {
+            for (IssuedCredentials lease : List.copyOf(generations.values())) {
+                byTask.remove(taskArn, lease);
+                byPath.remove(lease.relativeUri(), lease);
+            }
+        }
+        byTask.remove(taskArn);
+        byPath.entrySet().removeIf(entry -> taskArn.equals(entry.getValue().taskArn()));
+        // The task-level IAM operation is intentionally separate from generation cleanup so a
+        // stop/trust revocation also removes generations not present in this process-local map.
+        iamService.revokeEcsTaskRoleSession(taskArn);
+    }
+
+    private void removeLeaseIndexesLocked(IssuedCredentials lease) {
         byTask.remove(lease.taskArn(), lease);
         byPath.remove(lease.relativeUri(), lease);
-        iamService.revokeEcsTaskRoleSession(lease.taskArn(), lease.credentials().accessKeyId());
+        Map<String, IssuedCredentials> generations = generationsByTask.get(lease.taskArn());
+        if (generations != null) {
+            generations.remove(lease.credentials().accessKeyId(), lease);
+            if (generations.isEmpty()) {
+                generationsByTask.remove(lease.taskArn(), generations);
+            }
+        }
+    }
+
+    private void pruneExpiredGenerationsLocked(String taskArn) {
+        Map<String, IssuedCredentials> generations = generationsByTask.get(taskArn);
+        if (generations == null) {
+            return;
+        }
+        Instant now = clock.instant();
+        for (IssuedCredentials lease : List.copyOf(generations.values())) {
+            if (!lease.expiration().isAfter(now)) {
+                revokeLeaseLocked(lease);
+            }
+        }
+    }
+
+    private boolean pathAvailableForTask(String path, String taskArn) {
+        IssuedCredentials local = byPath.get(path);
+        if (local != null) {
+            return taskArn.equals(local.taskArn());
+        }
+        Optional<SessionCredential> indexed = iamService.resolveEcsTaskRoleSessionByPath(path);
+        return indexed.isEmpty() || taskArn.equals(indexed.orElseThrow().getTaskArn());
+    }
+
+    private static boolean sameGeneration(SessionCredential active, IssuedCredentials lease) {
+        return active != null && lease != null && lease.credentials() != null
+                && lease.credentials().accessKeyId() != null
+                && lease.credentials().accessKeyId().equals(active.getAccessKeyId());
     }
 
     private void releaseLinkLocalIpsLocked(String taskArn) {

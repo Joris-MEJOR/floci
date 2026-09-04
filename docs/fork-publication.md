@@ -55,11 +55,12 @@ the contract verifies that the mounted socket and controller report the same Doc
 
 The test uses a clean digest-pinned probe image, three real task containers, the default boto3
 container-role provider, an allowed object read and an explicit list-buckets denial. It asserts
-stable-path rotation, old-key denial, task-scoped revocation while another task remains allowed,
+stable-path rotation, bounded old/new-key overlap before their advertised expirations,
+task-scoped revocation of both generations while another task remains allowed,
 expired-key denial, default-SDK recovery after a running task is idle past its credential TTL,
 and reuse of the same STS/S3 client instances across another 125-second idle interval. It also
 checks revocation of the latest renewed credential on task stop and exact Docker cleanup. TTL is
-120 seconds and the refresh window is 60 seconds; allow about five minutes per platform. The task
+120 seconds and the refresh window is 60 seconds; allow about six minutes per platform. The task
 fixture holds for 900 seconds to cover emulated startup and both idle intervals, not to extend
 credential validity. A cached-client failure is not retried with a new client. Output contains observed role
 identities, one-way credential fingerprints, image manifest identity, and authentication error
