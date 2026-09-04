@@ -27,7 +27,7 @@ jobs:
       packages: write
     env:
       # Replaced only after independent source review and runtime acceptance.
-      SOURCE_SHA: 98d302a2624da070bab7f2a5af53febd9da2d6c4
+      SOURCE_SHA: 0f4593b8a634d3c9c5f8d29dd6905a6ad764933e
       IMAGE: ghcr.io/mejor-technologies/floci
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
