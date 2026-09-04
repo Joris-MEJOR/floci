@@ -65,6 +65,8 @@ public class EcsContainerManager {
             "AWS_ROLE_ARN",
             "AWS_CONTAINER_CREDENTIALS_FULL_URI",
             "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+            "BOTO_CONFIG",
             "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
             "AWS_EC2_METADATA_DISABLED");
 
@@ -136,14 +138,14 @@ public class EcsContainerManager {
         Map<String, String> containerIds = new LinkedHashMap<>();
         Map<String, Closeable> logStreamsByContainerId = new LinkedHashMap<>();
         List<Container> runtimeContainers = new ArrayList<>();
+        boolean unverifiedContainerCreation = false;
 
         // A task role is one task-level lease shared by all its containers. Mint it before any
         // image/secret resolution or Docker create, then revoke it on every failed launch path so
         // a pre-start error cannot leave a bearer credential behind.
+        try {
         Optional<EcsTaskRoleCredentials.IssuedCredentials> issuedTaskCredentials =
                 issueTaskCredentials(task, taskDef, region);
-
-        try {
         // Task-level volumes consumed by per-container mountPoints: host volumes map their
         // name -> absolute host source path; efsVolumeConfiguration volumes map their
         // name -> EFS configuration (materialised below as a shared local Docker volume).
@@ -294,8 +296,11 @@ public class EcsContainerManager {
             ContainerSpec spec = specBuilder.build();
 
             // Create and start container
+            unverifiedContainerCreation = true;
             ContainerInfo info = lifecycleManager.createAndStart(spec);
             String dockerId = info.containerId();
+            containerIds.put(def.getName(), dockerId);
+            unverifiedContainerCreation = false;
 
             LOG.infov("Created ECS container {0} for task {1} container {2}", dockerId, taskId, def.getName());
 
@@ -305,7 +310,6 @@ public class EcsContainerManager {
             // Build ECS container model
             Container container = buildContainer(task.getTaskArn(), def, dockerId, networkBindings, region);
             runtimeContainers.add(container);
-            containerIds.put(def.getName(), dockerId);
 
             // Attach log streaming
             String logGroup = "/ecs/" + taskDef.getFamily();
@@ -326,12 +330,15 @@ public class EcsContainerManager {
 
         return new EcsTaskHandle(task.getTaskArn(), containerIds, logStreamsByContainerId);
         } catch (RuntimeException e) {
-            if (issuedTaskCredentials.isPresent()) {
-                // Credential revocation intentionally precedes container teardown: code in a
-                // still-running failed-start container must not retain IAM access while it drains.
-                revokeTaskCredentials(task.getTaskArn());
-            }
+            // Include failures inside issuance itself, before a lease was returned to this caller.
+            // Revocation precedes teardown so a failed-start container cannot retain IAM access.
+            revokeTaskCredentials(task.getTaskArn());
             cleanupFailedStart(containerIds, logStreamsByContainerId);
+            // A thrown Docker create/start can leave an orphan whose ID was never returned.
+            // Keep its network allocation quarantined rather than assuming absence.
+            if (!unverifiedContainerCreation) {
+                releaseTaskNetworkIfRemoved(task.getTaskArn(), containerIds);
+            }
             throw e;
         }
     }
@@ -357,6 +364,7 @@ public class EcsContainerManager {
         }
         new ArrayList<>(handle.getLogStreamsByContainerId().keySet())
                 .forEach(dockerId -> finalizeLogStream(handle, dockerId));
+        handle.setPendingNetworkCleanup(!releaseTaskNetworkIfRemoved(handle.getTaskArn(), handle.getContainerIds()));
     }
 
     /**
@@ -404,6 +412,7 @@ public class EcsContainerManager {
         // A force removal terminates Docker's follow-log transport even when the preceding stop failed.
         // Preserve handles for any container that still may be running after both operations failed.
         terminatedContainerIds.forEach(dockerId -> finalizeLogStream(handle, dockerId));
+        handle.setPendingNetworkCleanup(!releaseTaskNetworkIfRemoved(handle.getTaskArn(), handle.getContainerIds()));
         return exitCodes;
     }
 
@@ -443,6 +452,12 @@ public class EcsContainerManager {
                 || !taskRoleCredentials.enabled()) {
             return Optional.empty();
         }
+        String network = config.services().ecs().dockerNetwork()
+                .or(() -> config.services().dockerNetwork()).orElse("");
+        if (network.isBlank() || java.util.Set.of("host", "none", "bridge").contains(network)) {
+            throw new AwsException("InvalidParameterException",
+                    "ECS task-role credentials require an explicit private Docker network", 400);
+        }
         Optional<EcsTaskRoleCredentials.IssuedCredentials> issued = taskRoleCredentials.issue(
                 task.getTaskArn(), taskDef.getTaskRoleArn(), region);
         if (issued.isEmpty()) {
@@ -456,6 +471,24 @@ public class EcsContainerManager {
         if (taskRoleCredentials != null) {
             taskRoleCredentials.revokeTask(taskArn);
         }
+    }
+
+    private boolean releaseTaskNetworkIfRemoved(String taskArn, Map<String, String> containerIds) {
+        if (taskRoleCredentials == null) {
+            return true;
+        }
+        for (String dockerId : containerIds.values()) {
+            try {
+                lifecycleManager.getDockerClient().inspectContainerCmd(dockerId).exec();
+                return false; // Even a stopped container still owns its Docker network endpoint.
+            } catch (NotFoundException removed) {
+                // Exact container absence is the only safe release condition.
+            } catch (Exception uncertain) {
+                return false; // Quarantine allocations while Docker removal cannot be verified.
+            }
+        }
+        taskRoleCredentials.releaseTaskNetwork(taskArn);
+        return true;
     }
 
     private void cleanupFailedStart(Map<String, String> containerIds,

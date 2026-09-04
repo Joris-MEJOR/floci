@@ -1664,7 +1664,11 @@ public class EcsService implements ContainerTeardown, ResourceProvider {
         revokeTaskCredentials(taskArn);
 
         // Close log streams and remove the stopped Docker containers without re-inspecting.
-        containerManager.cleanupStoppedTask(claimed);
+        try {
+            containerManager.cleanupStoppedTask(claimed);
+        } finally {
+            retainUnresolvedLogHandle(taskArn, claimed);
+        }
 
         if (task.getContainers() != null) {
             task.getContainers().forEach(c -> {
@@ -1720,7 +1724,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider {
     }
 
     private void retainUnresolvedLogHandle(String taskArn, EcsTaskHandle handle) {
-        if (handle != null && handle.hasOpenLogStreams()) {
+        if (handle != null && (handle.hasOpenLogStreams() || handle.hasPendingNetworkCleanup())) {
             taskHandles.put(taskArn, handle);
         }
     }

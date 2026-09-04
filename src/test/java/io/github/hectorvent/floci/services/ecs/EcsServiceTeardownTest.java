@@ -76,20 +76,23 @@ class EcsServiceTeardownTest {
         verify(containerManager, times(1)).stopTask(handle);
     }
 
-    @Test
-    void stoppedTaskRetriesTeardownUntilItsRemainingLogStreamIsReleased() {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void stoppedTaskRetriesTeardownUntilLogsAndNetworkAreReleased(boolean networkOnly) {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().ecs().mock()).thenReturn(false); // docker mode
         when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
 
         EcsContainerManager containerManager = mock(EcsContainerManager.class);
         EcsTaskHandle handle = new EcsTaskHandle("task-arn", Map.of("app", "docker-id"),
-                Map.of("docker-id", mock(Closeable.class)));
+                networkOnly ? Map.of() : Map.of("docker-id", mock(Closeable.class)));
+        handle.setPendingNetworkCleanup(networkOnly);
         when(containerManager.startTask(any(), any(), any(), anyString())).thenReturn(handle);
         AtomicInteger teardownAttempts = new AtomicInteger();
         when(containerManager.stopTaskAndCollectExitCodes(handle)).thenAnswer(ignored -> {
             if (teardownAttempts.incrementAndGet() == 2) {
                 handle.removeLogStream("docker-id");
+                handle.setPendingNetworkCleanup(false);
             }
             return Map.of();
         });

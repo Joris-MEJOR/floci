@@ -1825,12 +1825,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     // Internal helpers
     // =========================================================================
 
-    /** Returns the secret for an active access key or an unexpired temporary session. */
+    /** Legacy lookup for static and STS keys. ECS credentials always require the token-aware overload. */
     public Optional<String> findSecretKey(String accessKeyId) {
-        Optional<SessionCredential> ecsSession = resolveEcsTaskRoleSession(accessKeyId);
-        if (ecsSession.isPresent()) {
-            return Optional.ofNullable(ecsSession.get().getSecretAccessKey());
-        }
         if (isEcsTaskRoleCredential(accessKeyId)) {
             return Optional.empty();
         }
@@ -1867,6 +1863,11 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * {@link #findSecretKey(String, String)} resolves the secret and matches the token in one step.
      */
     public Optional<String> findSessionToken(String accessKeyId) {
+        if (isEcsTaskRoleCredential(accessKeyId)) {
+            return resolveEcsTaskRoleSession(accessKeyId)
+                    .map(SessionCredential::getSessionToken)
+                    .filter(token -> !token.isBlank());
+        }
         return currentSession(accessKeyId)
                 .map(SessionCredential::getSessionToken)
                 .filter(token -> !token.isBlank());

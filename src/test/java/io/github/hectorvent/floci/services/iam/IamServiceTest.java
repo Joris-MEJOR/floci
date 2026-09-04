@@ -71,10 +71,12 @@ class IamServiceTest {
                 roleArn, Instant.now().plusSeconds(3600), path);
 
         assertTrue(iamService.isCredentialAccessKeyInUse(accessKey));
-        assertEquals(Optional.of(secret), iamService.findSecretKey(accessKey));
+        assertTrue(iamService.findSecretKey(accessKey).isEmpty());
+        assertEquals(Optional.of(token), iamService.findSessionToken(accessKey));
         assertEquals(Optional.of(secret), iamService.findSecretKey(accessKey, token));
         assertTrue(iamService.findSecretKey(accessKey, "wrong-token").isEmpty());
         assertTrue(iamService.findSecretKey(accessKey, null).isEmpty());
+        assertTrue(iamService.findSecretKey(accessKey, "").isEmpty());
         assertEquals(Optional.of("000000000000"), iamService.resolveAccountId(accessKey));
         assertTrue(iamService.validateEcsTaskRoleSessionToken(accessKey, token));
         assertFalse(iamService.validateEcsTaskRoleSessionToken(accessKey, "wrong-token"));
@@ -91,11 +93,29 @@ class IamServiceTest {
         assertFalse(iamService.isCredentialAccessKeyInUse(accessKey));
         assertTrue(iamService.findSecretKey(accessKey).isEmpty());
         assertTrue(iamService.findSecretKey(accessKey, token).isEmpty());
+        assertTrue(iamService.findSessionToken(accessKey).isEmpty());
         assertTrue(iamService.resolveAccountId(accessKey).isEmpty());
         assertFalse(iamService.validateEcsTaskRoleSessionToken(accessKey, token));
         assertNotNull(iamService.resolveCallerContext(accessKey));
         assertTrue(iamService.resolveCallerContext(accessKey).identityPolicies().isEmpty());
         assertTrue(iamService.resolveCallerArn(accessKey).isEmpty());
+    }
+
+    @Test
+    void expiredEcsSessionCannotResolveSecretOrTokenEvenWithIssuedToken() {
+        IamRole role = iamService.createRole("ExpiredTaskRole", "/", "{}", null, 0, null);
+        String key = "ASIAECS" + "E".repeat(13);
+        iamService.registerEcsTaskRoleSession(
+                "arn:aws:ecs:us-east-1:000000000000:task/default/expired",
+                "000000000000", key, "test-secret", "test-token", role.getArn(),
+                Instant.now().plusSeconds(3600), "/v2/credentials/" + "E".repeat(48));
+        iamService.resolveEcsTaskRoleSession(key).orElseThrow().setExpiration(Instant.EPOCH);
+
+        assertTrue(iamService.findSessionToken(key).isEmpty());
+        assertTrue(iamService.findSecretKey(key).isEmpty());
+        assertTrue(iamService.findSecretKey(key, "test-token").isEmpty());
+        assertFalse(iamService.validateEcsTaskRoleSessionToken(key, "test-token"));
+        assertTrue(iamService.isEcsTaskRoleCredential(key));
     }
 
     // =========================================================================

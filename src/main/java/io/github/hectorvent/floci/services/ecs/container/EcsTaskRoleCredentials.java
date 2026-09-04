@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.ecs.container;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.services.iam.IamService;
@@ -33,6 +34,7 @@ public class EcsTaskRoleCredentials {
 
     private final IamService iamService;
     private final EmulatorConfig config;
+    private final EcsTaskRoleTrustPolicy trustPolicy;
 
     /** Guards all lease/index/IP transitions so refresh and revocation are atomic. */
     private final Object lock = new Object();
@@ -43,9 +45,16 @@ public class EcsTaskRoleCredentials {
     private int nextLinkLocalHost = 3;
 
     @Inject
-    public EcsTaskRoleCredentials(IamService iamService, EmulatorConfig config) {
+    public EcsTaskRoleCredentials(IamService iamService, EmulatorConfig config,
+                                  EcsTaskRoleTrustPolicy trustPolicy) {
         this.iamService = iamService;
         this.config = config;
+        this.trustPolicy = trustPolicy;
+    }
+
+    /** Convenience constructor retained for focused unit tests and embedders. */
+    public EcsTaskRoleCredentials(IamService iamService, EmulatorConfig config) {
+        this(iamService, config, new EcsTaskRoleTrustPolicy(new ObjectMapper()));
     }
 
     /** AWS-compatible credential bundle plus the opaque relative URI used by the task. */
@@ -57,6 +66,7 @@ public class EcsTaskRoleCredentials {
     /** Whether this optional credential-vending surface is enabled. */
     public boolean enabled() {
         return config != null && config.services() != null
+                && config.services().ecs() != null
                 && config.services().ecs().taskRoleCredentialsEnabled();
     }
 
@@ -83,13 +93,18 @@ public class EcsTaskRoleCredentials {
             if (lease == null) {
                 return Optional.empty();
             }
-            Optional<SessionCredential> active = iamService.resolveEcsTaskRoleSessionByPath(relativeUri);
-            if (active.isEmpty() || !lease.expiration().isAfter(Instant.now())) {
+            if (!validCredentialTiming()) {
                 revokeLeaseLocked(lease);
                 return Optional.empty();
             }
-            long refreshWindow = Math.max(0, config.services().ecs().taskRoleCredentialsRefreshWindowSeconds());
-            if (!lease.expiration().isAfter(Instant.now().plusSeconds(refreshWindow))) {
+            Instant now = Instant.now();
+            Optional<SessionCredential> active = iamService.resolveEcsTaskRoleSessionByPath(relativeUri);
+            if (active.isEmpty() || !lease.expiration().isAfter(now)) {
+                revokeLeaseLocked(lease);
+                return Optional.empty();
+            }
+            long refreshWindow = config.services().ecs().taskRoleCredentialsRefreshWindowSeconds();
+            if (!lease.expiration().isAfter(now.plusSeconds(refreshWindow))) {
                 return refreshLocked(relativeUri, lease);
             }
             return Optional.of(lease);
@@ -103,6 +118,12 @@ public class EcsTaskRoleCredentials {
         }
         synchronized (lock) {
             IssuedCredentials lease = byPath.get(relativeUri);
+            if (!validCredentialTiming()) {
+                if (lease != null) {
+                    revokeLeaseLocked(lease);
+                }
+                return Optional.empty();
+            }
             if (lease == null || !lease.expiration().isAfter(Instant.now())
                     || iamService.resolveEcsTaskRoleSessionByPath(relativeUri).isEmpty()) {
                 if (lease != null) {
@@ -114,7 +135,7 @@ public class EcsTaskRoleCredentials {
         }
     }
 
-    /** Revokes all credentials and link-local allocations owned by one exact task. */
+    /** Revokes credentials immediately; Docker owns the lifetime of network allocations. */
     public void revokeTask(String taskArn) {
         if (taskArn == null || taskArn.isBlank()) {
             return;
@@ -125,8 +146,17 @@ public class EcsTaskRoleCredentials {
                 revokeLeaseLocked(lease);
             } else {
                 iamService.revokeEcsTaskRoleSession(taskArn);
-                releaseLinkLocalIpsLocked(taskArn);
             }
+        }
+    }
+
+    /** Called only after every Docker container for this exact task is confirmed removed. */
+    public void releaseTaskNetwork(String taskArn) {
+        if (taskArn == null || taskArn.isBlank()) {
+            return;
+        }
+        synchronized (lock) {
+            releaseLinkLocalIpsLocked(taskArn);
         }
     }
 
@@ -189,7 +219,7 @@ public class EcsTaskRoleCredentials {
 
     private Optional<IssuedCredentials> issueLocked(String taskArn, String roleArn, String region,
                                                      String requestedPath) {
-        if (!enabled() || !validTaskRole(taskArn, roleArn)) {
+        if (!enabled() || !validCredentialTiming() || !validTaskRole(taskArn, roleArn)) {
             return Optional.empty();
         }
         AwsArnUtils.Arn role = AwsArnUtils.parse(roleArn);
@@ -197,7 +227,8 @@ public class EcsTaskRoleCredentials {
         String accountId = role.accountId();
         Optional<io.github.hectorvent.floci.services.iam.model.IamRole> exactRole =
                 iamService.findRole(accountId, roleName);
-        if (exactRole.isEmpty() || !roleArn.equals(exactRole.get().getArn())) {
+        if (exactRole.isEmpty() || !roleArn.equals(exactRole.get().getArn())
+                || !trustPolicy.allows(exactRole.get().getAssumeRolePolicyDocument())) {
             return Optional.empty();
         }
 
@@ -230,7 +261,7 @@ public class EcsTaskRoleCredentials {
             return Optional.empty();
         }
         Instant now = Instant.now();
-        int ttl = Math.max(1, config.services().ecs().taskRoleCredentialsTtlSeconds());
+        int ttl = config.services().ecs().taskRoleCredentialsTtlSeconds();
         Instant expiration = now.plusSeconds(ttl);
         iamService.registerEcsTaskRoleSession(taskArn, accountId,
                 session.accessKeyId(), session.secretAccessKey(), session.sessionToken(), roleArn,
@@ -245,7 +276,6 @@ public class EcsTaskRoleCredentials {
         byTask.remove(lease.taskArn(), lease);
         byPath.remove(lease.relativeUri(), lease);
         iamService.revokeEcsTaskRoleSession(lease.taskArn(), lease.credentials().accessKeyId());
-        releaseLinkLocalIpsLocked(lease.taskArn());
     }
 
     private void releaseLinkLocalIpsLocked(String taskArn) {
@@ -283,6 +313,20 @@ public class EcsTaskRoleCredentials {
         } catch (IllegalArgumentException e) {
             return false;
         }
+    }
+
+    /**
+     * The refresh window is a pre-expiry interval, so it must be non-negative and strictly shorter
+     * than the credential lifetime. Invalid configuration fails closed instead of causing every
+     * metadata GET to rotate the task's credentials.
+     */
+    private boolean validCredentialTiming() {
+        if (config == null || config.services() == null || config.services().ecs() == null) {
+            return false;
+        }
+        int ttl = config.services().ecs().taskRoleCredentialsTtlSeconds();
+        int refreshWindow = config.services().ecs().taskRoleCredentialsRefreshWindowSeconds();
+        return ttl > 0 && refreshWindow >= 0 && refreshWindow < ttl;
     }
 
     private static boolean validRelativeUri(String path) {

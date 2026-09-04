@@ -79,6 +79,7 @@ public class RdsSigV4Validator {
             String expires = findRawParam(rawPairs, "X-Amz-Expires");
             String credential = findRawParam(rawPairs, "X-Amz-Credential");
             String signedHeaders = findRawParam(rawPairs, "X-Amz-SignedHeaders");
+            String sessionToken = findRawParam(rawPairs, "X-Amz-Security-Token");
             String signature = findRawParam(rawPairs, "X-Amz-Signature");
 
             if (!"connect".equals(action) || dbUser == null || dateTime == null || expires == null
@@ -115,7 +116,12 @@ public class RdsSigV4Validator {
             if (LEGACY_ACCESS_KEY_ID.equals(accessKeyId)) {
                 secretKey = LEGACY_SECRET_KEY;
             } else {
-                Optional<String> registeredSecretKey = iamService.findSecretKey(accessKeyId);
+                // ECS task-role credentials are bearer credentials: the session token issued with
+                // the key must accompany the signed token. Keep the historical one-argument path
+                // for static IAM keys and STS sessions, whose direct-proxy behavior predates ECS.
+                Optional<String> registeredSecretKey = iamService.isEcsTaskRoleCredential(accessKeyId)
+                        ? iamService.findSecretKey(accessKeyId, sessionToken)
+                        : iamService.findSecretKey(accessKeyId);
                 if (registeredSecretKey.isEmpty()) {
                     LOG.debugv("RDS IAM token references unregistered access key={0}", sanitizeForLog(accessKeyId));
                     return false;

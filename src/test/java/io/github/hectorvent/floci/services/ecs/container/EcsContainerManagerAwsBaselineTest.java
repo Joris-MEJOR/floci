@@ -151,8 +151,10 @@ class EcsContainerManagerAwsBaselineTest {
                 "overridden baseline endpoint should not remain");
     }
 
-    @Test
-    void taskRoleUsesOnlyRelativeCredentialEndpointAndUniqueLinkLocalIp() {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({"false,false", "true,false", "false,true"})
+    void taskRoleUsesOnlyRelativeCredentialEndpointAndUniqueLinkLocalIp(boolean sharedNetworkOnly,
+                                                                      boolean creationFails) {
         EcsTaskRoleCredentials credentials = mock(EcsTaskRoleCredentials.class);
         when(credentials.enabled()).thenReturn(true);
         EcsTaskRoleCredentials.IssuedCredentials issued = new EcsTaskRoleCredentials.IssuedCredentials(
@@ -167,9 +169,13 @@ class EcsContainerManagerAwsBaselineTest {
         when(lifecycleManager.createAndStart(any())).thenReturn(new ContainerInfo("docker-id", Map.of()));
         EcrRegistryManager ecr = mock(EcrRegistryManager.class);
         when(ecr.rewriteImageUri(anyString())).thenAnswer(inv -> inv.getArgument(0));
+        EmulatorConfig taskConfig = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(taskConfig.services().ecs().dockerNetwork()).thenReturn(
+                sharedNetworkOnly ? Optional.empty() : Optional.of("test-private"));
+        when(taskConfig.services().dockerNetwork()).thenReturn(Optional.of("test-private"));
         manager = new EcsContainerManager(containerBuilder, lifecycleManager,
                 mock(ContainerLogStreamer.class), mock(ContainerDetector.class),
-                mock(EmulatorConfig.class, RETURNS_DEEP_STUBS), mock(RegionResolver.class), awsEnv,
+                taskConfig, mock(RegionResolver.class), awsEnv,
                 mock(SsmService.class), mock(SecretsManagerService.class), ecr,
                 credentials);
         ContainerDefinition app = containerDef("app", "app:latest", List.of(
@@ -177,6 +183,8 @@ class EcsContainerManagerAwsBaselineTest {
                 new KeyValuePair("AWS_PROFILE", "attacker-profile"),
                 new KeyValuePair("AWS_CONTAINER_CREDENTIALS_FULL_URI", "http://attacker"),
                 new KeyValuePair("AWS_CONTAINER_AUTHORIZATION_TOKEN", "attacker-token"),
+                new KeyValuePair("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", "/attacker-token"),
+                new KeyValuePair("BOTO_CONFIG", "/attacker-config"),
                 new KeyValuePair("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/attacker"),
                 new KeyValuePair("AWS_EC2_METADATA_DISABLED", "false")));
         TaskDefinition taskDef = new TaskDefinition();
@@ -186,6 +194,14 @@ class EcsContainerManagerAwsBaselineTest {
         EcsTask task = new EcsTask();
         task.setTaskArn(issued.taskArn());
 
+        if (creationFails) {
+            when(lifecycleManager.createAndStart(any())).thenThrow(new IllegalStateException("Docker start failed"));
+            org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                    () -> manager.startTask(task, taskDef, null, "us-east-1"));
+            verify(credentials).revokeTask(issued.taskArn());
+            verify(credentials, org.mockito.Mockito.never()).releaseTaskNetwork(anyString());
+            return;
+        }
         manager.startTask(task, taskDef, null, "us-east-1");
 
         @SuppressWarnings("unchecked")
@@ -200,7 +216,51 @@ class EcsContainerManagerAwsBaselineTest {
         assertTrue(env.stream().noneMatch(e -> e.startsWith("AWS_PROFILE=")));
         assertTrue(env.stream().noneMatch(e -> e.startsWith("AWS_CONTAINER_CREDENTIALS_FULL_URI=")));
         assertTrue(env.stream().noneMatch(e -> e.startsWith("AWS_CONTAINER_AUTHORIZATION_TOKEN=")));
+        assertTrue(env.stream().noneMatch(e -> e.startsWith("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE=")));
+        assertTrue(env.stream().noneMatch(e -> e.startsWith("BOTO_CONFIG=")));
         verify(builder).withLinkLocalIp("169.254.170.3");
+    }
+
+    @Test
+    void credentialIssuanceFailureRevokesLeaseBeforeAnyContainerStarts() {
+        EcsTaskRoleCredentials credentials = mock(EcsTaskRoleCredentials.class);
+        when(credentials.enabled()).thenReturn(true);
+        when(credentials.issue(anyString(), anyString(), anyString()))
+                .thenThrow(new IllegalStateException("issuance failed"));
+        EmulatorConfig taskConfig = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(taskConfig.services().ecs().dockerNetwork()).thenReturn(Optional.of("test-private"));
+        assertCredentialStartRejected(credentials, taskConfig, IllegalStateException.class);
+    }
+
+    @Test
+    void missingOrSharedDockerNetworkFailsClosedBeforeIssuance() {
+        for (String network : List.of("", "host", "none", "bridge")) {
+            EcsTaskRoleCredentials credentials = mock(EcsTaskRoleCredentials.class);
+            when(credentials.enabled()).thenReturn(true);
+            EmulatorConfig taskConfig = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+            when(taskConfig.services().ecs().dockerNetwork()).thenReturn(Optional.of(network));
+            assertCredentialStartRejected(credentials, taskConfig,
+                    io.github.hectorvent.floci.core.common.AwsException.class);
+            verify(credentials, org.mockito.Mockito.never()).issue(anyString(), anyString(), anyString());
+        }
+    }
+
+    private void assertCredentialStartRejected(EcsTaskRoleCredentials credentials,
+                                              EmulatorConfig taskConfig,
+                                              Class<? extends Throwable> failure) {
+        ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+        EcsContainerManager subject = new EcsContainerManager(containerBuilder, lifecycle,
+                mock(ContainerLogStreamer.class), mock(ContainerDetector.class), taskConfig,
+                mock(RegionResolver.class), awsEnv, mock(SsmService.class),
+                mock(SecretsManagerService.class), mock(EcrRegistryManager.class), credentials);
+        TaskDefinition definition = new TaskDefinition();
+        definition.setTaskRoleArn("arn:aws:iam::000000000000:role/task-role");
+        EcsTask task = new EcsTask();
+        task.setTaskArn("arn:aws:ecs:us-east-1:000000000000:task/default/failure");
+        org.junit.jupiter.api.Assertions.assertThrows(failure,
+                () -> subject.startTask(task, definition, null, "us-east-1"));
+        verify(credentials).revokeTask(task.getTaskArn());
+        org.mockito.Mockito.verifyNoInteractions(lifecycle);
     }
 
     private static ContainerDefinition containerDef(String name, String image, List<KeyValuePair> env) {

@@ -49,11 +49,18 @@ AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/v2/credentials/<opaque-task-token>
 The AWS SDK combines this path with the ECS container metadata address. Floci removes static,
 profile, full-URI, and authorization-token credential overrides for a task-role container and sets
 `AWS_EC2_METADATA_DISABLED=true`, so the relative container credential provider is the only
-credential source exposed to that task. The endpoint returns AWS-shaped temporary credentials and
+credential source injected by Floci. Task images and application code must not contain their own
+credential files, credential environment defaults, or explicit SDK credentials, which can take
+precedence over any injected provider. The endpoint returns AWS-shaped temporary credentials and
 refreshes them inside `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_REFRESH_WINDOW_SECONDS`, retaining
 the same relative URI while rotating the access key and token. Sessions expire after
 `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_TTL_SECONDS` and are revoked when the task stops or Floci
-restarts. The task role must already exist in the task's account; an unknown role fails the launch.
+restarts. The task role must already exist in the task's account and its trust policy must contain
+an unconditional `Allow` for the exact `ecs-tasks.amazonaws.com` service principal and
+`sts:AssumeRole`; an unknown role, a role trusted only by another service, an explicit matching
+`Deny`, or a conditioned statement fails the launch. The refresh window must be non-negative and
+strictly shorter than the TTL; invalid values fail closed rather than rotating on every metadata
+request.
 
 The listener binds to `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_PORT` (default `80`) and does not
 publish a host port. It is reachable only through the task container's private Docker network and
@@ -62,11 +69,24 @@ link-local metadata route. Configure `FLOCI_SERVICES_ECS_DOCKER_NETWORK`, or the
 claims `169.254.170.2` for Floci on its shared network; task allocations begin at `.3` so the
 metadata address is not reused. Keep the listener on port `80` for clients using the unmodified
 standard relative-URI provider; a custom port requires a client that explicitly targets that port.
+Expired or revoked credentials do not release a running container's network address. Addresses
+are released only after exact Docker container absence is verified; failed or unverifiable cleanup
+quarantines the allocation until cleanup can be retried.
+Reservations are process-local. After a failed launch or emulator shutdown, remove any orphaned
+task containers from the private network before restarting Floci; restarting is not a substitute
+for verified Docker cleanup.
 This provider requires Floci itself to run in a container that owns `169.254.170.2`; native Floci is
 not supported for this opt-in surface. A custom container setup must assign that address with
 Compose `link_local_ips` or Docker's `--link-local-ip` on the same network used by ECS tasks. If the
 address or listener port is unavailable, Floci startup fails closed before launching tasks rather
 than running with a broken credential endpoint.
+
+The opaque relative URI is a bearer capability, not authenticated task identity. Keep the Docker
+network trusted and private; do not log or share credential paths. A process that already knows
+another task's exact URI may retrieve that task's credentials while the lease is active. This
+local emulator does not provide an AWS-equivalent hostile-container or multi-tenant isolation
+boundary. Missing, incorrect, expired, and revoked ECS session tokens fail authentication on the
+direct RDS, ElastiCache, S3, and execute-api paths, independently of the global IAM filter.
 
 ### Tasks
 

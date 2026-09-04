@@ -30,6 +30,36 @@ import static org.mockito.Mockito.when;
 
 class EcsContainerManagerLifecycleTest {
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"removed", "present", "unreachable"})
+    void releasesNetworkOnlyAfterExactDockerAbsence(String state) {
+        ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+        DockerClient docker = mock(DockerClient.class, org.mockito.Mockito.RETURNS_DEEP_STUBS);
+        when(lifecycle.getDockerClient()).thenReturn(docker);
+        var inspect = docker.inspectContainerCmd("docker-id");
+        if (state.equals("removed")) {
+            when(inspect.exec()).thenThrow(new com.github.dockerjava.api.exception.NotFoundException("removed"));
+        } else if (state.equals("unreachable")) {
+            when(inspect.exec()).thenThrow(new IllegalStateException("daemon unavailable"));
+        }
+        EcsTaskRoleCredentials credentials = mock(EcsTaskRoleCredentials.class);
+        EcsContainerManager subject = new EcsContainerManager(
+                mock(ContainerBuilder.class), lifecycle, mock(ContainerLogStreamer.class),
+                mock(ContainerDetector.class), mock(EmulatorConfig.class), mock(RegionResolver.class),
+                mock(LaunchedContainerAwsEnv.class), mock(SsmService.class), mock(SecretsManagerService.class),
+                mock(EcrRegistryManager.class), credentials);
+        EcsTaskHandle handle = new EcsTaskHandle("task-arn", Map.of("app", "docker-id"), Map.of());
+        subject.cleanupStoppedTask(handle);
+        verify(credentials).revokeTask("task-arn");
+        if (state.equals("removed")) {
+            verify(credentials).releaseTaskNetwork("task-arn");
+            assertFalse(handle.hasPendingNetworkCleanup());
+        } else {
+            verify(credentials, never()).releaseTaskNetwork("task-arn");
+            assertTrue(handle.hasPendingNetworkCleanup());
+        }
+    }
+
     @Test
     void finalizesTaskLogStreamsAfterForceRemovingAContainerWhoseStopFails() {
         ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);

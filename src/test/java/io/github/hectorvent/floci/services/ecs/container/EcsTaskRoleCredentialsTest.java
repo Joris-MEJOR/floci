@@ -19,6 +19,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -34,10 +35,18 @@ class EcsTaskRoleCredentialsTest {
         config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().ecs().taskRoleCredentialsEnabled()).thenReturn(true);
         when(config.services().ecs().taskRoleCredentialsTtlSeconds()).thenReturn(3600);
-        when(config.services().ecs().taskRoleCredentialsRefreshWindowSeconds()).thenReturn(3600);
+        when(config.services().ecs().taskRoleCredentialsRefreshWindowSeconds()).thenReturn(300);
         when(iamService.findRole(anyString(), anyString())).thenReturn(Optional.of(
-                new IamRole("AROAEXAMPLE", "task-role", "/", "arn:aws:iam::111122223333:role/task-role", "{}")));
+                new IamRole("AROAEXAMPLE", "task-role", "/", "arn:aws:iam::111122223333:role/task-role",
+                        ecsTasksTrustPolicy())));
         credentials = new EcsTaskRoleCredentials(iamService, config);
+    }
+
+    private static String ecsTasksTrustPolicy() {
+        return """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                "Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}
+                """;
     }
 
     @Test
@@ -122,6 +131,25 @@ class EcsTaskRoleCredentialsTest {
     }
 
     @Test
+    void revokedAndExpiredLeasesKeepNetworkReservationsUntilDockerRemoval() {
+        String roleArn = "arn:aws:iam::111122223333:role/task-role";
+        String firstTask = "arn:aws:ecs:us-east-1:111122223333:task/default/reserved";
+        var first = credentials.issue(firstTask, roleArn, "us-east-1").orElseThrow();
+        assertEquals("169.254.170.3", credentials.linkLocalIp(firstTask, "app").orElseThrow());
+        // Missing IAM session models expiry/revocation without a Docker stop.
+        assertTrue(credentials.current(first.relativeUri()).isEmpty());
+        credentials.revokeTask(firstTask);
+        String nextTask = "arn:aws:ecs:us-east-1:111122223333:task/default/next";
+        credentials.issue(nextTask, roleArn, "us-east-1").orElseThrow();
+        for (int i = 0; i < 251; i++) {
+            assertTrue(credentials.linkLocalIp(nextTask, "app-" + i).isPresent());
+        }
+        assertTrue(credentials.linkLocalIp(nextTask, "exhausted").isEmpty());
+        credentials.releaseTaskNetwork(firstTask);
+        assertEquals("169.254.170.3", credentials.linkLocalIp(nextTask, "after-removal").orElseThrow());
+    }
+
+    @Test
     void rejectsNonCanonicalTaskAndRoleArns() {
         assertTrue(credentials.issue(
                 "arn:aws:ecs:us-east-1:111122223333:task/",
@@ -129,5 +157,109 @@ class EcsTaskRoleCredentialsTest {
         assertTrue(credentials.issue(
                 "arn:aws:ecs:us-east-1:111122223333:task/default/task-f",
                 "arn:aws:iam::111122223333:role/other/task-role", "us-east-1").isEmpty());
+    }
+
+    @Test
+    void rejectsRoleWhenTrustPolicyIsForLambdaOnly() {
+        when(iamService.findRole(anyString(), anyString())).thenReturn(Optional.of(
+                new IamRole("AROAEXAMPLE", "task-role", "/", "arn:aws:iam::111122223333:role/task-role",
+                        ecsTrustPolicyFor("lambda.amazonaws.com"))));
+
+        assertTrue(credentials.issue(
+                "arn:aws:ecs:us-east-1:111122223333:task/default/task-lambda",
+                "arn:aws:iam::111122223333:role/task-role", "us-east-1").isEmpty());
+        verify(iamService, never()).registerEcsTaskRoleSession(
+                anyString(), anyString(), anyString(), anyString(), anyString(), anyString(),
+                any(Instant.class), anyString());
+    }
+
+    @Test
+    void explicitTrustDenyOverridesEcsAllow() {
+        String policy = """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"},
+                  {"Effect":"Deny","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}
+                """;
+        when(iamService.findRole(anyString(), anyString())).thenReturn(Optional.of(
+                new IamRole("AROAEXAMPLE", "task-role", "/", "arn:aws:iam::111122223333:role/task-role", policy)));
+
+        assertTrue(credentials.issue(
+                "arn:aws:ecs:us-east-1:111122223333:task/default/task-denied",
+                "arn:aws:iam::111122223333:role/task-role", "us-east-1").isEmpty());
+    }
+
+    @Test
+    void conditionedTrustStatementFailsClosed() {
+        String policy = """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                "Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole",
+                "Condition":{"StringEquals":{"aws:SourceAccount":"111122223333"}}}]}
+                """;
+        when(iamService.findRole(anyString(), anyString())).thenReturn(Optional.of(
+                new IamRole("AROAEXAMPLE", "task-role", "/", "arn:aws:iam::111122223333:role/task-role", policy)));
+
+        assertTrue(credentials.issue(
+                "arn:aws:ecs:us-east-1:111122223333:task/default/task-conditioned",
+                "arn:aws:iam::111122223333:role/task-role", "us-east-1").isEmpty());
+    }
+
+    @Test
+    void unsupportedTrustStatementsFailClosedEvenWithAnEcsAllow() {
+        String[] unsupportedPolicies = {
+                """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"},
+                  {"Effect":"Deny","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole",
+                   "Condition":{"StringEquals":{"aws:SourceAccount":"111122223333"}}}]}
+                """,
+                """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"},
+                  {"Effect":"Deny","NotPrincipal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}
+                """,
+                """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}, { }]}
+                """,
+                """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"},
+                  {"Effect":"Audit","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}
+                """
+        };
+
+        for (int i = 0; i < unsupportedPolicies.length; i++) {
+            when(iamService.findRole(anyString(), anyString())).thenReturn(Optional.of(
+                    new IamRole("AROAEXAMPLE", "task-role", "/",
+                            "arn:aws:iam::111122223333:role/task-role", unsupportedPolicies[i])));
+            assertTrue(credentials.issue(
+                    "arn:aws:ecs:us-east-1:111122223333:task/default/task-unsupported-" + i,
+                    "arn:aws:iam::111122223333:role/task-role", "us-east-1").isEmpty());
+        }
+        verify(iamService, never()).registerEcsTaskRoleSession(
+                anyString(), anyString(), anyString(), anyString(), anyString(), anyString(),
+                any(Instant.class), anyString());
+    }
+
+    @Test
+    void rejectsNegativeOrAtLeastTtlRefreshWindow() {
+        String taskArn = "arn:aws:ecs:us-east-1:111122223333:task/default/task-invalid-window";
+        String roleArn = "arn:aws:iam::111122223333:role/task-role";
+
+        when(config.services().ecs().taskRoleCredentialsRefreshWindowSeconds()).thenReturn(-1);
+        assertTrue(credentials.issue(taskArn, roleArn, "us-east-1").isEmpty());
+
+        when(config.services().ecs().taskRoleCredentialsRefreshWindowSeconds()).thenReturn(3600);
+        assertTrue(credentials.issue(taskArn, roleArn, "us-east-1").isEmpty());
+        verify(iamService, never()).registerEcsTaskRoleSession(
+                anyString(), anyString(), anyString(), anyString(), anyString(), anyString(),
+                any(Instant.class), anyString());
+    }
+
+    private static String ecsTrustPolicyFor(String servicePrincipal) {
+        return """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                "Principal":{"Service":"%s"},"Action":"sts:AssumeRole"}]}
+                """.formatted(servicePrincipal);
     }
 }
